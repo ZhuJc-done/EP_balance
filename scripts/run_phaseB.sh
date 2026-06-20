@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Phase B launcher: run a tiny MoE GPT on Megatron with the Scale-EPLB observer.
+#
+# It uses --mock-data + NullTokenizer, so there is NO data/checkpoint prep: push
+# this repo + Megatron-LM to the cluster and run. Each forward prints, on rank 0:
+#   [EPLB] layer=.. mb=.. tau=.. imbalance=.. replicas=.. phi_token=..
+# which validates E2 (solver latency) and E3 (determinism) on REAL routing.
+#
+# Prereqs on the cluster:
+#   pip install -e /path/to/EP_balance            # makes `eplb` importable
+#   git clone https://github.com/NVIDIA/Megatron-LM && pip install -e Megatron-LM
+#
+# Usage (single node, 8 GPUs):
+#   MEGATRON_DIR=/path/to/Megatron-LM EPLB_DIR=/path/to/EP_balance bash scripts/run_phaseB.sh
+# Multi-node: set NNODES, NODE_RANK, MASTER_ADDR, MASTER_PORT on each node.
+set -euo pipefail
+
+# --- paths -------------------------------------------------------------------
+MEGATRON_DIR="${MEGATRON_DIR:?set MEGATRON_DIR to the Megatron-LM repo root}"
+EPLB_DIR="${EPLB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+
+# --- cluster topology --------------------------------------------------------
+GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+MASTER_ADDR="${MASTER_ADDR:-localhost}"
+MASTER_PORT="${MASTER_PORT:-6000}"
+WORLD_SIZE=$(( GPUS_PER_NODE * NNODES ))
+
+# --- MoE / parallelism (override via env) ------------------------------------
+EP_SIZE="${EP_SIZE:-$WORLD_SIZE}"          # expert parallel = all ranks by default
+NUM_EXPERTS="${NUM_EXPERTS:-8}"            # must be divisible by EP_SIZE
+TOPK="${TOPK:-2}"
+TRAIN_ITERS="${TRAIN_ITERS:-5}"
+
+export GPUS_PER_NODE EPLB_OBSERVE="${EPLB_OBSERVE:-1}"
+export PYTHONPATH="${MEGATRON_DIR}:${EPLB_DIR}:${PYTHONPATH:-}"
+
+MODEL_ARGS=(
+  --num-layers 4
+  --hidden-size 512
+  --num-attention-heads 8
+  --seq-length 1024
+  --max-position-embeddings 1024
+  --position-embedding-type rope
+  --transformer-impl local
+)
+
+MOE_ARGS=(
+  --num-experts "${NUM_EXPERTS}"
+  --moe-router-topk "${TOPK}"
+  --moe-ffn-hidden-size 512
+  --moe-token-dispatcher-type alltoall
+  --expert-model-parallel-size "${EP_SIZE}"
+)
+
+PARALLEL_ARGS=(
+  --tensor-model-parallel-size 1
+  --pipeline-model-parallel-size 1
+  --distributed-backend nccl
+)
+
+DATA_ARGS=(
+  --mock-data
+  --tokenizer-type NullTokenizer
+  --vocab-size 32000
+)
+
+TRAIN_ARGS=(
+  --micro-batch-size 1
+  --global-batch-size "${WORLD_SIZE}"
+  --train-iters "${TRAIN_ITERS}"
+  --eval-iters 0
+  --lr 1e-4
+  --min-lr 1e-5
+  --lr-decay-style constant
+  --bf16
+  --log-interval 1
+)
+
+DISTRIBUTED_ARGS=(
+  --nproc_per_node "${GPUS_PER_NODE}"
+  --nnodes "${NNODES}"
+  --node_rank "${NODE_RANK}"
+  --master_addr "${MASTER_ADDR}"
+  --master_port "${MASTER_PORT}"
+)
+
+echo "[run_phaseB] world=${WORLD_SIZE} EP=${EP_SIZE} experts=${NUM_EXPERTS} topk=${TOPK}"
+torchrun "${DISTRIBUTED_ARGS[@]}" \
+  "${EPLB_DIR}/scripts/pretrain_eplb_moe.py" \
+  "${MODEL_ARGS[@]}" "${MOE_ARGS[@]}" "${PARALLEL_ARGS[@]}" \
+  "${DATA_ARGS[@]}" "${TRAIN_ARGS[@]}"

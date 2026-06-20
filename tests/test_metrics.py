@@ -48,11 +48,10 @@ def test_metrics_phi_token_zero_when_no_movement():
         num_experts=4, num_ranks=R, weight_bytes_each=1000,
         s_tok=1, n_slot=4,
     )
-    # perfectly balanced, one expert per rank == its main: each rank routes only
-    # its own expert's tokens to itself.
+    # balanced: each rank r routes only expert r's tokens to itself (its main)
     lam = torch.zeros((R, 4), dtype=torch.int64)
     for r in range(R):
-        lam[r, r] = 100  # rank r sends only to expert r, whose main is rank r
+        lam[r, r] = 100
     loads = Loads(lam)
     plan = solve(loads, topo, spec, EPLBConfig())
     metrics = compute_metrics(plan, loads, topo, spec)
@@ -82,11 +81,9 @@ def test_rebalancer_single_process():
     plan = reb.plan_from_lambda(loads)
     assert plan.num_replicas().sum().item() >= 32
 
-    # forward via the already-gathered Lambda path (single process), then check
-    # the ring buffer + deterministic backward recompute.
+    # forward via the already-gathered Lambda path, then check backward recompute
     res = reb.rebalance_from_lambda(loads, layer_id=3, micro_batch_id=7)
     assert res.plan.tau >= 0
-    # backward recomputes deterministically from cached Lambda
     bwd_plan = reb.backward(layer_id=3, micro_batch_id=7)
     assert bwd_plan.tau == res.plan.tau
     assert bwd_plan.equals(res.plan)

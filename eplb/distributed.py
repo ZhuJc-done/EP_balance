@@ -1,13 +1,4 @@
-"""Collect the global load matrix ``Lambda`` with a single all-gather.
-
-This is the *only* communication the solver needs. Each rank contributes its own
-row ``Lambda[r, :]`` (the token counts it routes to every expert this
-micro-batch); after the all-gather every rank holds the full ``[R, E]`` matrix
-and can solve locally and identically. No broadcast, no CPU sync.
-
-Works under ``gloo`` (CPU, for the simulator/tests) and ``nccl`` (GPU). If
-``torch.distributed`` is not initialised, falls back to single-rank behaviour.
-"""
+"""Collect the global load matrix ``Lambda`` with a single all-gather (the solver's only communication)."""
 
 from __future__ import annotations
 

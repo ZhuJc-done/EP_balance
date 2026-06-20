@@ -1,22 +1,4 @@
-"""Per-micro-batch rebalancing orchestrator (K=1 by default).
-
-Usage inside a Megatron MoE layer (pseudo-code)::
-
-    rebalancer = EPLBRebalancer(topo, spec, cfg)          # once, per EP layer
-    ...
-    # forward, every micro-batch:
-    local_row = local_counts_from_routing(routed_expert_ids, E)
-    result = rebalancer.rebalance(local_row, layer_id, mb_id)
-    # -> dispatch with result.plan.q via your DeepEP Dispatcher
-    ...
-    # backward:
-    rebalancer.backward(layer_id, mb_id)   # re-derives plan, aggregates grads
-
-With ``K=1`` the solver runs for every (layer, micro-batch). Because the plan is
-a deterministic function of ``Lambda``, the backward pass can *recompute* it from
-the stored ``Lambda`` instead of caching the whole plan -- controlled by
-``cache_plans``.
-"""
+"""Per-micro-batch rebalancing orchestrator (collect Lambda -> solve -> apply, K=1 by default)."""
 
 from __future__ import annotations
 
@@ -42,13 +24,9 @@ class EPLBRebalancer:
         spec: Static problem spec.
         cfg: Solver config (defaults to :class:`EPLBConfig`).
         materializer: Backend weight materializer (defaults to no-op placeholder).
-        cache_plans: If True, keep solved plans keyed by ``(layer, mb)`` for the
-            backward pass (uses more memory). If False, the backward pass
-            recomputes the plan from the cached ``Lambda`` (less memory, relies on
-            determinism -- the recommended default for K=1).
-        ring_size: Max number of in-flight (layer, mb) entries to retain
-            (>= max in-flight micro-batches for PP/VPP). Older entries are
-            evicted FIFO.
+        cache_plans: If True, cache solved plans for backward; else recompute from
+            cached ``Lambda`` (less memory, relies on determinism; default for K=1).
+        ring_size: Max in-flight (layer, mb) entries to retain (FIFO eviction).
     """
 
     def __init__(
@@ -83,11 +61,7 @@ class EPLBRebalancer:
     def rebalance_from_lambda(
         self, loads: Loads, layer_id: int, micro_batch_id: int
     ) -> RebalanceResult:
-        """Like :meth:`rebalance` but for an already-gathered ``Lambda``.
-
-        Use this in single-process simulation/tests where the full ``[R, E]``
-        matrix is available without an all-gather.
-        """
+        """Like :meth:`rebalance` but for an already-gathered ``Lambda`` (single-process/sim)."""
         plan = self.plan_from_lambda(loads)
         self._remember(layer_id, micro_batch_id, loads.lam, plan)
         handle = self.materializer.materialize(plan, layer_id, micro_batch_id)
@@ -120,11 +94,7 @@ class EPLBRebalancer:
 
     # -- backward ---------------------------------------------------------------
     def backward(self, layer_id: int, micro_batch_id: int) -> Plan:
-        """Re-derive the forward plan for ``(layer, mb)`` and aggregate gradients.
-
-        Returns the plan used (recomputed from cached ``Lambda`` unless plan
-        caching is on), after invoking the materializer's gradient aggregation.
-        """
+        """Re-derive the forward plan for ``(layer, mb)`` and aggregate gradients."""
         key = (int(layer_id), int(micro_batch_id))
         if self.cache_plans and key in self._plan_ring:
             plan = self._plan_ring[key]

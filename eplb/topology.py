@@ -1,10 +1,4 @@
-"""Cluster topology: NVLink domains, ranks, and the per-token communication cost.
-
-The cost matrix ``c[r, r']`` is the (fixed-point integer) cost of moving one
-token's activation from rank ``r`` to rank ``r'``. ``c[r, r] == 0``. For a
-GB200-style cluster, intra-node (NVLink) cost is small and inter-node (RDMA)
-cost is large; the ratio should be calibrated from measured bandwidths.
-"""
+"""Cluster topology: NVLink domains, ranks, and the per-token communication cost matrix."""
 
 from __future__ import annotations
 
@@ -15,16 +9,10 @@ import torch
 
 @dataclass
 class Topology:
-    """Static cluster topology.
+    """Static cluster topology (domain id per rank + per-token cost matrix)."""
 
-    Attributes:
-        domain_of_rank: int64 tensor ``[R]`` mapping each rank to its NVLink
-            domain id (contiguous, ``0..M-1``).
-        cost: int64 tensor ``[R, R]`` per-token communication cost, ``c[r, r]=0``.
-    """
-
-    domain_of_rank: torch.Tensor
-    cost: torch.Tensor
+    domain_of_rank: torch.Tensor  # int64 [R], contiguous domain id 0..M-1
+    cost: torch.Tensor  # int64 [R, R] per-token comm cost, c[r,r]=0
 
     def __post_init__(self) -> None:
         self.domain_of_rank = self.domain_of_rank.to(torch.int64)
@@ -69,7 +57,7 @@ class Topology:
         inter_cost: int = 8,
         device: torch.device | str = "cpu",
     ) -> "Topology":
-        """Build a homogeneous-per-tier topology: one NVLink domain per node.
+        """Build a topology with one NVLink domain per node.
 
         Args:
             num_nodes: Number of physical nodes (= number of NVLink domains).

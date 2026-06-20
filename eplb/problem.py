@@ -1,8 +1,4 @@
-"""Static problem specification: the things that do *not* change every micro-batch.
-
-These describe the MoE layer + placement constraints. The dynamic per-mb load
-matrix ``Lambda`` lives in :mod:`eplb.loads`.
-"""
+"""Static problem specification: the per-layer constants that do not change every micro-batch."""
 
 from __future__ import annotations
 
@@ -13,25 +9,13 @@ import torch
 
 @dataclass
 class ProblemSpec:
-    """Static per-layer specification.
+    """Static per-layer specification (main placement, expert weights, slot budget)."""
 
-    Attributes:
-        num_experts: Number of (logical) routed experts ``E``.
-        main_rank: int64 tensor ``[E]`` giving ``main(e)``, the immutable rank
-            that holds expert ``e``'s primary instance (C7).
-        weight_bytes: int64 tensor ``[E]`` with ``|W_e|`` (bytes of one expert's
-            parameters). Used by the cross-domain replication gate (C6).
-        s_tok: Bytes of one token's activation moved on dispatch
-            (``hidden_dim * dtype_size``).
-        n_slot: Per-rank replica slot budget ``N_slot`` (memory constraint, C4).
-            Each rank may host at most ``n_slot`` expert instances.
-    """
-
-    num_experts: int
-    main_rank: torch.Tensor
-    weight_bytes: torch.Tensor
-    s_tok: int
-    n_slot: int
+    num_experts: int  # number of logical routed experts E
+    main_rank: torch.Tensor  # int64 [E], immutable main(e) rank (C7)
+    weight_bytes: torch.Tensor  # int64 [E], |W_e| used by the C6 gate
+    s_tok: int  # bytes of one token's activation (hidden_dim * dtype_size)
+    n_slot: int  # per-rank instance slot budget N_slot (C4)
 
     def __post_init__(self) -> None:
         self.main_rank = self.main_rank.to(torch.int64)
@@ -55,7 +39,7 @@ class ProblemSpec:
             raise ValueError("s_tok must be a positive integer")
         if self.n_slot <= 0:
             raise ValueError("n_slot must be a positive integer")
-        # Each rank must be able to hold the mains assigned to it (C4 feasibility).
+        # each rank must be able to hold the mains assigned to it (C4 feasibility)
         mains_per_rank = torch.bincount(self.main_rank, minlength=num_ranks)
         if torch.any(mains_per_rank > self.n_slot):
             raise ValueError(

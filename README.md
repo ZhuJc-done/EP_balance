@@ -6,10 +6,16 @@ compute by **replicating** hot experts (never rearranging them), planning replic
 placement and token routing so per-rank load is even and cross-domain traffic is
 minimized.
 
-This repo is the **reference implementation + research/eval harness**: a correct,
-bit-identical PyTorch solver you can validate on CPU (no GPU needed), structured
-so the hot path can later be swapped for a single-SM CUDA kernel and wired into
-Megatron-LM + DeepEP.
+## What this repo is
+
+1. A **reference solver** — a correct, bit-identical PyTorch implementation of the
+   Stage 0/1/2 algorithm you can run and validate entirely on CPU (no GPU needed).
+2. An **integration harness for Megatron-LM** — glue (`eplb/integration/megatron.py`)
+   and ready-to-run cluster scripts (`scripts/`) to capture real MoE routing,
+   solve, and verify determinism on real GPUs, staged so the risky parts come last.
+
+The hot path is structured so it can later be swapped for a single-SM CUDA kernel
+and wired into Megatron-LM + DeepEP.
 
 > Design follows the *Scale-EPLB 问题定义* doc and targets the *scale-EPLB 实验计划*
 > (4 nodes × 8 GB200, K=1 per-mb × per-layer replanning, stateless replicas).
@@ -48,6 +54,9 @@ python -m sim.run_sim --nodes 4 --gpus 8 --experts 64 --skew 1.5
 
 # multi-process determinism check (gloo): every rank computes a bit-identical plan
 python -m sim.run_dist --world-size 8 --experts 64 --skew 1.5
+
+# Megatron-shaped API demo (simulated routing, no Megatron needed)
+python -m examples.megatron_eplb_hook
 
 # tests
 pytest -q
@@ -99,6 +108,38 @@ result = reb.rebalance(local_row, layer_id=L, micro_batch_id=mb)  # all-gather +
 reb.backward(layer_id=L, micro_batch_id=mb)      # re-derives plan, aggregates grads
 ```
 
+## Run on a real cluster (Megatron-LM)
+
+Integration is **staged** so the high-risk parts (changing token dispatch) come
+last. See `scripts/README.md` for the push-and-run guide.
+
+- **Phase A — determinism / latency, no Megatron.** Verify bit-identical plans
+  (E3) and solver latency (E2) over NCCL at scale:
+  ```bash
+  torchrun --nproc_per_node=8 -m sim.run_dist --backend nccl --experts 64
+  ```
+- **Phase B — observe real routing, zero Megatron source edits.** Attach PyTorch
+  forward hooks to every MoE router to capture `Λ`, solve, and log/verify each
+  forward — dispatch unchanged. One call: `eplb.integration.megatron.setup_eplb_observer`.
+  Launch a tiny MoE with mock data via `scripts/run_phaseB.sh` (no data prep).
+- **Phase C — apply (the long pole).** Make the plan take effect by editing
+  `megatron/core/transformer/moe/token_dispatcher.py` to honor `plan.q` and wiring
+  a `WeightMaterializer` (replica weight transfer + gradient aggregation). Not yet
+  implemented; `eplb/integration/hooks.py` defines the interfaces.
+
+```python
+# Phase B, inside Megatron's model_provider (see scripts/pretrain_eplb_moe.py):
+from eplb.integration.megatron import setup_eplb_observer, assert_plan_replicated
+
+hook, handles = setup_eplb_observer(
+    model, num_experts=args.num_experts, weight_bytes_each=expert_param_bytes,
+    s_tok=args.hidden_size * 2, n_slot=2 * (args.num_experts // ep_size),
+    gpus_per_node=8, logger=print,
+)
+# ... run a few iters; rank 0 prints "[EPLB] layer=.. tau=.. imbalance=.." ...
+assert assert_plan_replicated(hook.last_plan, hook.ep_group)   # E3 on real routing
+```
+
 ## How the solver maps to the formulation
 
 | Doc symbol | Code |
@@ -117,9 +158,9 @@ Algorithm (`eplb/algorithm.py`), mirroring the doc's "算法设计":
 - **Stage 1** cross-domain replication gate (**C6**): admit a replica of `e` in
   domain `d` iff `‖W_e‖ < 2·T[d,e]·s_tok`, greedily by marginal benefit, under
   the slot budget.
-- **Stage 2** τ reduction by iterative replica insertion with argmax-slack / LPT
-  placement, then water-filling quota assignment (makespan-first, comm-cost
-  tie-break).
+- **Stage 2** intra-domain balancing: relieve the busiest rank by replicating its
+  top expert **inside its own domain**, then water-filling quota assignment with
+  strict domain-local serving (cross-domain only when no in-domain instance).
 
 Constraints **C1–C7** are checked by `eplb.check_constraints`:
 C1 conservation, C2 reachability, C3 makespan, C4 slot budget, C5 quota
@@ -149,18 +190,27 @@ eplb/
   integration/
     rebalancer.py  EPLBRebalancer: collect -> solve -> apply, ring buffer
     hooks.py       WeightMaterializer / Dispatcher interfaces (placeholders)
+    megatron.py    Megatron-Core glue: capture Λ, build spec, observe hooks (Phase B)
+examples/
+  megatron_eplb_hook.py   Megatron-shaped API demo + insertion-point docs
+scripts/
+  pretrain_eplb_moe.py    zero-fork Megatron entrypoint (attaches the observer)
+  run_phaseB.sh           torchrun launcher: tiny MoE + mock data
+  convert_hf_to_mcore.sh  optional HF -> mcore checkpoint conversion
 sim/
   workload.py      synthetic skewed Λ generators
   run_sim.py       single-process end-to-end demo
   run_dist.py      multi-process bit-identical verification (E3)
+  walkthrough.py   tiny fully-traced example of one solve
 tests/             pytest: constraints, determinism, metrics
 ```
 
 ## Status & roadmap
 
-**Implemented (this release):** deterministic reference solver, C1–C7 checks,
-metrics, real `torch.distributed` all-gather (gloo/NCCL), Megatron-oriented
-rebalancer with ring buffer + deterministic backward, CPU simulator, tests.
+**Implemented:** deterministic reference solver, C1–C7 checks, metrics, real
+`torch.distributed` all-gather (gloo/NCCL), Megatron rebalancer with ring buffer +
+deterministic backward, **Phase B** Megatron observer (forward-hook Λ capture, no
+source edits) + cluster scripts, CPU simulator, tests.
 
 **Placeholders (interfaces defined, backend not wired):**
 
@@ -172,11 +222,10 @@ rebalancer with ring buffer + deterministic backward, CPU simulator, tests.
 
 **Next steps (see the experiment plan):**
 
-1. Validate DeepEP `hybrid-ep` supports the **per-mb dynamic** replica layout +
-   quota dispatch (highest integration risk).
+1. **Phase C**: make the plan take effect — DeepEP dispatch honoring `plan.q` +
+   weight materialization (highest integration risk).
 2. Calibrate the cost model `c_{r,r'}`, `s_tok`, `η` from measured NVLink/RDMA
    bandwidth.
 3. Single-SM CUDA solver kernel to hit the ~100µs solving-overhead target (E2),
    validated bit-for-bit against this Python oracle.
 4. Optional OR-Tools MILP oracle to measure the greedy's optimality gap.
-```

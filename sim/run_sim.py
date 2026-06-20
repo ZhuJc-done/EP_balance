@@ -1,12 +1,4 @@
-"""End-to-end CPU simulation of one Scale-EPLB rebalance.
-
-Run::
-
-    python -m sim.run_sim --nodes 4 --gpus 8 --experts 64 --skew 1.5
-
-It builds a 4x8 NVLink+RDMA topology, a skewed load matrix, solves, verifies
-C1-C7, and prints before/after load imbalance. No GPU required.
-"""
+"""End-to-end CPU simulation of one Scale-EPLB rebalance (run: python -m sim.run_sim)."""
 
 from __future__ import annotations
 

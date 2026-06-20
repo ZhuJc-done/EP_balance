@@ -1,10 +1,4 @@
-"""Determinism: the plan is a bit-identical function of Lambda.
-
-This is the property that lets every rank solve locally without any broadcast or
-CPU sync (experiment E3). We check that (a) re-solving is bit-identical, and
-(b) the plan does not depend on the *storage* rank order: permuting ranks (and
-the topology/spec accordingly) yields the correspondingly permuted plan.
-"""
+"""Determinism: the plan is a bit-identical function of Lambda (enables CPU-sync-free E3)."""
 
 import torch
 
@@ -34,13 +28,7 @@ def test_resolve_bit_identical():
 
 
 def test_invariant_to_input_memory_layout():
-    """The plan must not depend on the input tensor's memory layout.
-
-    A non-contiguous / differently-strided ``Lambda`` holding the same values
-    must yield a bit-identical plan. This guards against layout-dependent,
-    non-deterministic reductions on the decision path -- the actual risk behind
-    the E3 "bit-identical across rank-GPU mapping" requirement.
-    """
+    """A value-identical but non-contiguous Lambda must yield a bit-identical plan."""
     topo, spec, cfg, R = _setup()
     loads = make_loads(R, 64, tokens_per_rank=4096, top_k=6, skew=1.5,
                        hotspot_ranks=0.25, seed=123)

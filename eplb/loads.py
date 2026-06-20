@@ -1,9 +1,4 @@
-"""Dynamic per-micro-batch load matrix ``Lambda`` and its derived aggregates.
-
-``Lambda[r, e]`` = number of tokens that *originate* on rank ``r`` and are routed
-by the gate to expert ``e`` for this micro-batch / layer. Counts are integers so
-the plan is bit-identical across ranks.
-"""
+"""Dynamic per-micro-batch load matrix ``Lambda[r,e]`` (integer token counts) and its aggregates."""
 
 from __future__ import annotations
 
@@ -14,13 +9,9 @@ import torch
 
 @dataclass
 class Loads:
-    """The dynamic routing load for one (layer, micro-batch).
+    """The dynamic routing load for one (layer, micro-batch)."""
 
-    Attributes:
-        lam: int64 tensor ``[R, E]`` token counts, ``Lambda[r, e]``.
-    """
-
-    lam: torch.Tensor
+    lam: torch.Tensor  # int64 [R, E] token counts, Lambda[r, e]
 
     def __post_init__(self) -> None:
         self.lam = self.lam.to(torch.int64)

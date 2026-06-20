@@ -1,17 +1,4 @@
-"""Multi-process verification of the no-CPU-sync, bit-identical-plan property.
-
-Each process is one EP rank. Every rank builds *only its own* row of ``Lambda``,
-all-gathers, solves locally, and we verify all ranks produced a bit-identical
-plan (experiment E3) -- with no broadcast of the plan itself.
-
-Run on CPU (gloo) locally::
-
-    python -m sim.run_dist --world-size 8 --experts 64 --skew 1.5
-
-Run on GPUs (nccl) via torchrun::
-
-    torchrun --nproc_per_node=8 -m sim.run_dist --backend nccl --experts 64
-"""
+"""Multi-process verification (E3) that every rank all-gathers Lambda and solves a bit-identical plan."""
 
 from __future__ import annotations
 

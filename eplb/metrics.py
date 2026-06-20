@@ -16,28 +16,16 @@ from .topology import Topology
 
 @dataclass
 class Metrics:
-    """Quantitative quality of a plan.
+    """Quantitative quality of a plan."""
 
-    Attributes:
-        tau: Makespan (max per-rank token load).
-        mean_load: Mean per-rank load.
-        imbalance: ``tau / mean_load`` (1.0 is perfect). The whole point of EPLB
-            is to drive this toward 1.0.
-        phi_token: Token communication cost ``sum c[r,r'] q[r,e,r']``.
-        phi_weight: Weight movement cost ``sum_{e,r!=main} 2 c[main,r] |W_e| x``.
-        objective: ``alpha tau + beta phi_token + gamma phi_weight``.
-        total_replicas: Total physical instances across all experts.
-        max_slots_used: Max instances hosted on any single rank.
-    """
-
-    tau: int
-    mean_load: float
-    imbalance: float
-    phi_token: int
-    phi_weight: int
-    objective: int
-    total_replicas: int
-    max_slots_used: int
+    tau: int  # makespan (max per-rank token load)
+    mean_load: float  # mean per-rank load
+    imbalance: float  # tau / mean_load (1.0 is perfect)
+    phi_token: int  # token comm cost sum c[r,r'] q[r,e,r']
+    phi_weight: int  # weight movement cost sum_{e,r!=main} 2 c[main,r] |W_e| x
+    objective: int  # alpha tau + beta phi_token + gamma phi_weight
+    total_replicas: int  # total physical instances across all experts
+    max_slots_used: int  # max instances hosted on any single rank
 
 
 def compute_metrics(
@@ -58,12 +46,11 @@ def compute_metrics(
     imbalance = (tau / mean_load) if mean_load > 0 else 1.0
 
     # Phi_token = sum_{r,e,r'} c[r,r'] q[r,e,r']
-    # q is [R, E, R]; cost is [R, R] over (src, dst).
     phi_token = int(torch.einsum("rd,red->", cost.to(torch.int64), plan.q).item())
 
     # Phi_weight = sum_{e, r!=main(e)} 2 c[main(e), r] |W_e| x[e, r]
     main_rank = spec.main_rank
-    c_main = cost[main_rank]  # [E, R] cost from each expert's main to every rank
+    c_main = cost[main_rank]
     x = plan.x.to(torch.int64)
     # zero out the main column so r==main contributes nothing
     not_main = torch.ones_like(x)
@@ -129,7 +116,7 @@ def check_constraints(
     if torch.any((q * forbidden.unsqueeze(0).to(q.dtype)) != 0):
         v.append("C2 reachability violated: quota routed to a rank without an instance")
 
-    # C3 makespan threshold is the objective tau itself; report consistency only.
+    # C3 makespan: check plan.tau matches the realised max rank load
     load = q.sum(dim=(0, 1))
     if int(load.max().item()) != int(plan.tau):
         v.append(
@@ -148,8 +135,7 @@ def check_constraints(
         if nz.numel() and int(nz.min().item()) < cfg.u_min:
             v.append(f"C5 granularity violated: a nonzero quota < u_min={cfg.u_min}")
 
-    # C6 cross-domain replica gate: any cross-domain replica must satisfy
-    # |W_e| < 2 T[dom(r),e] s_tok
+    # C6 cross-domain gate: any cross-domain replica must satisfy |W_e| < 2 T[dom(r),e] s_tok
     Tde = loads.domain_demand(dom, topo.num_domains)
     for e in range(E):
         hosts = torch.nonzero(x[e] == 1, as_tuple=False).flatten()

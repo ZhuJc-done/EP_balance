@@ -1,9 +1,4 @@
-"""Synthetic load-matrix (``Lambda``) generators for experiments and tests.
-
-Real MoE routing is heavily skewed (a few hot experts), which is exactly what
-EPLB must fix. These generators produce integer ``[R, E]`` matrices with
-controllable skew so the solver can be stressed without a real model.
-"""
+"""Synthetic, controllably-skewed load-matrix (``Lambda``) generators for experiments and tests."""
 
 from __future__ import annotations
 
@@ -29,11 +24,8 @@ def make_loads(
         num_experts: ``E``.
         tokens_per_rank: Tokens emitted per source rank (before top_k).
         top_k: Experts activated per token (load is ``tokens_per_rank * top_k``).
-        skew: 0.0 = uniform expert popularity; larger = more concentrated
-            (Zipf-like exponent). Try 0.0, 1.0, 2.0.
-        hotspot_ranks: Fraction of ranks (from rank 0) whose tokens all pile onto
-            the hottest experts (simulates domain-local hotspots). 1.0 = all
-            ranks share the same skewed distribution.
+        skew: Zipf-like exponent; 0.0 = uniform popularity, larger = more concentrated.
+        hotspot_ranks: Fraction of ranks (from rank 0) sharing the skewed distribution (1.0 = all).
         seed: RNG seed (per-call deterministic).
         device: Tensor device.
 
@@ -42,7 +34,7 @@ def make_loads(
     """
     g = torch.Generator(device="cpu").manual_seed(int(seed))
 
-    # base popularity over experts (Zipf-ish): p_e ~ 1 / (rank_e + 1)^skew
+    # base popularity p_e ~ 1 / (rank_e + 1)^skew
     ranks_e = torch.arange(num_experts, dtype=torch.float64)
     base = 1.0 / torch.pow(ranks_e + 1.0, float(skew))
     base = base / base.sum()
@@ -55,9 +47,8 @@ def make_loads(
         if r < n_hot:
             probs = base
         else:
-            # cooler ranks: flatten the distribution toward uniform
+            # cooler ranks: flatten toward uniform
             probs = 0.5 * base + 0.5 * (torch.ones_like(base) / num_experts)
-        # shuffle which expert ids are "hot" per rank a little, deterministically
         counts = torch.multinomial(
             probs, total_per_rank, replacement=True, generator=g
         )

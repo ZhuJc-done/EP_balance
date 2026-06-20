@@ -1,10 +1,4 @@
-"""The output of the solver: a placement table ``x`` and a routing/quota table ``q``.
-
-These two tensors are everything the dispatch/combine layer needs:
-  * ``x[e, r] == 1``  -> rank ``r`` hosts an instance of expert ``e``.
-  * ``q[r, e, r'] = k`` -> route ``k`` of rank ``r``'s tokens for expert ``e`` to
-    the instance on rank ``r'`` (only nonzero where ``x[e, r'] == 1``).
-"""
+"""The solver output: placement table ``x`` and routing quota table ``q`` for dispatch/combine."""
 
 from __future__ import annotations
 
@@ -15,17 +9,11 @@ import torch
 
 @dataclass
 class Plan:
-    """Solver output.
+    """Solver output (placement, routing quota, makespan)."""
 
-    Attributes:
-        x: int8 tensor ``[E, R]`` placement table (1 = instance present).
-        q: int64 tensor ``[R, E, R]`` routing quota ``q[src, e, dst]``.
-        tau: Resulting per-rank makespan (max destination token load).
-    """
-
-    x: torch.Tensor
-    q: torch.Tensor
-    tau: int
+    x: torch.Tensor  # int8 [E, R] placement table (1 = instance present)
+    q: torch.Tensor  # int64 [R, E, R] routing quota q[src, e, dst]
+    tau: int  # resulting per-rank makespan (max destination token load)
 
     @property
     def num_experts(self) -> int:
@@ -52,15 +40,14 @@ class Plan:
         return self.x.sum(dim=0).to(torch.int64)
 
     def dispatch_indices(self, src_rank: int):
-        """Convenience view for a dispatcher: for ``src_rank`` return, per expert,
-        the destination ranks and the token counts assigned to each.
+        """Per-expert destination ranks and token counts for ``src_rank``.
 
         Returns:
             dict ``{e: (dst_ranks: LongTensor, counts: LongTensor)}`` for experts
             with nonzero quota originating at ``src_rank``.
         """
         out = {}
-        qe = self.q[src_rank]  # [E, R]
+        qe = self.q[src_rank]
         for e in range(self.num_experts):
             row = qe[e]
             dsts = torch.nonzero(row > 0, as_tuple=False).flatten()
