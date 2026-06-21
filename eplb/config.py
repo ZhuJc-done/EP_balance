@@ -16,12 +16,15 @@ class EPLBConfig:
     u_min: int = 1  # minimum routing quota granularity (C5)
     allow_cross_domain: bool = True  # if False, Stage 1 is skipped (single-domain runs)
     max_stage2_iters: int = 4096  # safety cap on replicas Stage 2 may add
-    tau_bisect_iters: int = 24  # reserved for an explicit tau-bisection variant
+    tau_bisect_iters: int = 24  # tau-descent step budget for the bisect Stage 2 (per domain)
+    stage2_mode: str = "greedy"  # "greedy" (global LPT relief) or "bisect" (per-domain tau-descent)
 
     def __post_init__(self) -> None:
         for name in ("alpha", "beta", "gamma", "eta_milli", "u_min", "max_stage2_iters"):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"EPLBConfig.{name} must be a positive integer")
+        if self.stage2_mode not in ("greedy", "bisect"):
+            raise ValueError("EPLBConfig.stage2_mode must be 'greedy' or 'bisect'")
 
     @property
     def eta(self) -> float:
