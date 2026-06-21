@@ -24,7 +24,7 @@ def _plan_hash(plan) -> str:
 
 
 def _worker(rank: int, args, full_lam_bytes: bytes, lam_shape):
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", str(args.port))
     dist.init_process_group(
         backend=args.backend, rank=rank, world_size=args.world_size

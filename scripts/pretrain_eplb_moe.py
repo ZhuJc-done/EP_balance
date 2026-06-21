@@ -1,8 +1,9 @@
-"""Zero-fork Megatron entrypoint for Scale-EPLB; EPLB_MODE=observe (Phase B) or apply (Phase C). See scripts/README.md."""
+"""Zero-fork Megatron-LM ``main`` entrypoint for Scale-EPLB; EPLB_MODE=observe (Phase B) or apply (Phase C)."""
 
 from __future__ import annotations
 
 import os
+import time
 
 import torch
 
@@ -40,9 +41,18 @@ def _eplb_params(args):
     )
 
 
-def model_provider(pre_process=True, post_process=True):
+def model_provider(
+    pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None
+):
     """Megatron's GPT model_provider plus the EPLB observer (Phase B) or dispatcher binding (Phase C)."""
-    model = pg.model_provider(pre_process, post_process)
+    model = pg.model_provider(
+        pg.gpt_builder,
+        pre_process,
+        post_process,
+        vp_stage=vp_stage,
+        config=config,
+        pg_collection=pg_collection,
+    )
     args = get_args()
     mode = os.environ.get("EPLB_MODE", "observe")
     if mode == "off" or not getattr(args, "num_experts", None):
@@ -76,10 +86,27 @@ def model_provider(pre_process=True, post_process=True):
 
 
 if __name__ == "__main__":
-    pretrain(
+    pg.set_startup_timestamps(program_start=time.time(), main_entry=time.time())
+
+    # Temporary for transition to core datasets (matches pretrain_gpt.py).
+    setattr(pg.train_valid_test_datasets_provider, "is_distributed", True)
+
+    # Optionally enable inprocess restart (no-op unless configured).
+    pretrain_fn, store = pg.inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
+
+    args = pg.parse_and_validate_args(
+        extra_args_provider=pg.add_modelopt_args if pg.has_nvidia_modelopt else None,
+        args_defaults={"tokenizer_type": "NullTokenizer"},
+    )
+    model_cfg = pg.gpt_config_from_args(args)
+    full_config = pg.pretrain_cfg_container_from_args(args, model_cfg)
+
+    pretrain_fn(
+        full_config,
         pg.train_valid_test_datasets_provider,
         model_provider,
         ModelType.encoder_or_decoder,
         pg.forward_step,
-        args_defaults={"tokenizer_type": "NullTokenizer"},
+        store=store,
+        get_embedding_ranks=pg.get_embedding_ranks,
     )

@@ -46,6 +46,24 @@ pip install -e ".[dev]"     # + pytest
 # pip install -e ".[oracle]"  # optional OR-Tools MILP oracle (future; gap measurement)
 ```
 
+The reference solver, simulator and tests are **pure CPU** and need only
+`torch>=2.1` and `numpy>=1.24` (Python `>=3.9`) — no GPU required.
+
+### Environment used / validated
+
+The CPU solver and tests run anywhere. The Megatron-LM integration (Phase B/C
+below) was developed and validated on:
+
+| Component | Version |
+|---|---|
+| Hardware | 4× NVIDIA GB200 (single node, `aarch64` Grace-Blackwell) |
+| OS / Python | Linux `aarch64` / Python 3.12.4 |
+| CUDA | 13.1 |
+| PyTorch | 2.9.1 (cu13 build) |
+| TransformerEngine | 2.16.0 (built from source for `sm_100`) |
+| Megatron-Core / Megatron-LM | 0.19.0 (`main`) |
+| NCCL / cuDNN | `nvidia-nccl-cu13` 2.30.7 / `nvidia-cudnn-cu13` 9.22 |
+
 ## Quick start (CPU, no GPU)
 
 ```bash
@@ -62,12 +80,12 @@ python -m examples.megatron_eplb_hook
 pytest -q
 ```
 
-Example `run_sim` output (imbalance 8.9× → 1.08×):
+Example `run_sim` output (imbalance 8.9× → 2.2×):
 
 ```
 Baseline (no replication):  tau=  218957  imbalance= 8.909
-Scale-EPLB plan          :  tau=   26441  imbalance= 1.076
-Makespan reduction       :   8.281x
+Scale-EPLB plan          :  tau=   53988  imbalance= 2.197
+Makespan reduction       :   4.056x
 Constraints C1-C7: OK
 ```
 
@@ -117,7 +135,11 @@ last. See `scripts/README.md` for the push-and-run guide.
   (E3) and solver latency (E2) over NCCL at scale:
   ```bash
   torchrun --nproc_per_node=8 -m sim.run_dist --backend nccl --experts 64
+  # on the 4x GB200 box: --nproc_per_node=4 --master_addr=localhost --master_port=6010 \
+  #                      -m sim.run_dist --backend nccl --world-size 4 --nodes 1 --gpus 4 --experts 64
   ```
+  Expected tail: every rank prints the same `plan_hash`/`tau` and
+  `E3 determinism check: PASS`.
 - **Phase B — observe real routing, zero Megatron source edits.** Attach PyTorch
   forward hooks to every MoE router to capture `Λ`, solve, and log/verify each
   forward — dispatch unchanged. One call: `eplb.integration.megatron.setup_eplb_observer`.
@@ -143,97 +165,57 @@ hook, handles = setup_eplb_observer(
 assert assert_plan_replicated(hook.last_plan, hook.ep_group)   # E3 on real routing
 ```
 
-## How the solver maps to the formulation
+## Tests
 
-| Doc symbol | Code |
-|---|---|
-| `Λ = [λ_{r,e}]` | `Loads.lam` `[R, E]` |
-| `λ_e`, `T_{d→e}` | `Loads.expert_load()`, `Loads.domain_demand()` |
-| `dom(r)`, `c_{r,r'}` | `Topology.domain_of_rank`, `Topology.cost` |
-| `main(e)`, `‖W_e‖`, `s_tok`, `N_slot` | `ProblemSpec.main_rank / weight_bytes / s_tok / n_slot` |
-| `x_{e,r}`, `q_{r,e,r'}`, `τ` | `Plan.x`, `Plan.q`, `Plan.tau` |
-| objective `α τ + β Φ_token + γ Φ_weight` | `Metrics.objective` |
-
-Algorithm (`eplb/algorithm.py`), mirroring the doc's "算法设计":
-
-- **Stage 0** precompute `λ_e`, `T[d,e]`, break-even threshold
-  `T*[e] = ceil(2‖W_e‖ / (η·s_tok))`.
-- **Stage 1** cross-domain replication gate (**C6**): admit a replica of `e` in
-  domain `d` iff `‖W_e‖ < 2·T[d,e]·s_tok`, greedily by marginal benefit, under
-  the slot budget.
-- **Stage 2** intra-domain balancing: relieve the busiest rank by replicating its
-  top expert **inside its own domain**, then water-filling quota assignment with
-  strict domain-local serving (cross-domain only when no in-domain instance).
-
-Constraints **C1–C7** are checked by `eplb.check_constraints`:
-C1 conservation, C2 reachability, C3 makespan, C4 slot budget, C5 quota
-granularity, C6 cross-domain gate, C7 main fixed.
-
-### Determinism contract
-
-Every decision uses **integer** arithmetic with a fully specified,
-rank-independent tie-break order (value → expert id → rank id). Inputs are
-integer token counts. Therefore all ranks that all-gather the same `Λ` produce a
-**bit-identical** `Plan` (verified by `sim/run_dist.py` and
-`tests/test_determinism.py`). The backward pass can recompute the plan from the
-cached `Λ` instead of storing it (`EPLBRebalancer(cache_plans=False)`).
-
-## Project layout
-
-```
-eplb/
-  config.py        EPLBConfig (α/β/γ, η, u_min, slot/gate knobs)
-  topology.py      Topology: NVLink domains + RDMA cost matrix
-  problem.py       ProblemSpec: main placement, weights, slot budget
-  loads.py         Loads: Λ matrix + aggregates
-  plan.py          Plan: x placement, q quota, tau
-  algorithm.py     solve(): Stage 0/1/2 deterministic solver
-  metrics.py       compute_metrics(), check_constraints() (C1-C7)
-  distributed.py   all_gather_lambda() (gloo/nccl), routing->counts helper
-  integration/
-    rebalancer.py  EPLBRebalancer: collect -> solve -> apply, ring buffer
-    hooks.py       WeightMaterializer / Dispatcher interfaces (placeholders)
-    megatron.py    Megatron-Core glue: capture Λ, build spec, observe hooks (Phase B)
-    comm.py        autograd all-to-all + broadcast-from-main (grad reduces to main)
-    dispatcher.py  replicated_moe_forward: replication-aware dispatch/combine (Phase C)
-    megatron_moe.py  bind MoELayer.forward to the replication dispatcher (Phase C apply)
-examples/
-  megatron_eplb_hook.py   Megatron-shaped API demo + insertion-point docs
-scripts/
-  pretrain_eplb_moe.py    zero-fork Megatron entrypoint (attaches the observer)
-  run_phaseB.sh           torchrun launcher: tiny MoE + mock data
-  convert_hf_to_mcore.sh  optional HF -> mcore checkpoint conversion
-sim/
-  workload.py      synthetic skewed Λ generators
-  run_sim.py       single-process end-to-end demo
-  run_dist.py      multi-process bit-identical verification (E3)
-  walkthrough.py   tiny fully-traced example of one solve
-tests/             pytest: constraints, determinism, metrics
+```bash
+pip install -e ".[dev]"
+pytest -q          # constraints (C1-C7), determinism, metrics, Phase C dispatcher
 ```
 
-## Status & roadmap
+The suite is CPU-only; the determinism and Phase C tests spawn one `gloo` process
+per rank to exercise the real all-gather / all-to-all path.
 
-**Implemented:** deterministic reference solver, C1–C7 checks, metrics, real
-`torch.distributed` all-gather (gloo/NCCL), Megatron rebalancer with ring buffer +
-deterministic backward, **Phase B** Megatron observer (forward-hook Λ capture, no
-source edits) + cluster scripts, **Phase C** reference replication dispatcher
-(gloo-verified compute-invariant dispatch/combine + per-mb weight materialization +
-gradient aggregation to `main(e)`), CPU simulator, tests.
+Notes for running the full suite:
 
-**Placeholders (interfaces defined, backend not wired):**
+- **Runtime.** The reference solver re-runs the full `O(R·E)` quota assignment on
+  every replica-insertion attempt (clarity over speed; the fast path is a future
+  CUDA kernel). A full `pytest` therefore takes a few minutes — the
+  `test_constraints` / `test_determinism` parametrisations dominate, not a hang.
+- **Loopback rendezvous.** The gloo-spawn tests rendezvous on `localhost` and a
+  low port. On sandboxed pods that block wildcard (`0.0.0.0` / `[::]`) binds and
+  the ephemeral port range — bind only loopback + low ports — keep `MASTER_ADDR`
+  at `localhost` (not `127.0.0.1`, which forces a wildcard bind) and pick a low
+  `--port` (e.g. `6000`). This is why `sim/run_dist.py`'s default `--port` may
+  need overriding there.
 
-- **Weight (re)materialization** — `eplb/integration/hooks.py:WeightMaterializer`.
-  Production: Triton/NVSHMEM prefetch of stateless replica weights, backward
-  re-materialize + gradient aggregation to `main(e)`. Currently `NullWeightMaterializer`.
-- **DeepEP dispatch/combine** — `hooks.py:Dispatcher`. Production: translate
-  `plan.q` into DeepEP's dynamic per-call layout.
+## Validated on 4× GB200 (this environment)
 
-**Next steps (see the experiment plan):**
+End-to-end runs that passed on the box in [the env table](#environment-used--validated).
+All three Megatron phases use `--transformer-impl local` (no hard TE dependency),
+`--swiglu` experts and `--mock-data`, on `GPUS_PER_NODE=4` with a low `MASTER_PORT`:
 
-1. Bind `replicated_moe_forward` into Megatron's `MoELayer.forward` (flatten top-k
-   routing into units, pass the expert weights), then a DeepEP-fused fast path.
-2. Calibrate the cost model `c_{r,r'}`, `s_tok`, `η` from measured NVLink/RDMA
-   bandwidth.
-3. Single-SM CUDA solver kernel to hit the ~100µs solving-overhead target (E2),
-   validated bit-for-bit against this Python oracle.
-4. Optional OR-Tools MILP oracle to measure the greedy's optimality gap.
+```bash
+# one-time: make `eplb` importable + point at Megatron
+pip install -e .
+export MEGATRON_DIR=~/Megatron-LM EPLB_DIR=~/EP_balance GPUS_PER_NODE=4
+
+# Phase A — NCCL determinism (E3): all 4 ranks emit one bit-identical plan_hash
+torchrun --nproc_per_node=4 --master_addr=localhost --master_port=6010 \
+  -m sim.run_dist --backend nccl --world-size 4 --nodes 1 --gpus 4 --experts 64
+
+# Phase B — observe real Megatron routing (dispatch unchanged)
+MASTER_PORT=6008 bash scripts/run_phaseB.sh
+#   -> [EPLB] layer=0..3 mb=0 tau=~2100 imbalance≈1.0 replicas=~14   (uniform mock data)
+
+# Phase C — apply the replication dispatcher (loss decreases; EPLB active each mb)
+MASTER_PORT=6009 bash scripts/run_phaseC.sh
+#   -> iteration 1..20 | lm loss: 10.4 -> 9.45
+```
+
+If Megatron's MoE build pulls in a source-built TransformerEngine, also export the
+NCCL/cuDNN wheel libs before launching, e.g.:
+
+```bash
+NV=$(python -c "import nvidia,os;print(os.path.dirname(nvidia.__file__))")
+export LD_LIBRARY_PATH=$NV/nccl/lib:$NV/cudnn/lib:${LD_LIBRARY_PATH:-}
+```

@@ -1,10 +1,4 @@
-"""Phase C correctness: the replication dispatcher is compute-invariant.
-
-Splitting an expert's tokens across replicas (each materialising the same ``W_e`` from
-``main(e)``) must reproduce, bit-for-bit within fp tolerance, both the MoE outputs and the
-aggregated ``W_e`` gradient of computing every token on a single instance. Verified over
-gloo with one process per EP rank (the real all-gather/all-to-all path, on CPU).
-"""
+"""Phase C correctness: the replication dispatcher is compute-invariant (outputs + W_e grad match a single instance)."""
 
 import os
 
@@ -58,7 +52,7 @@ def _ground_truth(unit_expert, unit_prob, tokens, base_w1, base_w2):
 
 
 def _worker(rank, port):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(backend="gloo", rank=rank, world_size=W)
 
@@ -107,7 +101,7 @@ def _worker(rank, port):
 
 
 def test_replication_is_compute_invariant():
-    mp.spawn(_worker, args=(29555,), nprocs=W, join=True)
+    mp.spawn(_worker, args=(6005,), nprocs=W, join=True)
 
 
 def test_routing_to_units():

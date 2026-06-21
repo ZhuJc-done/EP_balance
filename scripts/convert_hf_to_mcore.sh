@@ -1,19 +1,5 @@
 #!/usr/bin/env bash
-# OPTIONAL: convert a HuggingFace MoE checkpoint to Megatron-Core format.
-#
-# Phase B with run_phaseB.sh needs NO real checkpoint (it uses --mock-data, which
-# is enough to validate the EPLB pipeline + determinism). Use this only when you
-# want REALISTIC routing skew from a pretrained MoE (e.g. Mixtral / Qwen-MoE /
-# DeepSeek), then point training at the converted checkpoint with --load.
-#
-# Two supported paths:
-#   (A) Megatron Bridge (recommended; HF<->Megatron recipes):
-#         pip install megatron-bridge
-#         # see https://github.com/NVIDIA/Megatron-LM (Megatron Bridge) for the
-#         # per-model recipe; it writes an mcore-format dist checkpoint.
-#   (B) Megatron-LM's tools/checkpoint/convert.py (loader/saver plugins).
-#
-# Example for Mixtral-8x7B via path (B). Adapt loader/args for other models.
+# OPTIONAL: convert a HuggingFace MoE checkpoint to Megatron-Core format for realistic routing skew (example: Mixtral-8x7B).
 set -euo pipefail
 
 MEGATRON_DIR="${MEGATRON_DIR:?set MEGATRON_DIR to the Megatron-LM repo root}"

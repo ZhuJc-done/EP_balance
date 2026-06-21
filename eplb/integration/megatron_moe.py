@@ -1,19 +1,4 @@
-"""Phase C binding: drive Megatron-Core's MoELayer through the Scale-EPLB replication dispatcher.
-
-Import-safe (no ``megatron`` import at load time). This replaces a ``MoELayer``'s token
-dispatch + expert compute with :func:`eplb.integration.dispatcher.replicated_moe_forward`,
-so the per-(layer,mb) plan actually takes effect: tokens are split across replicas and
-gradients aggregate back to ``main(e)``. The router is still called (its aux-loss side
-effects are preserved); only the dispatch/compute path is swapped.
-
-Supported expert module: ``SequentialMLP`` (a ModuleList of MLPs with ``linear_fc1`` /
-``linear_fc2``). ``GroupedMLP`` (``--moe-grouped-gemm``) is not yet supported here -- run
-the EPLB reference path with sequential experts first. Bias on experts is ignored (v1).
-
-Version caveat: Megatron's router output and expert attribute names vary across releases;
-the two clearly marked helpers below (`_routing_to_units`, `extract_local_expert_weights`)
-are where you adapt to your fork.
-"""
+"""Phase C binding (import-safe, SequentialMLP only): drive Megatron-Core's MoELayer through the EPLB replication dispatcher."""
 
 from __future__ import annotations
 

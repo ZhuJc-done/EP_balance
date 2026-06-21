@@ -1,11 +1,4 @@
-"""Phase C reference dispatcher: replication-aware MoE dispatch/combine over torch.distributed.
-
-Self-contained and gloo-testable (no DeepEP). Tokens for an expert are split across its
-replicas per ``plan.q``; replica weights are materialised from ``main(e)`` so backward
-aggregates every replica's gradient back to the single optimizer owner. The key invariant
-(verified by tests): replicating an expert is *compute-invariant* -- outputs and the
-aggregated ``W_e`` gradient are identical to computing all tokens on one instance.
-"""
+"""Phase C reference dispatcher: compute-invariant replication-aware MoE dispatch/combine over torch.distributed."""
 
 from __future__ import annotations
 
@@ -133,9 +126,7 @@ def replicated_moe_forward(
     result = torch.zeros((tokens.shape[0], H), dtype=out_per_unit.dtype, device=device)
     result = result.index_add(0, unit_token_idx, unit_prob.unsqueeze(1) * out_per_unit)
 
-    # keepalive: force every rank to traverse the same collective backward branches
-    # (broadcast-from-main and the dispatch all-to-all) even when it used none of them,
-    # so the in-backward collectives stay symmetric and cannot deadlock. Contributes 0.
+    # keepalive (contributes 0): force every rank through the same collective backward branches so they can't deadlock
     keep = recv_tokens.sum() * 0.0
     for e in replicated:
         for w in We[e]:

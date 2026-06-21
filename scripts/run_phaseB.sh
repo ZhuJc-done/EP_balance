@@ -1,18 +1,5 @@
 #!/usr/bin/env bash
-# Phase B launcher: run a tiny MoE GPT on Megatron with the Scale-EPLB observer.
-#
-# It uses --mock-data + NullTokenizer, so there is NO data/checkpoint prep: push
-# this repo + Megatron-LM to the cluster and run. Each forward prints, on rank 0:
-#   [EPLB] layer=.. mb=.. tau=.. imbalance=.. replicas=.. phi_token=..
-# which validates E2 (solver latency) and E3 (determinism) on REAL routing.
-#
-# Prereqs on the cluster:
-#   pip install -e /path/to/EP_balance            # makes `eplb` importable
-#   git clone https://github.com/NVIDIA/Megatron-LM && pip install -e Megatron-LM
-#
-# Usage (single node, 8 GPUs):
-#   MEGATRON_DIR=/path/to/Megatron-LM EPLB_DIR=/path/to/EP_balance bash scripts/run_phaseB.sh
-# Multi-node: set NNODES, NODE_RANK, MASTER_ADDR, MASTER_PORT on each node.
+# Phase B launcher: tiny MoE GPT on Megatron (--mock-data) with the Scale-EPLB observer; set MEGATRON_DIR/EPLB_DIR.
 set -euo pipefail
 
 # --- paths -------------------------------------------------------------------
@@ -43,6 +30,8 @@ MODEL_ARGS=(
   --seq-length 1024
   --max-position-embeddings 1024
   --position-embedding-type rope
+  --swiglu
+  --disable-bias-linear
   --transformer-impl local
 )
 
@@ -71,6 +60,7 @@ TRAIN_ARGS=(
   --global-batch-size "${WORLD_SIZE}"
   --train-iters "${TRAIN_ITERS}"
   --eval-iters 0
+  --eval-interval 1000000
   --lr 1e-4
   --min-lr 1e-5
   --lr-decay-style constant

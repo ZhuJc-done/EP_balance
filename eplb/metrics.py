@@ -45,8 +45,9 @@ def compute_metrics(
     mean_load = total_tokens / R if R > 0 else 0.0
     imbalance = (tau / mean_load) if mean_load > 0 else 1.0
 
-    # Phi_token = sum_{r,e,r'} c[r,r'] q[r,e,r']
-    phi_token = int(torch.einsum("rd,red->", cost.to(torch.int64), plan.q).item())
+    # Phi_token = sum_{r,e,r'} c[r,r'] q[r,e,r']; elementwise reduce (not einsum) for int64-on-CUDA support
+    cost_i64 = cost.to(torch.int64)  # [R, R] over (src, dst)
+    phi_token = int((plan.q * cost_i64.unsqueeze(1)).sum().item())
 
     # Phi_weight = sum_{e, r!=main(e)} 2 c[main(e), r] |W_e| x[e, r]
     main_rank = spec.main_rank
@@ -110,8 +111,7 @@ def check_constraints(
         bad = int((served != lam).sum().item())
         v.append(f"C1 conservation violated for {bad} (r,e) pairs")
 
-    # C2 reachability: q[r,e,r'] > 0 only where x[e,r'] == 1.
-    # forbidden[e, r'] is True where expert e has no instance on rank r'.
+    # C2 reachability: q[r,e,r'] > 0 only where x[e,r']==1 (forbidden marks ranks without an instance)
     forbidden = (x == 0)  # [E, R] over (e, dst)
     if torch.any((q * forbidden.unsqueeze(0).to(q.dtype)) != 0):
         v.append("C2 reachability violated: quota routed to a rank without an instance")

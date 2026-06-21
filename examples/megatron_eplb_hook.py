@@ -1,58 +1,4 @@
-"""How to wire Scale-EPLB into Megatron-Core's MoE layer, plus a runnable CPU demo.
-
-Run the demo (no GPU/Megatron needed):
-    python -m examples.megatron_eplb_hook
-
-================================================================================
-PHASE B -- observe, ZERO Megatron-Core source edits (recommended)
-================================================================================
-After Megatron builds the model (e.g. in pretrain_gpt.py's model_provider, or
-right after get_model()), attach forward-hook observers in one call:
-
-    from eplb.integration.megatron import setup_eplb_observer, assert_plan_replicated
-
-    hook, handles = setup_eplb_observer(
-        model,                       # the GPTModel (nn.Module)
-        num_experts=args.num_experts,
-        weight_bytes_each=expert_param_bytes,   # ~ #params_per_expert * dtype_size
-        s_tok=args.hidden_size * 2,             # bf16 activation bytes / token
-        n_slot=2 * (args.num_experts // ep_size),
-        gpus_per_node=8,
-        logger=print,               # prints "[EPLB] layer=.. tau=.. imbalance=.." each fwd
-    )
-    # ... run a few training iters; logs show real-routing imbalance vs EPLB makespan ...
-    assert assert_plan_replicated(hook.last_plan, hook.ep_group)   # E3 on real routing
-
-This needs NO edits to Megatron because register_forward_hook is a built-in
-PyTorch mechanism. It measures E2 (solver latency) + E3 (determinism) on real
-routing without changing dispatch.
-
-PHASE C -- apply, bind the MoELayer to the replication dispatcher
-================================================================================
-Patch each Megatron MoELayer to dispatch through Scale-EPLB (splits tokens across
-replicas per plan.q, materialises replica weights from main(e), aggregates grads):
-
-    from eplb import EPLBConfig, Topology
-    from eplb.integration import EPLBRebalancer, bind_eplb_to_moe_layer
-    from eplb.integration.megatron import build_spec_for_megatron
-    from megatron.core import parallel_state as mpu
-
-    ep_group = mpu.get_expert_model_parallel_group()
-    ep_size = mpu.get_expert_model_parallel_world_size()
-    for layer_id, moe in enumerate(find_moe_layers(model)):   # each MoELayer instance
-        topo = Topology.from_nvlink_rdma(ep_size // 4, 4, 1, 8, device='cuda')
-        spec = build_spec_for_megatron(num_experts, ep_size, w_bytes, s_tok, n_slot, 'cuda')
-        reb = EPLBRebalancer(topo, spec, EPLBConfig())
-        bind_eplb_to_moe_layer(moe, reb, ep_group, layer_id)
-
-Supports SequentialMLP experts (run without --moe-grouped-gemm). The correctness of
-the dispatch/combine + grad aggregation is verified on CPU in tests/test_phase_c.py.
-For peak performance, a DeepEP-fused fast path replaces this reference dispatcher later.
-
-For the standalone real-cluster determinism / latency runs (no Megatron):
-    torchrun --nproc_per_node=8 -m sim.run_dist --backend nccl --experts 64
-================================================================================
-"""
+"""Runnable CPU demo of wiring Scale-EPLB into Megatron-Core MoE (run: python -m examples.megatron_eplb_hook)."""
 
 from __future__ import annotations
 
@@ -96,8 +42,7 @@ def main() -> None:
         EPLBRebalancer(topo, spec, EPLBConfig()), mode="observe", logger=print
     )
 
-    # single process: build each EP rank's Lambda row from a simulated routing_map,
-    # then assemble the full matrix the all-gather would have produced.
+    # single process: build each EP rank's Lambda row from a simulated routing_map, then assemble the full matrix
     rows = []
     for r in range(ep_size):
         rmap = _fake_router_routing_map(num_tokens=2048, num_experts=num_experts,

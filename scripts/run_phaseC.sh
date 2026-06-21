@@ -1,21 +1,5 @@
 #!/usr/bin/env bash
-# Phase C launcher: end-to-end MoE training on Megatron with Scale-EPLB ACTIVE.
-#
-# Unlike Phase B (observe-only), this binds every MoELayer to the replication
-# dispatcher (EPLB_MODE=apply): tokens are split across replicas per plan.q, replica
-# weights are materialised from main(e), and gradients aggregate back to main(e).
-# Training (loss/backward/optimizer/checkpoint) is plain Megatron.
-#
-# IMPORTANT: do NOT pass --moe-grouped-gemm. The v1 binding supports SequentialMLP
-# (clean per-expert weights); GroupedMLP's fused weights are not yet sliced here.
-#
-# Prereqs on the cluster:
-#   pip install -e /path/to/EP_balance
-#   git clone https://github.com/NVIDIA/Megatron-LM && pip install -e Megatron-LM
-#
-# Usage (single node, 4 GB200):
-#   MEGATRON_DIR=/path/to/Megatron-LM EPLB_DIR=/path/to/EP_balance bash scripts/run_phaseC.sh
-# Full cluster (4 nodes x 4 GPUs): set NNODES=4 and per-node NODE_RANK/MASTER_ADDR/MASTER_PORT.
+# Phase C launcher: end-to-end MoE training with Scale-EPLB ACTIVE (EPLB_MODE=apply, SequentialMLP, no --moe-grouped-gemm).
 set -euo pipefail
 
 # --- paths -------------------------------------------------------------------
@@ -46,11 +30,12 @@ MODEL_ARGS=(
   --seq-length 1024
   --max-position-embeddings 1024
   --position-embedding-type rope
+  --swiglu
+  --disable-bias-linear
   --transformer-impl local
 )
 
-# NOTE: SequentialMLP experts (no --moe-grouped-gemm). Our dispatcher replaces the
-# token dispatcher at runtime, but Megatron still constructs one; alltoall is fine.
+# SequentialMLP experts (no --moe-grouped-gemm); our dispatcher replaces Megatron's at runtime, alltoall is fine
 MOE_ARGS=(
   --num-experts "${NUM_EXPERTS}"
   --moe-router-topk "${TOPK}"
@@ -76,6 +61,7 @@ TRAIN_ARGS=(
   --global-batch-size "${WORLD_SIZE}"
   --train-iters "${TRAIN_ITERS}"
   --eval-iters 0
+  --eval-interval 1000000
   --lr 1e-4
   --min-lr 1e-5
   --lr-decay-style constant
