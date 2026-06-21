@@ -86,7 +86,7 @@ def replicated_moe_forward(
 
     # materialise replicated experts' weights from main(e) (collective; every rank participates)
     num_replicas = plan.num_replicas()
-    replicated = [e for e in range(plan.num_experts) if int(num_replicas[e].item()) > 1]
+    replicated = (num_replicas > 1).nonzero(as_tuple=False).flatten().tolist()  # one D2H instead of per-expert
     We: Dict[int, Tuple[torch.Tensor, ...]] = {}
     for e in replicated:
         main_local = int(spec.main_rank[e].item())

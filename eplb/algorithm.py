@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .config import EPLBConfig
@@ -9,6 +11,7 @@ from .loads import Loads
 from .plan import Plan
 from .problem import ProblemSpec
 from .topology import Topology
+from .triton_solve import HAS_TRITON
 
 
 def _lexsort_keys(*keys: torch.Tensor) -> torch.Tensor:
@@ -154,6 +157,24 @@ def solve(
         spec.validate(R)
         loads.validate(R, E)
 
+    backend = os.environ.get("EPLB_SOLVER_BACKEND", "auto")
+
+    # bisect backend: tau-bisection heuristic (separate plan, not bit-identical to the greedy)
+    if backend == "bisect":
+        return solve_bisect(loads, topo, spec, cfg)
+
+    # GPU fast path: run the whole solver in one Triton launch (zero host sync), bit-identical to the reference
+    if (
+        R > 0
+        and E > 0
+        and loads.lam.is_cuda
+        and HAS_TRITON
+        and backend in ("auto", "fused")
+    ):
+        from .triton_solve import solve_fused
+
+        return solve_fused(loads, topo, spec, cfg)
+
     lam = loads.lam
     dom = topo.domain_of_rank
     cost = topo.cost
@@ -262,3 +283,198 @@ def solve(
             stuck[r_star] = True
 
     return Plan(x=x, q=q, tau=tau)
+
+
+def _stage01_placement(loads: Loads, topo: Topology, spec: ProblemSpec, cfg: EPLBConfig):
+    """Stage 0 (per-domain demand) + Stage 1 (C6-gated cross-domain admission), shared placement init.
+
+    Args:
+        loads: Dynamic load matrix ``Lambda``.
+        topo: Cluster topology.
+        spec: Static problem spec.
+        cfg: Solver configuration.
+
+    Returns:
+        ``(x, slot_used)`` where ``x`` is int8 ``[E, R]`` placement (mains + Stage 1
+        cross-domain replicas) and ``slot_used`` is int64 ``[R]`` instances per rank.
+    """
+    R = topo.num_ranks
+    E = spec.num_experts
+    device = loads.device
+    dom = topo.domain_of_rank
+    main_rank = spec.main_rank
+    main_dom = dom[main_rank]
+    W = spec.weight_bytes
+    s_tok = int(spec.s_tok)
+    n_slot = int(spec.n_slot)
+    M = topo.num_domains
+
+    Tde = loads.domain_demand(dom, M)
+    x = torch.zeros((E, R), dtype=torch.int8, device=device)
+    x[torch.arange(E, device=device, dtype=torch.int64), main_rank] = 1
+    slot_used = x.sum(dim=0).to(torch.int64)
+
+    if cfg.allow_cross_domain and M > 1:
+        cand_e, cand_d, cand_benefit = [], [], []
+        for e in range(E):
+            mde = int(main_dom[e].item())
+            we = int(W[e].item())
+            for d in range(M):
+                if d == mde:
+                    continue
+                t = int(Tde[d, e].item())
+                if t == 0:
+                    continue
+                if we < 2 * t * s_tok:  # C6 gate
+                    cand_e.append(e)
+                    cand_d.append(d)
+                    cand_benefit.append(2 * t * s_tok - we)
+        if cand_e:
+            ce = torch.tensor(cand_e, dtype=torch.int64, device=device)
+            cd = torch.tensor(cand_d, dtype=torch.int64, device=device)
+            cb = torch.tensor(cand_benefit, dtype=torch.int64, device=device)
+            order = _lexsort_keys(-cb, ce, cd)
+            for idx in order.tolist():
+                e = int(ce[idx].item())
+                d = int(cd[idx].item())
+                ranks_d = topo.ranks_in_domain(d)
+                if int(x[e, ranks_d].sum().item()) > 0:
+                    continue
+                free = ranks_d[slot_used[ranks_d] < n_slot]
+                if free.numel() == 0:
+                    continue
+                chosen_order = _lexsort_keys(slot_used[free], free)
+                chosen = int(free[chosen_order[0]].item())
+                x[e, chosen] = 1
+                slot_used[chosen] += 1
+
+    return x, slot_used
+
+
+def solve_bisect(
+    loads: Loads,
+    topo: Topology,
+    spec: ProblemSpec,
+    cfg: EPLBConfig | None = None,
+) -> Plan:
+    """tau-bisection solver (CPU reference): Stage 0/1 as usual, then a makespan-bisection
+    descent driven by an expert-granular incremental relief oracle.
+
+    Each step targets the midpoint between the even-split lower bound and the current exact
+    makespan; an oracle proposes a *batch* of intra-domain replicas (expert-granular:
+    replicate the bottleneck rank's top contributor, re-waterfill its in-domain tokens),
+    then one exact :func:`_assign_quota` reseeds the next step so optimism cannot drift. This
+    needs only ``O(log L)`` exact routes vs the greedy solver's ``O(#replicas)`` re-routes,
+    so it is a *different* heuristic and is not bit-identical to :func:`solve`.
+
+    Args:
+        loads: Dynamic load matrix ``Lambda`` (already all-gathered).
+        topo: Cluster topology.
+        spec: Static problem spec.
+        cfg: Solver configuration (uses ``cfg.tau_bisect_iters`` probe budget).
+
+    Returns:
+        A :class:`~eplb.plan.Plan` with placement ``x``, routing quota ``q`` and makespan ``tau``.
+    """
+    cfg = cfg or EPLBConfig()
+    R = topo.num_ranks
+    E = spec.num_experts
+    device = loads.device
+    dom = topo.domain_of_rank
+    cost = topo.cost
+    n_slot = int(spec.n_slot)
+
+    if R == 0 or E == 0:
+        q = torch.zeros((R, E, R), dtype=torch.int64, device=device)
+        return Plan(x=torch.zeros((E, R), dtype=torch.int8, device=device), q=q, tau=0)
+
+    lam = loads.lam
+    dom_list = dom.tolist()
+    x_cur, su = _stage01_placement(loads, topo, spec, cfg)
+    su = su.tolist()
+
+    def _propose(load: list, contrib: torch.Tensor, x: torch.Tensor, target: int) -> list:
+        """Propose intra-domain replicas to push every rank's load <= ``target``.
+
+        Decides on an expert-granular incremental model (replicate the bottleneck rank's
+        top contributor, re-waterfill that expert's in-domain tokens). Seeded from the
+        caller's *exact* per-rank ``load`` so optimism cannot accumulate across iterations.
+
+        Args:
+            load: Exact per-rank token load (length ``R``) from the latest route.
+            contrib: int64 ``[E, R]`` per-(expert, dst) token contribution from that route.
+            x: int8 ``[E, R]`` current placement.
+            target: Makespan threshold to drive every rank under.
+
+        Returns:
+            List of ``(expert, rank)`` intra-domain replicas to add.
+        """
+        load = list(load)
+        cell = []
+        for r in range(R):
+            nz = torch.nonzero(contrib[:, r] > 0, as_tuple=False).flatten().tolist()
+            cell.append({e: int(contrib[e, r].item()) for e in nz})
+        hosts: dict[int, set] = {}
+        for r in range(R):
+            for e in torch.nonzero(x[:, r] == 1, as_tuple=False).flatten().tolist():
+                hosts.setdefault(e, set()).add(r)
+        su_local = list(su)
+        stuck: set = set()
+        added: list = []
+        while True:
+            cand = [r for r in range(R) if load[r] > target and r not in stuck]
+            if not cand:
+                return added
+            r_star = min(cand, key=lambda r: (-load[r], r))
+            d_star = dom_list[r_star]
+            ccell = cell[r_star]
+            max_c = max(ccell.values()) if ccell else 0
+            if max_c == 0:
+                stuck.add(r_star)
+                continue
+            e_star = min(e for e, v in ccell.items() if v == max_c)
+            hosts_e = hosts.get(e_star, set())
+            elig = [t for t in range(R)
+                    if dom_list[t] == d_star and su_local[t] < n_slot and t not in hosts_e]
+            if not elig:
+                stuck.add(r_star)
+                continue
+            t = min(elig, key=lambda t: (load[t], int(cost[r_star, t].item()), t))
+            # re-waterfill e_star's in-domain(d*) tokens over its d*-instances incl. the new replica
+            H = sorted(h for h in hosts_e if dom_list[h] == d_star)
+            H.append(t)
+            base_vals = [load[h] - cell[h].get(e_star, 0) for h in H]
+            pool = sum(cell[h].get(e_star, 0) for h in H)
+            base_t = torch.tensor(base_vals, dtype=torch.int64, device=device)
+            tie_t = torch.zeros(len(H), dtype=torch.int64, device=device)
+            addv = _waterfill(pool, base_t, tie_t).tolist()
+            for h, a, b in zip(H, addv, base_vals):
+                load[h] = b + a
+                cell[h][e_star] = a
+            hosts.setdefault(e_star, set()).add(t)
+            su_local[t] += 1
+            added.append((e_star, t))
+            stuck = set()  # loads changed; re-evaluate every rank
+
+    # makespan-bisection descent: each step halves the gap to the even-split lower bound,
+    # reseeding the oracle from the *exact* route so the proposal stays grounded. O(log L) routes.
+    lo = (int(lam.sum().item()) + R - 1) // R
+    best_x = x_cur.clone()
+    best_q, best_load = _assign_quota(lam, best_x, cost, dom)
+    best_tau = int(best_load.max().item())
+    for _ in range(int(cfg.tau_bisect_iters)):
+        q, load = _assign_quota(lam, x_cur, cost, dom)
+        tau = int(load.max().item())
+        if tau < best_tau:
+            best_tau, best_x, best_q = tau, x_cur.clone(), q
+        if tau <= lo:
+            break
+        target = (lo + tau) // 2
+        added = _propose(load.tolist(), q.sum(dim=0).to(torch.int64), x_cur, target)
+        if not added:
+            break
+        for (e, t) in added:
+            x_cur[e, t] = 1
+            su[t] += 1
+
+    return Plan(x=best_x, q=best_q, tau=best_tau)

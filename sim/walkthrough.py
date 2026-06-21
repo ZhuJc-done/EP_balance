@@ -46,7 +46,7 @@ print("\n=== FINAL PLAN ===")
 print("x[e,r] placement =\n", plan.x)
 print("num_replicas/e   =", plan.num_replicas().tolist())
 print("slots used/rank  =", plan.slots_used().tolist(), " (N_slot=2)")
-print("rank load L[r']  =", plan.rank_load().tolist(), " tau =", plan.tau)
+print("rank load L[r']  =", plan.rank_load().tolist(), " tau =", int(plan.tau))
 
 m = compute_metrics(plan, loads, topo, spec, cfg)
 print("imbalance        =", round(m.imbalance, 3))

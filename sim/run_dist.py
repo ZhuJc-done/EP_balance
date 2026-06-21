@@ -19,7 +19,7 @@ def _plan_hash(plan) -> str:
     h = hashlib.sha256()
     h.update(plan.x.cpu().numpy().tobytes())
     h.update(plan.q.cpu().numpy().tobytes())
-    h.update(str(plan.tau).encode())
+    h.update(str(int(plan.tau)).encode())
     return h.hexdigest()[:16]
 
 
