@@ -27,11 +27,27 @@ This needs NO edits to Megatron because register_forward_hook is a built-in
 PyTorch mechanism. It measures E2 (solver latency) + E3 (determinism) on real
 routing without changing dispatch.
 
-PHASE C -- apply, REQUIRES Megatron-Core source edits
+PHASE C -- apply, bind the MoELayer to the replication dispatcher
 ================================================================================
-To actually rebalance, edit megatron/core/transformer/moe/token_dispatcher.py
-to honor ``plan.q`` and wire a WeightMaterializer; then construct the hook with
-mode='apply'. (The long pole; reference FasterMoE's DYNREP for weight/grad logic.)
+Patch each Megatron MoELayer to dispatch through Scale-EPLB (splits tokens across
+replicas per plan.q, materialises replica weights from main(e), aggregates grads):
+
+    from eplb import EPLBConfig, Topology
+    from eplb.integration import EPLBRebalancer, bind_eplb_to_moe_layer
+    from eplb.integration.megatron import build_spec_for_megatron
+    from megatron.core import parallel_state as mpu
+
+    ep_group = mpu.get_expert_model_parallel_group()
+    ep_size = mpu.get_expert_model_parallel_world_size()
+    for layer_id, moe in enumerate(find_moe_layers(model)):   # each MoELayer instance
+        topo = Topology.from_nvlink_rdma(ep_size // 4, 4, 1, 8, device='cuda')
+        spec = build_spec_for_megatron(num_experts, ep_size, w_bytes, s_tok, n_slot, 'cuda')
+        reb = EPLBRebalancer(topo, spec, EPLBConfig())
+        bind_eplb_to_moe_layer(moe, reb, ep_group, layer_id)
+
+Supports SequentialMLP experts (run without --moe-grouped-gemm). The correctness of
+the dispatch/combine + grad aggregation is verified on CPU in tests/test_phase_c.py.
+For peak performance, a DeepEP-fused fast path replaces this reference dispatcher later.
 
 For the standalone real-cluster determinism / latency runs (no Megatron):
     torchrun --nproc_per_node=8 -m sim.run_dist --backend nccl --experts 64

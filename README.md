@@ -122,10 +122,13 @@ last. See `scripts/README.md` for the push-and-run guide.
   forward hooks to every MoE router to capture `Λ`, solve, and log/verify each
   forward — dispatch unchanged. One call: `eplb.integration.megatron.setup_eplb_observer`.
   Launch a tiny MoE with mock data via `scripts/run_phaseB.sh` (no data prep).
-- **Phase C — apply (the long pole).** Make the plan take effect by editing
-  `megatron/core/transformer/moe/token_dispatcher.py` to honor `plan.q` and wiring
-  a `WeightMaterializer` (replica weight transfer + gradient aggregation). Not yet
-  implemented; `eplb/integration/hooks.py` defines the interfaces.
+- **Phase C — apply.** A self-contained, gloo-verified reference dispatcher
+  (`eplb/integration/dispatcher.py:replicated_moe_forward`) makes the plan take
+  effect: it splits each expert's tokens across replicas per `plan.q`, materialises
+  replica weights from `main(e)` (differentiable, so backward aggregates every
+  replica's gradient to the one optimizer owner), and is **compute-invariant** vs a
+  single instance (`tests/test_phase_c.py`). Remaining: bind it into Megatron's
+  `MoELayer.forward`, and (later) a DeepEP-fused fast path for peak performance.
 
 ```python
 # Phase B, inside Megatron's model_provider (see scripts/pretrain_eplb_moe.py):
@@ -191,6 +194,9 @@ eplb/
     rebalancer.py  EPLBRebalancer: collect -> solve -> apply, ring buffer
     hooks.py       WeightMaterializer / Dispatcher interfaces (placeholders)
     megatron.py    Megatron-Core glue: capture Λ, build spec, observe hooks (Phase B)
+    comm.py        autograd all-to-all + broadcast-from-main (grad reduces to main)
+    dispatcher.py  replicated_moe_forward: replication-aware dispatch/combine (Phase C)
+    megatron_moe.py  bind MoELayer.forward to the replication dispatcher (Phase C apply)
 examples/
   megatron_eplb_hook.py   Megatron-shaped API demo + insertion-point docs
 scripts/
@@ -210,7 +216,9 @@ tests/             pytest: constraints, determinism, metrics
 **Implemented:** deterministic reference solver, C1–C7 checks, metrics, real
 `torch.distributed` all-gather (gloo/NCCL), Megatron rebalancer with ring buffer +
 deterministic backward, **Phase B** Megatron observer (forward-hook Λ capture, no
-source edits) + cluster scripts, CPU simulator, tests.
+source edits) + cluster scripts, **Phase C** reference replication dispatcher
+(gloo-verified compute-invariant dispatch/combine + per-mb weight materialization +
+gradient aggregation to `main(e)`), CPU simulator, tests.
 
 **Placeholders (interfaces defined, backend not wired):**
 
@@ -222,8 +230,8 @@ source edits) + cluster scripts, CPU simulator, tests.
 
 **Next steps (see the experiment plan):**
 
-1. **Phase C**: make the plan take effect — DeepEP dispatch honoring `plan.q` +
-   weight materialization (highest integration risk).
+1. Bind `replicated_moe_forward` into Megatron's `MoELayer.forward` (flatten top-k
+   routing into units, pass the expert weights), then a DeepEP-fused fast path.
 2. Calibrate the cost model `c_{r,r'}`, `s_tok`, `η` from measured NVLink/RDMA
    bandwidth.
 3. Single-SM CUDA solver kernel to hit the ~100µs solving-overhead target (E2),
