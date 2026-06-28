@@ -101,6 +101,7 @@ MODEL_ARGS=(
   --no-masked-softmax-fusion
   --no-bias-swiglu-fusion
   --no-gradient-accumulation-fusion
+  --no-persist-layer-norm
 )
 
 MOE_ARGS=(

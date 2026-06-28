@@ -30,13 +30,13 @@ and validated on:
 
 | Component | Version |
 |---|---|
-| Hardware | 4× NVIDIA GB200 (single node, `aarch64` Grace-Blackwell) |
-| OS / Python | Linux `aarch64` / Python 3.12.4 |
-| CUDA | 13.1 |
-| PyTorch | 2.9.1 (cu13 build) |
-| TransformerEngine | 2.16.0 (built from source for `sm_100`) |
+| Hardware | NVIDIA GB200 (`aarch64` Grace-Blackwell), driver 580.126.20 |
+| OS / Python | Linux `aarch64` (kernel 6.14) / Python 3.12.4 |
+| CUDA | 13.2 (PyTorch cu13 build) |
+| PyTorch | 2.11.0 (cu13 build) |
 | Megatron-Core / Megatron-LM | 0.19.0 (`main`) |
-| NCCL / cuDNN | `nvidia-nccl-cu13` 2.30.7 / `nvidia-cudnn-cu13` 9.22 |
+| NCCL / cuDNN | 2.28.9 / 9.22 |
+
 
 ## Quick start
 
