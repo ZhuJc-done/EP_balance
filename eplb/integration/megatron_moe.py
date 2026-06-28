@@ -18,10 +18,7 @@ def find_moe_layers(model, class_name: str = "MoELayer") -> List:
 
 
 def build_expert_mlp_fn(config) -> Callable[[torch.Tensor, Tuple[torch.Tensor, ...]], torch.Tensor]:
-    """Build an expert forward matching Megatron's MLP from its ``TransformerConfig``.
-
-    Weights are Megatron ``Linear`` tensors ``[out, in]`` (compute is ``x @ W.t()``).
-    Handles gated (SwiGLU-style) and plain activations.
+    """Build an expert forward matching Megatron's MLP (``[out, in]`` weights, gated or plain) from its ``TransformerConfig``.
 
     Args:
         config: Megatron ``TransformerConfig`` (uses ``gated_linear_unit`` + ``activation_func``).
@@ -133,10 +130,7 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
 
 
 def bind_eplb_to_moe_layer(moe_layer, rebalancer, ep_group, layer_id: int = 0) -> None:
-    """Patch a Megatron ``MoELayer`` instance to dispatch through Scale-EPLB (Phase C, apply).
-
-    Call once per MoE layer after the model is built. The layer's ``ProblemSpec`` comes from
-    ``rebalancer.spec`` (build it with :func:`build_spec_for_megatron`).
+    """Patch a Megatron ``MoELayer`` to dispatch through Scale-EPLB (Phase C apply; call once per layer, spec comes from ``rebalancer.spec``).
 
     Args:
         moe_layer: A Megatron ``MoELayer`` instance.

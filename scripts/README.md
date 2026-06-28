@@ -16,6 +16,8 @@ Run MoE on real Megatron-LM with Scale-EPLB, in two stages selected by `EPLB_MOD
 | `pretrain_eplb_moe.py` | Zero-fork entrypoint; `EPLB_MODE=observe\|apply\|off` in `model_provider`. |
 | `run_phaseB.sh` | `torchrun` launcher, observe mode, tiny MoE + `--mock-data`. |
 | `run_phaseC.sh` | `torchrun` launcher, apply mode, end-to-end training. |
+| `run_gb200_4x4.sh` | Multi-node 4 nodes x 4 GB200 launcher: Slurm auto-discovery + GB200 NCCL/RDMA env; mock-data smoke test by default, `REAL=1` forwards to `run_real_moe.sh`. |
+| `sbatch_gb200_4x4.sbatch` | Slurm wrapper (`sbatch`) that `srun`s `run_gb200_4x4.sh` (1 task/node). |
 | `convert_hf_to_mcore.sh` | Optional: convert a HF MoE checkpoint to mcore for realistic skew. |
 
 ## One-time setup (on the cluster)
@@ -53,6 +55,35 @@ MEGATRON_DIR=/path/to/Megatron-LM EPLB_DIR=/path/to/EP_balance \
 Trains normally (loss should decrease) with EPLB rebalancing each micro-batch.
 Full cluster (4 nodes x 4 GPUs): set `NNODES=4` and per-node `NODE_RANK`,
 `MASTER_ADDR`, `MASTER_PORT`; `EP_SIZE` defaults to the world size.
+
+## Multi-node 4 x GB200 (4 nodes x 4 GPUs = 16 ranks)
+
+`run_gb200_4x4.sh` adds Slurm rank/master auto-discovery and a GB200/Blackwell
+NCCL+RDMA env block on top of the entrypoint. Start with the safe observe-mode
+smoke test (no checkpoint/data), then move to apply / a real model.
+
+Under Slurm (recommended online):
+
+```bash
+MEGATRON_DIR=/path/to/Megatron-LM EPLB_DIR=/path/to/EP_balance \
+  sbatch scripts/sbatch_gb200_4x4.sbatch          # observe-mode smoke test on 16 GPUs
+```
+
+Manual (run on every node, set NODE_RANK=0..3 and MASTER_ADDR=node-0):
+
+```bash
+MEGATRON_DIR=/path/to/Megatron-LM EPLB_DIR=/path/to/EP_balance \
+NNODES=4 NODE_RANK=$RANK MASTER_ADDR=$HEAD MASTER_PORT=29500 \
+  bash scripts/run_gb200_4x4.sh
+```
+
+Then escalate: `EPLB_MODE=apply` (active dispatcher), or `REAL=1 MODEL=qwen3_30b_a3b`
+plus `CHECKPOINT`/`DATA_PATH`/`TOKENIZER_MODEL` to forward to `run_real_moe.sh`.
+Adjust `NCCL_IB_HCA` / `NCCL_SOCKET_IFNAME` / `NCCL_IB_GID_INDEX` to your fabric.
+
+> The training entrypoint uses the **reference** all-to-all dispatcher (observe/apply).
+> The sync-free DeepEP path (`eplb.integration.sync_free`) is validated by tests but is
+> not yet wired into `pretrain_eplb_moe.py`; add `DeepEPAdapter` there once on-cluster.
 
 ## Notes
 

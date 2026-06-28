@@ -177,9 +177,7 @@ def setup_eplb_observer(
     micro_batch_id_fn=None,
     router_class_name: str = "TopKRouter",
 ):
-    """One-call Phase B setup: read Megatron's EP state, build the rebalancer, attach observers.
-
-    Call once after the model is built; imports ``megatron`` lazily so CPU tests stay clean.
+    """One-call Phase B setup (call once after model build): read Megatron's EP state, build the rebalancer, attach observers.
 
     Args:
         model: The Megatron model (``nn.Module``) after construction.

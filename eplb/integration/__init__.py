@@ -9,6 +9,14 @@ from .hooks import (
 )
 from .dispatcher import replicated_moe_forward, assign_unit_dst
 from .comm import all_to_all_single, broadcast_from_main
+from .physical import assign_physical, build_phys_slot_table
+from .grouped_mlp import grouped_expert_mlp, make_batched_gated_mlp
+from .sync_free import (
+    CommAdapter,
+    AllToAllAdapter,
+    DeepEPAdapter,
+    sync_free_moe_forward,
+)
 from .megatron_moe import (
     bind_eplb_to_moe_layer,
     build_expert_mlp_fn,
@@ -26,6 +34,14 @@ __all__ = [
     "assign_unit_dst",
     "all_to_all_single",
     "broadcast_from_main",
+    "assign_physical",
+    "build_phys_slot_table",
+    "grouped_expert_mlp",
+    "make_batched_gated_mlp",
+    "CommAdapter",
+    "AllToAllAdapter",
+    "DeepEPAdapter",
+    "sync_free_moe_forward",
     "bind_eplb_to_moe_layer",
     "build_expert_mlp_fn",
     "extract_local_expert_weights",
