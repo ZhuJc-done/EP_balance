@@ -1,45 +1,28 @@
-"""Phase C binding (import-safe, SequentialMLP only): drive Megatron-Core's MoELayer through the EPLB replication dispatcher."""
+"""Phase C binding (import-safe, SequentialMLP only): drive Megatron-Core's MoELayer through the sync-free EPLB dispatcher."""
 
 from __future__ import annotations
 
+import os
 import types
-from typing import Callable, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.distributed as dist
 
 from . import profiling
 from ..problem import ProblemSpec
-from .dispatcher import replicated_moe_forward
+from .grouped_mlp import make_batched_gated_mlp
+from .sync_free import AllToAllAdapter, sync_free_moe_forward
+
+
+def _env_flag(name: str) -> bool:
+    """Truthy parse of an on/off environment toggle."""
+    return os.environ.get(name, "0").lower() not in ("0", "", "false", "no")
 
 
 def find_moe_layers(model, class_name: str = "MoELayer") -> List:
     """Collect every Megatron ``MoELayer`` instance in a model (by class name)."""
     return [m for _, m in model.named_modules() if type(m).__name__ == class_name]
-
-
-def build_expert_mlp_fn(config) -> Callable[[torch.Tensor, Tuple[torch.Tensor, ...]], torch.Tensor]:
-    """Build an expert forward matching Megatron's MLP (``[out, in]`` weights, gated or plain) from its ``TransformerConfig``.
-
-    Args:
-        config: Megatron ``TransformerConfig`` (uses ``gated_linear_unit`` + ``activation_func``).
-
-    Returns:
-        ``mlp_fn(x, (fc1_weight, fc2_weight)) -> y``.
-    """
-    gated = bool(getattr(config, "gated_linear_unit", False))
-    act = getattr(config, "activation_func", torch.nn.functional.gelu)
-
-    def mlp_fn(x: torch.Tensor, w: Tuple[torch.Tensor, ...]) -> torch.Tensor:
-        h = x @ w[0].t()
-        if gated:
-            gate, up = torch.chunk(h, 2, dim=-1)
-            h = act(gate) * up
-        else:
-            h = act(h)
-        return h @ w[1].t()
-
-    return mlp_fn
 
 
 def extract_local_expert_weights(
@@ -93,7 +76,7 @@ def _routing_to_units(
 
 
 def eplb_moe_forward(self, hidden_states, *args, **kwargs):
-    """Drop-in ``MoELayer.forward`` using the EPLB replication dispatcher (bound via :func:`bind_eplb_to_moe_layer`)."""
+    """Drop-in ``MoELayer.forward`` using the sync-free EPLB dispatcher (bound via :func:`bind_eplb_to_moe_layer`)."""
     cfg = self._eplb
     reb = cfg["reb"]
     group = cfg["group"]
@@ -120,13 +103,16 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
         ep_rank * num_local + i: weight_tuples[i] for i in range(num_local)
     }
 
-    out = replicated_moe_forward(
+    out = sync_free_moe_forward(
         tokens=tokens,
         unit_token_idx=unit_token_idx,
         unit_expert=unit_expert,
         unit_prob=unit_prob.to(tokens.dtype),
         plan=plan, spec=spec, weights_local=weights_local,
-        weight_shapes=weight_shapes, mlp_fn=cfg["mlp_fn"], group=group,
+        weight_shapes=weight_shapes, batched_mlp_fn=cfg["batched_mlp_fn"], cap=None,
+        group=group, adapter=cfg["adapter"],
+        rematerialize=cfg["rematerialize"], overlap=cfg["overlap"],
+        gated=cfg["gated"], act=cfg["act"], transpose_w=True,
     )
     if profiling.enabled():
         profiling.maybe_summary(print if ep_rank == 0 else None)
@@ -142,11 +128,19 @@ def bind_eplb_to_moe_layer(moe_layer, rebalancer, ep_group, layer_id: int = 0) -
         ep_group: The expert-model-parallel process group.
         layer_id: Stable id used as the rebalancer's ring-buffer key.
     """
+    config = moe_layer.config
+    gated = bool(getattr(config, "gated_linear_unit", False))
+    act = getattr(config, "activation_func", torch.nn.functional.gelu)
     moe_layer._eplb = {
         "reb": rebalancer,
         "group": ep_group,
         "layer_id": int(layer_id),
         "mb": 0,
-        "mlp_fn": build_expert_mlp_fn(moe_layer.config),
+        "gated": gated,
+        "act": act,
+        "batched_mlp_fn": make_batched_gated_mlp(gated, act),
+        "adapter": AllToAllAdapter(),
+        "rematerialize": _env_flag("EPLB_REMATERIALIZE"),
+        "overlap": _env_flag("EPLB_OVERLAP"),
     }
     moe_layer.forward = types.MethodType(eplb_moe_forward, moe_layer)

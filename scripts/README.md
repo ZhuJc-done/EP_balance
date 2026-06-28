@@ -5,8 +5,8 @@ Run MoE on real Megatron-LM with Scale-EPLB, in two stages selected by `EPLB_MOD
 - **Phase B (`observe`)** — attach forward-hook observers to capture real routing,
   solve, and log/verify each forward; **dispatch unchanged**, no Megatron source
   edits. Validates solver latency (E2) and bit-identical plans (E3) on real routing.
-- **Phase C (`apply`)** — bind every MoELayer to the replication dispatcher so the
-  plan **takes effect**: tokens split across replicas per `plan.q`, replica weights
+- **Phase C (`apply`)** — bind every MoELayer to the sync-free dispatcher so the
+  plan **takes effect**: tokens routed to physical instances per `plan.q`, replica weights
   materialised from `main(e)`, gradients aggregated back. Training stays plain Megatron.
 
 ## What's here
@@ -19,13 +19,32 @@ Run MoE on real Megatron-LM with Scale-EPLB, in two stages selected by `EPLB_MOD
 | `run_gb200_4x4.sh` | Multi-node 4 nodes x 4 GB200 launcher: Slurm auto-discovery + GB200 NCCL/RDMA env; mock-data smoke test by default, `REAL=1` forwards to `run_real_moe.sh`. |
 | `sbatch_gb200_4x4.sbatch` | Slurm wrapper (`sbatch`) that `srun`s `run_gb200_4x4.sh` (1 task/node). |
 | `convert_hf_to_mcore.sh` | Optional: convert a HF MoE checkpoint to mcore for realistic skew. |
+| `install_megatron.sh` | Clone+install a pinned community Megatron-LM and self-check `import megatron`. |
+| `install_deepep.sh` | Optional: clone+build DeepEP (NCCL Gin backend) for the sync-free transport. |
 
 ## One-time setup (on the cluster)
 
+Megatron-LM and DeepEP are **external dependencies** (not vendored / not submodules):
+they must be compiled+installed into the environment and are often already provided at a
+fixed cluster path. Install them with the helper scripts (each pins a commit and self-checks
+the import), then install `eplb`:
+
 ```bash
-git clone https://github.com/NVIDIA/Megatron-LM.git
-pip install -e Megatron-LM            # + transformer-engine/apex per its install guide
-pip install -e /path/to/EP_balance    # makes `eplb` importable
+# Megatron-LM (required) — pinned commit, editable install, import self-check
+MEGATRON_DIR=/opt/tiger/Megatron-LM bash scripts/install_megatron.sh
+
+# DeepEP (optional) — only for the fully sync-free DeepEPAdapter on a DeepEP-capable cluster
+DEEPEP_DIR=/opt/tiger/DeepEP bash scripts/install_deepep.sh
+
+pip install -e /path/to/EP_balance   # makes `eplb` importable
+```
+
+Or do it by hand (TE/Apex optional — the launchers use `--transformer-impl local`):
+
+```bash
+git clone https://github.com/NVIDIA/Megatron-LM.git && pip install -e Megatron-LM
+pip install transformers einops sentencepiece tiktoken regex
+pip install -e /path/to/EP_balance
 ```
 
 ## Phase B — observe (recommended first)
@@ -80,10 +99,6 @@ NNODES=4 NODE_RANK=$RANK MASTER_ADDR=$HEAD MASTER_PORT=29500 \
 Then escalate: `EPLB_MODE=apply` (active dispatcher), or `REAL=1 MODEL=qwen3_30b_a3b`
 plus `CHECKPOINT`/`DATA_PATH`/`TOKENIZER_MODEL` to forward to `run_real_moe.sh`.
 Adjust `NCCL_IB_HCA` / `NCCL_SOCKET_IFNAME` / `NCCL_IB_GID_INDEX` to your fabric.
-
-> The training entrypoint uses the **reference** all-to-all dispatcher (observe/apply).
-> The sync-free DeepEP path (`eplb.integration.sync_free`) is validated by tests but is
-> not yet wired into `pretrain_eplb_moe.py`; add `DeepEPAdapter` there once on-cluster.
 
 ## Notes
 

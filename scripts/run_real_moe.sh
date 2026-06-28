@@ -72,7 +72,7 @@ else
   exit 1
 fi
 
-# Phase C reference dispatcher needs SequentialMLP; off/observe use the fast native path (TE + grouped GEMM).
+# Phase C sync-free dispatcher needs SequentialMLP; off/observe use the fast native path (TE + grouped GEMM).
 if [[ "${EPLB_MODE}" == "apply" ]]; then
   MODEL_ARGS+=(--transformer-impl local)
   echo "[run_real_moe] EPLB_MODE=apply -> forcing SequentialMLP (local impl, no grouped GEMM): reference path, slower"

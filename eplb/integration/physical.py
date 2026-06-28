@@ -33,7 +33,7 @@ def assign_physical(
     spec: ProblemSpec,
     src_rank: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Assign each routing unit on ``src_rank`` to a physical instance, sync-free (matches ``assign_unit_dst``).
+    """Assign each routing unit on ``src_rank`` to a physical instance, sync-free (matches the host-loop reference router).
 
     Args:
         unit_expert: int64 ``[U]`` logical expert id of each routing unit (``U = N*topk``).

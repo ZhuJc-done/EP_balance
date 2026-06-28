@@ -4,11 +4,24 @@ import torch
 
 from eplb.algorithm import solve
 from eplb.config import EPLBConfig
-from eplb.integration.dispatcher import assign_unit_dst
 from eplb.integration.physical import assign_physical, build_phys_slot_table
 from eplb.loads import Loads
 from eplb.problem import ProblemSpec
 from eplb.topology import Topology
+
+
+def assign_unit_dst(unit_expert, plan, src_local_rank):
+    """Host-loop reference router (oracle): map each unit to a dst rank per ``plan.q[src, e, :]``."""
+    U = int(unit_expert.numel())
+    device = unit_expert.device
+    dst = torch.full((U,), -1, dtype=torch.int64, device=device)
+    r = int(src_local_rank)
+    for e in torch.unique(unit_expert).tolist():
+        idxs = torch.nonzero(unit_expert == e, as_tuple=False).flatten()
+        hosts = torch.nonzero(plan.x[e] == 1, as_tuple=False).flatten()
+        counts = plan.q[r, e, hosts].to(torch.int64)
+        dst[idxs] = torch.repeat_interleave(hosts, counts)
+    return dst
 
 
 def _make_case(seed: int, R_nodes=2, R_gpus=2, E=8, skew=2.0):

@@ -1,4 +1,4 @@
-"""Autograd-aware distributed primitives used by the Phase C replication dispatcher."""
+"""Autograd-aware distributed primitives used by the sync-free Phase C dispatcher."""
 
 from __future__ import annotations
 

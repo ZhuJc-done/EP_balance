@@ -34,9 +34,12 @@ and validated on:
 | OS / Python | Linux `aarch64` (kernel 6.14) / Python 3.12.4 |
 | CUDA | 13.2 (PyTorch cu13 build) |
 | PyTorch | 2.11.0 (cu13 build) |
-| Megatron-Core / Megatron-LM | 0.19.0 (`main`) |
+| Megatron-Core / Megatron-LM | 0.19.0 (`main`, commit `0ff7226f6`) |
 | NCCL / cuDNN | 2.28.9 / 9.22 |
 
+Megatron-LM and DeepEP are **external dependencies** (not vendored): install them with
+`scripts/install_megatron.sh` and `scripts/install_deepep.sh`, which
+pin a commit and self-check the import — see [`scripts/README.md`](scripts/README.md).
 
 ## Quick start
 
