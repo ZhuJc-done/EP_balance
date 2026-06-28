@@ -8,6 +8,7 @@ from typing import Callable, Dict, List, Tuple
 import torch
 import torch.distributed as dist
 
+from . import profiling
 from ..problem import ProblemSpec
 from .dispatcher import replicated_moe_forward
 
@@ -101,12 +102,13 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
     in_shape = hidden_states.shape
     tokens = hidden_states.reshape(-1, in_shape[-1])
 
-    probs, routing_map = self.router(hidden_states)
-    unit_token_idx, unit_expert, unit_prob = _routing_to_units(
-        probs, routing_map, tokens.shape[0], spec.num_experts
-    )
+    with profiling.record("apply/route", time_it=True, device=tokens.device):
+        probs, routing_map = self.router(hidden_states)
+        unit_token_idx, unit_expert, unit_prob = _routing_to_units(
+            probs, routing_map, tokens.shape[0], spec.num_experts
+        )
+        local_row = torch.bincount(unit_expert, minlength=spec.num_experts).to(torch.int64)
 
-    local_row = torch.bincount(unit_expert, minlength=spec.num_experts).to(torch.int64)
     mb = cfg["mb"]
     cfg["mb"] = mb + 1
     plan = reb.rebalance(local_row, cfg["layer_id"], mb, group=group).plan
@@ -126,6 +128,8 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
         plan=plan, spec=spec, weights_local=weights_local,
         weight_shapes=weight_shapes, mlp_fn=cfg["mlp_fn"], group=group,
     )
+    if profiling.enabled():
+        profiling.maybe_summary(print if ep_rank == 0 else None)
     return out.reshape(in_shape), None
 
 

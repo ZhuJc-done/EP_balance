@@ -13,6 +13,7 @@ from ..loads import Loads
 from ..plan import Plan
 from ..problem import ProblemSpec
 from ..topology import Topology
+from . import profiling
 from .hooks import NullWeightMaterializer, RebalanceResult, WeightMaterializer
 
 
@@ -56,7 +57,8 @@ class EPLBRebalancer:
     # -- forward ----------------------------------------------------------------
     def plan_from_lambda(self, loads: Loads) -> Plan:
         """Solve directly from an already-gathered ``Lambda`` (no communication)."""
-        return solve(loads, self.topo, self.spec, self.cfg, validate=False)
+        with profiling.record("solve", time_it=True, device=loads.device):
+            return solve(loads, self.topo, self.spec, self.cfg, validate=False)
 
     def rebalance_from_lambda(
         self, loads: Loads, layer_id: int, micro_batch_id: int
@@ -86,7 +88,8 @@ class EPLBRebalancer:
         Returns:
             :class:`RebalanceResult` with the plan and a weight handle.
         """
-        loads = all_gather_lambda(local_row, group=group)
+        with profiling.record("all_gather_lambda", time_it=True, device=local_row.device):
+            loads = all_gather_lambda(local_row, group=group)
         plan = self.plan_from_lambda(loads)
         self._remember(layer_id, micro_batch_id, loads.lam, plan)
         handle = self.materializer.materialize(plan, layer_id, micro_batch_id)
