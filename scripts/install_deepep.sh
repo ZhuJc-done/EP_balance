@@ -38,6 +38,21 @@ if [ "$DEEPEP_COMMIT" != "main" ]; then
   git -C "$DEEPEP_DIR" checkout "$DEEPEP_COMMIT"
 fi
 
+NCCL_LIB_DIR="$(python - <<'PY'
+import os
+try:
+    import deep_ep.find_pkgs as fp  # DeepEP ships the same resolver it uses in setup.py
+    print(f"{fp.find_nccl_root()}/lib")
+except Exception:
+    import nvidia.nccl, os
+    print(os.path.join(os.path.dirname(nvidia.nccl.__file__), "lib"))
+PY
+)"
+if [ -n "$NCCL_LIB_DIR" ] && [ -d "$NCCL_LIB_DIR" ]; then
+  export LIBRARY_PATH="${NCCL_LIB_DIR}:${LIBRARY_PATH:-}"
+  echo "[install_deepep] LIBRARY_PATH += ${NCCL_LIB_DIR} (link-time NCCL search path)"
+fi
+
 ( cd "$DEEPEP_DIR" && python setup.py install )
 
 python -c "import deep_ep; print('[install_deepep] import OK:', deep_ep.__file__)"

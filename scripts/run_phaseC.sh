@@ -30,8 +30,12 @@ MODEL_ARGS=(
   --seq-length 1024
   --max-position-embeddings 1024
   --position-embedding-type rope
+  --no-rope-fusion
   --swiglu
   --disable-bias-linear
+  --no-persist-layer-norm
+  --no-gradient-accumulation-fusion
+  --no-masked-softmax-fusion
   --transformer-impl local
 )
 

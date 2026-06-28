@@ -12,12 +12,22 @@ import torch.distributed as dist
 from . import profiling
 from ..problem import ProblemSpec
 from .grouped_mlp import make_batched_gated_mlp
-from .sync_free import AllToAllAdapter, sync_free_moe_forward
+from .sync_free import AllToAllAdapter, DeepEPAdapter, sync_free_moe_forward
 
 
 def _env_flag(name: str) -> bool:
     """Truthy parse of an on/off environment toggle."""
     return os.environ.get(name, "0").lower() not in ("0", "", "false", "no")
+
+
+def _make_adapter():
+    """Select the sync-free transport backend from ``EPLB_ADAPTER`` (``alltoall`` default | ``deepep``)."""
+    name = os.environ.get("EPLB_ADAPTER", "alltoall").strip().lower()
+    if name in ("deepep", "deep_ep"):
+        return DeepEPAdapter()
+    if name in ("", "alltoall", "all_to_all", "a2a"):
+        return AllToAllAdapter()
+    raise ValueError(f"unknown EPLB_ADAPTER={name!r} (expected 'alltoall' | 'deepep')")
 
 
 def find_moe_layers(model, class_name: str = "MoELayer") -> List:
@@ -139,7 +149,7 @@ def bind_eplb_to_moe_layer(moe_layer, rebalancer, ep_group, layer_id: int = 0) -
         "gated": gated,
         "act": act,
         "batched_mlp_fn": make_batched_gated_mlp(gated, act),
-        "adapter": AllToAllAdapter(),
+        "adapter": _make_adapter(),
         "rematerialize": _env_flag("EPLB_REMATERIALIZE"),
         "overlap": _env_flag("EPLB_OVERLAP"),
     }

@@ -37,10 +37,56 @@ class AllToAllAdapter:
         return all_to_all_single(inp, out_splits.tolist(), in_splits.tolist(), group)
 
 
-class DeepEPAdapter:
-    """Production drop-in backed by DeepEP's ``ElasticBuffer`` (device-side counts, no D2H)."""
+class _DeepEPDispatch(torch.autograd.Function):
+    """Forward all-to-all (scatter) via DeepEP ``dispatch``; backward is the paired ``combine`` (gather)."""
 
-    def __init__(self, buffer=None, num_sms: int = 0):
+    @staticmethod
+    def forward(ctx, inp, buffer, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, holder):
+        recv, _, _, _, handle, _ = buffer.dispatch(
+            x=inp.contiguous(),
+            num_tokens_per_rank=num_tokens_per_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+        )
+        ctx.buffer = buffer
+        ctx.handle = handle
+        holder["handle"] = handle          # expose to the adapter so the paired combine reuses this layout
+        return recv
+
+    @staticmethod
+    def backward(ctx, grad_recv):
+        # each token is routed to exactly one rank, so the gather (combine) is the exact transpose
+        grad_in, _, _ = ctx.buffer.combine(x=grad_recv.contiguous(), handle=ctx.handle)
+        return grad_in, None, None, None, None, None
+
+
+class _DeepEPCombine(torch.autograd.Function):
+    """Reverse all-to-all (gather) via DeepEP ``combine`` reusing a dispatch handle; backward is the cached ``dispatch``."""
+
+    @staticmethod
+    def forward(ctx, inp, buffer, handle):
+        out, _, _ = buffer.combine(x=inp.contiguous(), handle=handle)
+        ctx.buffer = buffer
+        ctx.handle = handle
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        grad_in, _, _, _, _, _ = ctx.buffer.dispatch(x=grad_out.contiguous(), handle=ctx.handle)
+        return grad_in, None, None
+
+
+class DeepEPAdapter:
+    """Sync-free transport over DeepEP ``dispatch``/``combine`` (device-side counts, no D2H on the token channel).
+
+    Drop-in for :class:`AllToAllAdapter` inside :func:`sync_free_moe_forward`, which issues, per forward,
+    a dispatch (tokens), a same-direction metadata send (phys ids), and a reverse combine. The heavy
+    ``[Ntok, H]`` token channel goes through DeepEP (NVLink, fully on-device); narrow / non-16B-aligned
+    metadata (e.g. ``[U, 1]`` phys ids) transparently falls back to ``all_to_all_single`` whose ordering is
+    bit-identical to DeepEP dispatch, so the two channels stay consistent.
+    """
+
+    def __init__(self, num_nvl_bytes: Optional[int] = None, num_qps_per_rank: int = 1):
         try:
             import deep_ep  # noqa: F401
         except Exception as e:  # pragma: no cover - environment-dependent
@@ -48,14 +94,57 @@ class DeepEPAdapter:
                 "DeepEPAdapter requires the 'deep_ep' package (PyTorch>=2.10, NCCL>=2.30.4, "
                 "SM90+ cluster). Use AllToAllAdapter for CPU/single-GPU testing."
             ) from e
-        self.buffer = buffer
-        self.num_sms = num_sms
+        import os
 
-    def all_to_all(self, inp, out_splits, in_splits, group):  # pragma: no cover
-        # wire ElasticBuffer.dispatch/combine here on a DeepEP-capable cluster (counts stay on device)
-        raise NotImplementedError(
-            "Wire ElasticBuffer.dispatch/combine here on a DeepEP-capable cluster."
+        self._deep_ep = deep_ep
+        self._num_nvl_bytes = int(num_nvl_bytes or os.environ.get("EPLB_DEEPEP_NVL_BYTES", 1_000_000_000))
+        self._num_qps_per_rank = int(num_qps_per_rank)
+        self._buffer = None
+        self._group = None
+        self._pending = None  # holder dict of the in-flight dispatch handle, consumed by the paired combine
+
+    def _get_buffer(self, group):
+        if self._buffer is None:
+            self._buffer = self._deep_ep.Buffer(
+                group, self._num_nvl_bytes, 0,
+                low_latency_mode=False, num_qps_per_rank=self._num_qps_per_rank, allow_mnnvl=False,
+            )
+            self._group = group
+        return self._buffer
+
+    @staticmethod
+    def _deepep_eligible(inp: torch.Tensor) -> bool:
+        # DeepEP kernels move 16B (int4) chunks of bf16/fp16 rows; everything else uses the exact fallback
+        return (
+            inp.dim() == 2
+            and inp.dtype in (torch.bfloat16, torch.float16)
+            and (inp.shape[1] * inp.element_size()) % 16 == 0
         )
+
+    def all_to_all(self, inp, out_splits, in_splits, group):
+        if not self._deepep_eligible(inp):
+            # metadata channel: exact, ordering matches DeepEP dispatch (one small D2H on the splits)
+            return all_to_all_single(inp, out_splits.tolist(), in_splits.tolist(), group)
+
+        buffer = self._get_buffer(group)
+        if self._pending is not None:
+            # second aligned call of this forward == the reverse leg -> combine reusing the dispatch layout
+            handle = self._pending["handle"]
+            self._pending = None
+            return _DeepEPCombine.apply(inp, buffer, handle)
+
+        # forward dispatch: rows arrive pre-grouped by destination rank, so split sizes define the layout
+        R = int(in_splits.shape[0])
+        device = inp.device
+        counts = in_splits.to(torch.long)
+        dst = torch.repeat_interleave(torch.arange(R, device=device), counts)
+        is_token_in_rank = torch.zeros(inp.shape[0], R, dtype=torch.bool, device=device)
+        is_token_in_rank[torch.arange(inp.shape[0], device=device), dst] = True
+        npr = in_splits.to(torch.int32)
+        holder: Dict[str, object] = {}
+        recv = _DeepEPDispatch.apply(inp, buffer, npr, is_token_in_rank, npr, holder)
+        self._pending = holder  # consumed by the paired combine (reverse leg) above
+        return recv
 
 
 def _slot_to_expert(x: torch.Tensor, my_rank: int, n_slot: int) -> torch.Tensor:
