@@ -4,6 +4,13 @@ set -euo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
+# TE's transformer_engine_torch links libnccl.so from the nvidia-nccl wheel; put it on the runtime
+# linker path so `import transformer_engine` works. No-op if TE/NCCL aren't installed.
+_nccl_lib="$(python -c 'import nvidia.nccl as n,os;print(os.path.join(n.__path__[0],"lib"))' 2>/dev/null || true)"
+if [ -n "${_nccl_lib}" ] && [ -d "${_nccl_lib}" ]; then
+  export LD_LIBRARY_PATH="${_nccl_lib}:${LD_LIBRARY_PATH:-}"
+fi
+
 # --- required paths / artifacts ----------------------------------------------
 MEGATRON_DIR="${MEGATRON_DIR:?set MEGATRON_DIR to the Megatron-LM repo root}"
 EPLB_DIR="${EPLB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
