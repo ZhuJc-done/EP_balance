@@ -79,10 +79,20 @@ else
   exit 1
 fi
 
-# Phase C sync-free dispatcher needs SequentialMLP; off/observe use the fast native path (TE + grouped GEMM).
-if [[ "${EPLB_MODE}" == "apply" ]]; then
-  MODEL_ARGS+=(--transformer-impl local)
-  echo "[run_real_moe] EPLB_MODE=apply -> forcing SequentialMLP (local impl, no grouped GEMM): reference path, slower"
+# Fast native path (TE + grouped GEMM) needs Transformer Engine; apply mode needs SequentialMLP.
+# Auto-detect TE: if absent (or apply mode) fall back to PyTorch-only 'local' impl with fusions off.
+if python -c "import transformer_engine" >/dev/null 2>&1; then HAS_TE=1; else HAS_TE=0; fi
+if [[ "${EPLB_MODE}" == "apply" || "${HAS_TE}" == "0" ]]; then
+  MODEL_ARGS+=(
+    --transformer-impl local
+    --no-rope-fusion --no-masked-softmax-fusion --no-bias-swiglu-fusion
+    --no-gradient-accumulation-fusion --no-persist-layer-norm
+  )
+  if [[ "${EPLB_MODE}" == "apply" ]]; then
+    echo "[run_real_moe] EPLB_MODE=apply -> SequentialMLP (local impl, no grouped GEMM): reference path, slower"
+  else
+    echo "[run_real_moe] Transformer Engine not found -> local impl + fusions off (baseline runs, but slower & no grouped GEMM; install TE for the fast path)"
+  fi
 else
   MODEL_ARGS+=(--transformer-impl transformer_engine --moe-grouped-gemm)
 fi
