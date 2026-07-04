@@ -41,11 +41,17 @@ WORLD_SIZE=$(( GPUS_PER_NODE * NNODES ))
 export CUDA_DEVICE_MAX_CONNECTIONS=1                      # required by Megatron for correct comm overlap
 export TORCH_NCCL_AVOID_RECORD_STREAMS="${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}"
 if [[ "${NNODES}" -gt 1 ]]; then
-  # Inject IB/RDMA env only for multi-node; single-node uses NVLink/P2P and RDMA hints just add risk.
-  export NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5}"               # adjust to your CX7 HCA names (e.g. mlx5_0,mlx5_1)
-  export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}" # control-plane NIC for rendezvous
-  export NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"      # RoCE GID index; ignore for pure InfiniBand
-  # export NCCL_NET_GDR_LEVEL=PIX; export NCCL_IB_DISABLE=0
+  # Multi-node: NCCL auto-detects NICs + IB by default; we don't hardcode any fabric names.
+  # Only pin the control-plane socket NIC, because under docker auto-detect may pick a
+  # non-routable veth/bridge/lo. Default to the interface backing the default route
+  # (guaranteed to reach other nodes); override with NCCL_SOCKET_IFNAME / NCCL_IB_HCA / NCCL_IB_GID_INDEX.
+  if [[ -z "${NCCL_SOCKET_IFNAME:-}" ]]; then
+    _def_if="$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)"
+    [[ -n "${_def_if}" ]] && export NCCL_SOCKET_IFNAME="${_def_if}"
+  fi
+  [[ -n "${NCCL_IB_HCA:-}" ]] && export NCCL_IB_HCA               # else NCCL auto-detects all IB devices
+  [[ -n "${NCCL_IB_GID_INDEX:-}" ]] && export NCCL_IB_GID_INDEX   # set only for RoCE if the default GID is wrong
+  echo "[run_gb200_4x4] NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-<auto>} NCCL_IB_HCA=${NCCL_IB_HCA:-<auto>}"
 elif [[ -z "${SLURM_JOB_ID:-}" ]]; then
   # Clear site-baked NCCL defaults (IPv6 socket family, CGA cluster size) that break plain single-node torchrun.
   unset NCCL_SOCKET_FAMILY NCCL_CGA_CLUSTER_SIZE NCCL_SOCKET_IFNAME 2>/dev/null || true

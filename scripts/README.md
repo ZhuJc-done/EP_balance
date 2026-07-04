@@ -19,32 +19,13 @@ Run MoE on real Megatron-LM with Scale-EPLB, in two stages selected by `EPLB_MOD
 | `run_gb200_4x4.sh` | Multi-node 4 nodes x 4 GB200 launcher: Slurm auto-discovery + GB200 NCCL/RDMA env; mock-data smoke test by default, `REAL=1` forwards to `run_real_moe.sh`. |
 | `sbatch_gb200_4x4.sbatch` | Slurm wrapper (`sbatch`) that `srun`s `run_gb200_4x4.sh` (1 task/node). |
 | `convert_hf_to_mcore.sh` | Optional: convert a HF MoE checkpoint to mcore for realistic skew. |
-| `install_megatron.sh` | Clone+install a pinned community Megatron-LM and self-check `import megatron`. |
-| `install_deepep.sh` | Optional: clone+build DeepEP (NCCL Gin backend) for the sync-free transport. |
 
 ## One-time setup (on the cluster)
 
-Megatron-LM and DeepEP are **external dependencies** (not vendored / not submodules):
-they must be compiled+installed into the environment and are often already provided at a
-fixed cluster path. Install them with the helper scripts (each pins a commit and self-checks
-the import), then install `eplb`:
-
 ```bash
-# Megatron-LM (required) — pinned commit, editable install, import self-check
-MEGATRON_DIR=/opt/tiger/Megatron-LM bash scripts/install_megatron.sh
-
-# DeepEP (optional) — only for the fully sync-free DeepEPAdapter on a DeepEP-capable cluster
-DEEPEP_DIR=/opt/tiger/DeepEP bash scripts/install_deepep.sh
-
-pip install -e /path/to/EP_balance   # makes `eplb` importable
-```
-
-Or do it by hand (TE/Apex optional — the launchers use `--transformer-impl local`):
-
-```bash
-git clone https://github.com/NVIDIA/Megatron-LM.git && pip install -e Megatron-LM
-pip install transformers einops sentencepiece tiktoken regex
-pip install -e /path/to/EP_balance
+git clone https://github.com/NVIDIA/Megatron-LM.git
+pip install -e Megatron-LM            # + transformer-engine/apex per its install guide
+pip install -e /path/to/EP_balance    # makes `eplb` importable
 ```
 
 ## Phase B — observe (recommended first)
