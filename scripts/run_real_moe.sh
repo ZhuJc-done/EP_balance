@@ -80,8 +80,10 @@ else
 fi
 
 # Fast native path (TE + grouped GEMM) needs Transformer Engine; apply mode needs SequentialMLP.
-# Auto-detect TE: if absent (or apply mode) fall back to PyTorch-only 'local' impl with fusions off.
-if python -c "import transformer_engine" >/dev/null 2>&1; then HAS_TE=1; else HAS_TE=0; fi
+# Auto-detect TE unless HAS_TE is set explicitly (HAS_TE=0 forces the PyTorch-only 'local' path).
+if [[ -n "${HAS_TE:-}" ]]; then
+  :  # honor caller override (HAS_TE=0 to disable TE, HAS_TE=1 to force it)
+elif python -c "import transformer_engine" >/dev/null 2>&1; then HAS_TE=1; else HAS_TE=0; fi
 if [[ "${EPLB_MODE}" == "apply" || "${HAS_TE}" == "0" ]]; then
   MODEL_ARGS+=(
     --transformer-impl local

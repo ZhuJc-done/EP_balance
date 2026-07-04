@@ -66,6 +66,7 @@ TRAIN_ARGS=(
   --lr-decay-style constant
   --bf16
   --log-interval 1
+  --no-gradient-accumulation-fusion
 )
 
 DISTRIBUTED_ARGS=(
