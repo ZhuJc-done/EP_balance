@@ -106,6 +106,18 @@ else
   MODEL_ARGS+=(--transformer-impl transformer_engine --moe-grouped-gemm --no-gradient-accumulation-fusion)
 fi
 
+# DEEPEP=1 (off/observe only): route Megatron's own MoE dispatch through DeepEP (flex backend, uses deep_ep.Buffer).
+# In apply mode EPLB replaces the dispatcher, so this is ignored there (DeepEPAdapter is not wired yet).
+DEEPEP_ARGS=()
+if [[ "${DEEPEP:-0}" == "1" ]]; then
+  if [[ "${EPLB_MODE}" == "apply" ]]; then
+    echo "[run_real_moe] DEEPEP=1 ignored in apply mode (EPLB owns the dispatcher; DeepEPAdapter not wired yet)"
+  else
+    DEEPEP_ARGS=(--moe-token-dispatcher-type flex --moe-enable-deepep)   # overrides the alltoall set in MOE_ARGS (argparse: last wins)
+    echo "[run_real_moe] DEEPEP=1 -> Megatron native DeepEP dispatch (flex)"
+  fi
+fi
+
 PARALLEL_ARGS=(
   --tensor-model-parallel-size "${TP}"
   --pipeline-model-parallel-size "${PP}"
@@ -163,7 +175,7 @@ echo "[run_real_moe] model=${MODEL} mode=${EPLB_MODE} world=${WORLD_SIZE} TP=${T
 run_torchrun() {
   torchrun "${DISTRIBUTED_ARGS[@]}" \
     "${EPLB_DIR}/scripts/pretrain_eplb_moe.py" \
-    "${MODEL_ARGS[@]}" "${MOE_ARGS[@]}" "${PARALLEL_ARGS[@]}" \
+    "${MODEL_ARGS[@]}" "${MOE_ARGS[@]}" "${DEEPEP_ARGS[@]}" "${PARALLEL_ARGS[@]}" \
     "${DATA_ARGS[@]}" "${TRAIN_ARGS[@]}" "${LOAD_ARGS[@]}"
 }
 if [[ "${LOG}" != "0" ]]; then
