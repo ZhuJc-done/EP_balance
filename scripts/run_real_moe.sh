@@ -117,8 +117,19 @@ DISTRIBUTED_ARGS=(
   --master_port "${MASTER_PORT}"
 )
 
+# Tee stdout+stderr to a timestamped per-node log (pipefail keeps torchrun's exit code); override path via LOG_FILE, disable with LOG=0.
+LOG="${LOG:-1}"
+LOG_FILE="${LOG_FILE:-${EPLB_DIR}/logs/real_${MODEL}_${EPLB_MODE}_node${NODE_RANK}.log}"
 echo "[run_real_moe] model=${MODEL} mode=${EPLB_MODE} world=${WORLD_SIZE} TP=${TP} PP=${PP} EP=${EP}"
-torchrun "${DISTRIBUTED_ARGS[@]}" \
-  "${EPLB_DIR}/scripts/pretrain_eplb_moe.py" \
-  "${MODEL_ARGS[@]}" "${MOE_ARGS[@]}" "${PARALLEL_ARGS[@]}" \
-  "${DATA_ARGS[@]}" "${TRAIN_ARGS[@]}" "${LOAD_ARGS[@]}"
+[[ "${LOG}" != "0" ]] && { mkdir -p "$(dirname "${LOG_FILE}")"; echo "[run_real_moe] logging to ${LOG_FILE}"; }
+run_torchrun() {
+  torchrun "${DISTRIBUTED_ARGS[@]}" \
+    "${EPLB_DIR}/scripts/pretrain_eplb_moe.py" \
+    "${MODEL_ARGS[@]}" "${MOE_ARGS[@]}" "${PARALLEL_ARGS[@]}" \
+    "${DATA_ARGS[@]}" "${TRAIN_ARGS[@]}" "${LOAD_ARGS[@]}"
+}
+if [[ "${LOG}" != "0" ]]; then
+  run_torchrun 2>&1 | tee "${LOG_FILE}"
+else
+  run_torchrun
+fi
