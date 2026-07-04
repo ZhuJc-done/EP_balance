@@ -45,7 +45,8 @@ try:
     print(f"{fp.find_nccl_root()}/lib")
 except Exception:
     import nvidia.nccl, os
-    print(os.path.join(os.path.dirname(nvidia.nccl.__file__), "lib"))
+    # nvidia is a PEP420 namespace pkg -> __file__ is None; use __path__ for the install dir.
+    print(os.path.join(nvidia.nccl.__path__[0], "lib"))
 PY
 )"
 if [ -n "$NCCL_LIB_DIR" ] && [ -d "$NCCL_LIB_DIR" ]; then
@@ -53,7 +54,9 @@ if [ -n "$NCCL_LIB_DIR" ] && [ -d "$NCCL_LIB_DIR" ]; then
   echo "[install_deepep] LIBRARY_PATH += ${NCCL_LIB_DIR} (link-time NCCL search path)"
 fi
 
-( cd "$DEEPEP_DIR" && python setup.py install )
+# install into the user site-packages (system /usr/local/... is not writable here); reuses the
+# already-compiled build/ dir. Override the target with PIP_USER=0 + a writable prefix if needed.
+( cd "$DEEPEP_DIR" && python setup.py install --user )
 
 python -c "import deep_ep; print('[install_deepep] import OK:', deep_ep.__file__)"
 echo "[install_deepep] done -> swap AllToAllAdapter() for DeepEPAdapter() in bind_eplb_to_moe_layer"
