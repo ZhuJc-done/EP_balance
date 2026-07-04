@@ -117,11 +117,14 @@ else
   )
 fi
 
+TRAIN_ITERS="${TRAIN_ITERS:-50}"
+# warmup must be < train-iters (Megatron asserts); default to ~10% capped below the total.
+LR_WARMUP_ITERS="${LR_WARMUP_ITERS:-$(( TRAIN_ITERS > 10 ? 5 : (TRAIN_ITERS > 1 ? 1 : 0) ))}"
 TRAIN_ARGS=(
   --micro-batch-size "${MICRO_BATCH_SIZE:-1}"
   --global-batch-size "${GLOBAL_BATCH_SIZE:-256}"
-  --train-iters "${TRAIN_ITERS:-50}"
-  --lr 1e-5 --min-lr 1e-6 --lr-decay-style cosine --lr-warmup-iters 5
+  --train-iters "${TRAIN_ITERS}"
+  --lr 1e-5 --min-lr 1e-6 --lr-decay-style cosine --lr-warmup-iters "${LR_WARMUP_ITERS}"
   --weight-decay 0.1 --clip-grad 1.0
   --bf16
   --log-interval 1 --eval-interval 1000000 --eval-iters 0
