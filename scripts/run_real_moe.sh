@@ -7,9 +7,16 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 # --- required paths / artifacts ----------------------------------------------
 MEGATRON_DIR="${MEGATRON_DIR:?set MEGATRON_DIR to the Megatron-LM repo root}"
 EPLB_DIR="${EPLB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-CHECKPOINT="${CHECKPOINT:?set CHECKPOINT to the mcore checkpoint dir (from convert_hf_to_mcore.sh / Megatron Bridge)}"
-DATA_PATH="${DATA_PATH:?set DATA_PATH to the preprocessed data prefix (from prepare_data.sh, no .bin/.idx suffix)}"
-TOKENIZER_MODEL="${TOKENIZER_MODEL:?set TOKENIZER_MODEL to the HF repo/dir matching the checkpoint}"
+# MOCK=1: real model architecture, but mock-data + random init (no checkpoint/data/tokenizer needed) --
+# a pure-Megatron "does it run / throughput / memory" baseline. MOCK=0 (default) needs real artifacts.
+MOCK="${MOCK:-0}"
+if [[ "${MOCK}" == "1" ]]; then
+  CHECKPOINT="" ; DATA_PATH="" ; TOKENIZER_MODEL=""
+else
+  CHECKPOINT="${CHECKPOINT:?set CHECKPOINT to the mcore checkpoint dir (from convert_hf_to_mcore.sh / Megatron Bridge)}"
+  DATA_PATH="${DATA_PATH:?set DATA_PATH to the preprocessed data prefix (from prepare_data.sh, no .bin/.idx suffix)}"
+  TOKENIZER_MODEL="${TOKENIZER_MODEL:?set TOKENIZER_MODEL to the HF repo/dir matching the checkpoint}"
+fi
 SAVE_DIR="${SAVE_DIR:-}"                    # optional: where to write new checkpoints
 
 # --- which open model (architecture recipe) ----------------------------------
@@ -85,16 +92,20 @@ PARALLEL_ARGS=(
   --pipeline-model-parallel-size "${PP}"
   --expert-model-parallel-size "${EP}"
   --use-distributed-optimizer
-  --sequence-parallel
   --distributed-backend nccl
 )
+[[ "${TP}" -gt 1 ]] && PARALLEL_ARGS+=(--sequence-parallel)   # sequence parallel requires TP>1
 
-DATA_ARGS=(
-  --tokenizer-type HuggingFaceTokenizer
-  --tokenizer-model "${TOKENIZER_MODEL}"
-  --data-path "${DATA_PATH}"
-  --split 99,1,0
-)
+if [[ "${MOCK}" == "1" ]]; then
+  DATA_ARGS=(--mock-data --tokenizer-type NullTokenizer --vocab-size "${VOCAB_SIZE:-32000}")
+else
+  DATA_ARGS=(
+    --tokenizer-type HuggingFaceTokenizer
+    --tokenizer-model "${TOKENIZER_MODEL}"
+    --data-path "${DATA_PATH}"
+    --split 99,1,0
+  )
+fi
 
 TRAIN_ARGS=(
   --micro-batch-size "${MICRO_BATCH_SIZE:-1}"
@@ -106,7 +117,11 @@ TRAIN_ARGS=(
   --log-interval 1 --eval-interval 1000000 --eval-iters 0
 )
 
-LOAD_ARGS=(--load "${CHECKPOINT}" --no-load-optim --no-load-rng --dist-ckpt-strictness log_unexpected)
+if [[ "${MOCK}" == "1" ]]; then
+  LOAD_ARGS=()                              # random init, no checkpoint
+else
+  LOAD_ARGS=(--load "${CHECKPOINT}" --no-load-optim --no-load-rng --dist-ckpt-strictness log_unexpected)
+fi
 [[ -n "${SAVE_DIR}" ]] && LOAD_ARGS+=(--save "${SAVE_DIR}" --save-interval "${SAVE_INTERVAL:-1000}")
 
 DISTRIBUTED_ARGS=(

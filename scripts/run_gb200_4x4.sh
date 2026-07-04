@@ -61,7 +61,7 @@ fi
 if [[ "${REAL:-0}" == "1" ]]; then
   export GPUS_PER_NODE NNODES NODE_RANK MASTER_ADDR MASTER_PORT
   echo "[run_gb200_4x4] REAL=1 -> scripts/run_real_moe.sh (model=${MODEL:-qwen3_30b_a3b} mode=${EPLB_MODE:-observe})"
-  exec bash "${EPLB_DIR}/scripts/run_real_moe.sh"
+  exec bash "${EPLB_DIR}/scripts/run_real_moe.sh" "$@"    # forward any extra Megatron flags (e.g. --recompute-*)
 fi
 
 # --- smoke-test MoE / parallelism (override via env) -------------------------
