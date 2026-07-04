@@ -130,6 +130,7 @@ TRAIN_ARGS=(
   --weight-decay 0.1 --clip-grad 1.0
   --bf16
   --log-interval 1 --eval-interval 1000000 --eval-iters 0
+  --num-workers "${NUM_WORKERS:-0}"
 )
 
 if [[ "${MOCK}" == "1" ]]; then
