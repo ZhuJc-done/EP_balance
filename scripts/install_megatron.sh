@@ -6,7 +6,7 @@
 # Override via env: MEGATRON_DIR, MEGATRON_REPO, MEGATRON_COMMIT.
 set -euo pipefail
 
-MEGATRON_DIR="${MEGATRON_DIR:-/opt/tiger/Megatron-LM}"
+MEGATRON_DIR="${MEGATRON_DIR:-/home/tiger/Megatron-LM}"
 MEGATRON_REPO="${MEGATRON_REPO:-https://github.com/NVIDIA/Megatron-LM.git}"
 # Validated with Scale-EPLB on GB200 (megatron-core 0.19.0+0ff7226f6). Pin a new SHA after re-validating.
 MEGATRON_COMMIT="${MEGATRON_COMMIT:-0ff7226f6}"

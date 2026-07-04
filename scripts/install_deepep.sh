@@ -7,7 +7,7 @@
 # Override via env: DEEPEP_DIR, DEEPEP_REPO, DEEPEP_COMMIT, NCCL_PKG, TORCH_CUDA_ARCH_LIST.
 set -euo pipefail
 
-DEEPEP_DIR="${DEEPEP_DIR:-/opt/tiger/DeepEP}"
+DEEPEP_DIR="${DEEPEP_DIR:-/home/tiger/DeepEP}"
 DEEPEP_REPO="${DEEPEP_REPO:-https://github.com/deepseek-ai/DeepEP.git}"
 DEEPEP_COMMIT="${DEEPEP_COMMIT:-main}"        # pin a SHA once validated on-cluster
 NCCL_PKG="${NCCL_PKG:-nvidia-nccl-cu13>=2.30.4}"
