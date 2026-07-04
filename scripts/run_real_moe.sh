@@ -96,7 +96,7 @@ if [[ "${EPLB_MODE}" == "apply" || "${HAS_TE}" == "0" ]]; then
     echo "[run_real_moe] Transformer Engine not found -> local impl + fusions off (baseline runs, but slower & no grouped GEMM; install TE for the fast path)"
   fi
 else
-  MODEL_ARGS+=(--transformer-impl transformer_engine --moe-grouped-gemm)
+  MODEL_ARGS+=(--transformer-impl transformer_engine --moe-grouped-gemm --no-gradient-accumulation-fusion)
 fi
 
 PARALLEL_ARGS=(
