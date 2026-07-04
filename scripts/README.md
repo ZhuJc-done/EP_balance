@@ -18,15 +18,15 @@ Run MoE on real Megatron-LM with Scale-EPLB, in two stages selected by `EPLB_MOD
 | `run_phaseC.sh` | `torchrun` launcher, apply mode, end-to-end training. |
 | `run_gb200_4x4.sh` | Multi-node 4 nodes x 4 GB200 launcher: Slurm auto-discovery + GB200 NCCL/RDMA env; mock-data smoke test by default, `REAL=1` forwards to `run_real_moe.sh`. |
 | `sbatch_gb200_4x4.sbatch` | Slurm wrapper (`sbatch`) that `srun`s `run_gb200_4x4.sh` (1 task/node). |
+| `run_real_moe.sh` | Real-model launcher (Qwen3-30B-A3B / Mixtral); `REAL=1` from `run_gb200_4x4.sh` forwards here. `MOCK=1` = mock-data + random init, `DEEPEP=1` = native DeepEP dispatch. |
+| `install_megatron.sh` | Clone+install pinned community Megatron-LM, self-check `import megatron`. |
+| `install_deepep.sh` | Optional: clone+build DeepEP (NCCL Gin backend) for the sync-free transport. |
+| `install_te.sh` | Optional: install Transformer Engine for the fast TE + grouped-GEMM path. |
 | `convert_hf_to_mcore.sh` | Optional: convert a HF MoE checkpoint to mcore for realistic skew. |
 
-## One-time setup (on the cluster)
-
-```bash
-git clone https://github.com/NVIDIA/Megatron-LM.git
-pip install -e Megatron-LM            # + transformer-engine/apex per its install guide
-pip install -e /path/to/EP_balance    # makes `eplb` importable
-```
+> **Install** (clone + `install_megatron.sh` / `install_deepep.sh` / `install_te.sh` + `pip install -e`)
+> lives in the [top-level README](../README.md#cluster-install-megatron-integration). This file is the
+> **run book**: launchers, run recipes, toggles, and troubleshooting.
 
 ## Phase B — observe (recommended first)
 
@@ -79,7 +79,29 @@ NNODES=4 NODE_RANK=$RANK MASTER_ADDR=$HEAD MASTER_PORT=29500 \
 
 Then escalate: `EPLB_MODE=apply` (active dispatcher), or `REAL=1 MODEL=qwen3_30b_a3b`
 plus `CHECKPOINT`/`DATA_PATH`/`TOKENIZER_MODEL` to forward to `run_real_moe.sh`.
-Adjust `NCCL_IB_HCA` / `NCCL_SOCKET_IFNAME` / `NCCL_IB_GID_INDEX` to your fabric.
+`NCCL_SOCKET_IFNAME` is auto-detected (default route); set it (and `NCCL_IB_HCA`) only to override.
+
+## Multi-node real model, 2 nodes x 4 GPUs = 8 ranks
+
+Run the **same command on both nodes**, changing only `NODE_RANK` (0 / 1); `MASTER_ADDR`
+is node-0's IP on both, and `MASTER_PORT` must be free on node-0 (pick a fresh high port if
+you hit `EADDRINUSE`). Below is a pure-Megatron baseline (real Qwen3-30B-A3B architecture,
+mock data + random init — no checkpoint/tokenizer needed):
+
+```bash
+# node0 (NODE_RANK=0); node1 is identical with NODE_RANK=1
+pkill -9 -f 'torchrun|torch\.distributed|pretrain_eplb_moe' 2>/dev/null || true
+MEGATRON_DIR=/home/tiger/Megatron-LM \
+REAL=1 MOCK=1 MODEL=qwen3_30b_a3b EPLB_MODE=off \
+TP=1 PP=1 EP=8 GLOBAL_BATCH_SIZE=8 SEQ_LEN=1024 TRAIN_ITERS=5 \
+NNODES=2 NODE_RANK=0 MASTER_ADDR=<NODE0_IP> MASTER_PORT=34567 GPUS_PER_NODE=4 \
+  bash scripts/run_gb200_4x4.sh
+```
+
+Toggles: `DEEPEP=1` (native DeepEP dispatch, off/observe only), `EPLB_MODE=observe|apply`
+(attach EPLB), drop `MOCK=1` + add `CHECKPOINT`/`DATA_PATH`/`TOKENIZER_MODEL` for real
+training. Without `install_te.sh`, experts run the slower `local` path — raise
+`GLOBAL_BATCH_SIZE`/`SEQ_LEN` only after installing TE for the fast grouped-GEMM path.
 
 ## Notes
 
