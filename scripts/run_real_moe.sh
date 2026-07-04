@@ -44,7 +44,7 @@ export PYTHONPATH="${MEGATRON_DIR}:${EPLB_DIR}:${PYTHONPATH:-}"
 if [[ "${MODEL}" == "mixtral8x7b" ]]; then
   MODEL_ARGS=(
     --use-mcore-models --disable-bias-linear --untie-embeddings-and-output-weights
-    --seq-length 4096 --max-position-embeddings 32768
+    --seq-length "${SEQ_LEN:-4096}" --max-position-embeddings 32768
     --num-layers 32 --hidden-size 4096 --ffn-hidden-size 14336
     --num-attention-heads 32 --group-query-attention --num-query-groups 8
     --normalization RMSNorm --position-embedding-type rope --rotary-base 1000000
@@ -59,7 +59,7 @@ if [[ "${MODEL}" == "mixtral8x7b" ]]; then
 elif [[ "${MODEL}" == "qwen3_30b_a3b" ]]; then
   MODEL_ARGS=(
     --use-mcore-models --disable-bias-linear --untie-embeddings-and-output-weights
-    --seq-length 8192 --max-position-embeddings 8192
+    --seq-length "${SEQ_LEN:-8192}" --max-position-embeddings 8192
     --num-layers 48 --hidden-size 2048 --ffn-hidden-size 6144
     --num-attention-heads 32 --kv-channels 128
     --group-query-attention --num-query-groups 4 --qk-layernorm
