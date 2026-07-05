@@ -4,12 +4,26 @@ set -euo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
+# TE's transformer_engine_torch links libnccl.so from the nvidia-nccl wheel; put it on the runtime
+# linker path so `import transformer_engine` works. No-op if TE/NCCL aren't installed.
+_nccl_lib="$(python -c 'import nvidia.nccl as n,os;print(os.path.join(n.__path__[0],"lib"))' 2>/dev/null || true)"
+if [ -n "${_nccl_lib}" ] && [ -d "${_nccl_lib}" ]; then
+  export LD_LIBRARY_PATH="${_nccl_lib}:${LD_LIBRARY_PATH:-}"
+fi
+
 # --- required paths / artifacts ----------------------------------------------
 MEGATRON_DIR="${MEGATRON_DIR:?set MEGATRON_DIR to the Megatron-LM repo root}"
 EPLB_DIR="${EPLB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-CHECKPOINT="${CHECKPOINT:?set CHECKPOINT to the mcore checkpoint dir (from convert_hf_to_mcore.sh / Megatron Bridge)}"
-DATA_PATH="${DATA_PATH:?set DATA_PATH to the preprocessed data prefix (from prepare_data.sh, no .bin/.idx suffix)}"
-TOKENIZER_MODEL="${TOKENIZER_MODEL:?set TOKENIZER_MODEL to the HF repo/dir matching the checkpoint}"
+# MOCK=1: real model architecture, but mock-data + random init (no checkpoint/data/tokenizer needed) --
+# a pure-Megatron "does it run / throughput / memory" baseline. MOCK=0 (default) needs real artifacts.
+MOCK="${MOCK:-0}"
+if [[ "${MOCK}" == "1" ]]; then
+  CHECKPOINT="" ; DATA_PATH="" ; TOKENIZER_MODEL=""
+else
+  CHECKPOINT="${CHECKPOINT:?set CHECKPOINT to the mcore checkpoint dir (from convert_hf_to_mcore.sh / Megatron Bridge)}"
+  DATA_PATH="${DATA_PATH:?set DATA_PATH to the preprocessed data prefix (from prepare_data.sh, no .bin/.idx suffix)}"
+  TOKENIZER_MODEL="${TOKENIZER_MODEL:?set TOKENIZER_MODEL to the HF repo/dir matching the checkpoint}"
+fi
 SAVE_DIR="${SAVE_DIR:-}"                    # optional: where to write new checkpoints
 
 # --- which open model (architecture recipe) ----------------------------------
@@ -37,7 +51,7 @@ export PYTHONPATH="${MEGATRON_DIR}:${EPLB_DIR}:${PYTHONPATH:-}"
 if [[ "${MODEL}" == "mixtral8x7b" ]]; then
   MODEL_ARGS=(
     --use-mcore-models --disable-bias-linear --untie-embeddings-and-output-weights
-    --seq-length 4096 --max-position-embeddings 32768
+    --seq-length "${SEQ_LEN:-4096}" --max-position-embeddings 32768
     --num-layers 32 --hidden-size 4096 --ffn-hidden-size 14336
     --num-attention-heads 32 --group-query-attention --num-query-groups 8
     --normalization RMSNorm --position-embedding-type rope --rotary-base 1000000
@@ -52,7 +66,7 @@ if [[ "${MODEL}" == "mixtral8x7b" ]]; then
 elif [[ "${MODEL}" == "qwen3_30b_a3b" ]]; then
   MODEL_ARGS=(
     --use-mcore-models --disable-bias-linear --untie-embeddings-and-output-weights
-    --seq-length 8192 --max-position-embeddings 8192
+    --seq-length "${SEQ_LEN:-8192}" --max-position-embeddings 8192
     --num-layers 48 --hidden-size 2048 --ffn-hidden-size 6144
     --num-attention-heads 32 --kv-channels 128
     --group-query-attention --num-query-groups 4 --qk-layernorm
@@ -72,12 +86,36 @@ else
   exit 1
 fi
 
-# Phase C reference dispatcher needs SequentialMLP; off/observe use the fast native path (TE + grouped GEMM).
-if [[ "${EPLB_MODE}" == "apply" ]]; then
-  MODEL_ARGS+=(--transformer-impl local)
-  echo "[run_real_moe] EPLB_MODE=apply -> forcing SequentialMLP (local impl, no grouped GEMM): reference path, slower"
+# Fast native path (TE + grouped GEMM) needs Transformer Engine; apply mode needs SequentialMLP.
+# Auto-detect TE unless HAS_TE is set explicitly (HAS_TE=0 forces the PyTorch-only 'local' path).
+if [[ -n "${HAS_TE:-}" ]]; then
+  :  # honor caller override (HAS_TE=0 to disable TE, HAS_TE=1 to force it)
+elif python -c "import transformer_engine" >/dev/null 2>&1; then HAS_TE=1; else HAS_TE=0; fi
+if [[ "${EPLB_MODE}" == "apply" || "${HAS_TE}" == "0" ]]; then
+  MODEL_ARGS+=(
+    --transformer-impl local
+    --no-rope-fusion --no-masked-softmax-fusion --no-bias-swiglu-fusion
+    --no-gradient-accumulation-fusion --no-persist-layer-norm
+  )
+  if [[ "${EPLB_MODE}" == "apply" ]]; then
+    echo "[run_real_moe] EPLB_MODE=apply -> SequentialMLP (local impl, no grouped GEMM): reference path, slower"
+  else
+    echo "[run_real_moe] Transformer Engine not found -> local impl + fusions off (baseline runs, but slower & no grouped GEMM; install TE for the fast path)"
+  fi
 else
-  MODEL_ARGS+=(--transformer-impl transformer_engine --moe-grouped-gemm)
+  MODEL_ARGS+=(--transformer-impl transformer_engine --moe-grouped-gemm --no-gradient-accumulation-fusion)
+fi
+
+# DEEPEP=1 (off/observe only): route Megatron's own MoE dispatch through DeepEP (flex backend, uses deep_ep.Buffer).
+# In apply mode EPLB replaces the dispatcher, so this is ignored there (DeepEPAdapter is not wired yet).
+DEEPEP_ARGS=()
+if [[ "${DEEPEP:-0}" == "1" ]]; then
+  if [[ "${EPLB_MODE}" == "apply" ]]; then
+    echo "[run_real_moe] DEEPEP=1 ignored in apply mode (EPLB owns the dispatcher; DeepEPAdapter not wired yet)"
+  else
+    DEEPEP_ARGS=(--moe-token-dispatcher-type flex --moe-enable-deepep --moe-router-dtype fp32)   # overrides the alltoall set in MOE_ARGS (argparse: last wins); DeepEP requires fp32 probs
+    echo "[run_real_moe] DEEPEP=1 -> Megatron native DeepEP dispatch (flex)"
+  fi
 fi
 
 PARALLEL_ARGS=(
@@ -85,28 +123,40 @@ PARALLEL_ARGS=(
   --pipeline-model-parallel-size "${PP}"
   --expert-model-parallel-size "${EP}"
   --use-distributed-optimizer
-  --sequence-parallel
   --distributed-backend nccl
 )
+[[ "${TP}" -gt 1 ]] && PARALLEL_ARGS+=(--sequence-parallel)   # sequence parallel requires TP>1
 
-DATA_ARGS=(
-  --tokenizer-type HuggingFaceTokenizer
-  --tokenizer-model "${TOKENIZER_MODEL}"
-  --data-path "${DATA_PATH}"
-  --split 99,1,0
-)
+if [[ "${MOCK}" == "1" ]]; then
+  DATA_ARGS=(--mock-data --tokenizer-type NullTokenizer --vocab-size "${VOCAB_SIZE:-32000}")
+else
+  DATA_ARGS=(
+    --tokenizer-type HuggingFaceTokenizer
+    --tokenizer-model "${TOKENIZER_MODEL}"
+    --data-path "${DATA_PATH}"
+    --split 99,1,0
+  )
+fi
 
+TRAIN_ITERS="${TRAIN_ITERS:-50}"
+# warmup must be < train-iters (Megatron asserts); default to ~10% capped below the total.
+LR_WARMUP_ITERS="${LR_WARMUP_ITERS:-$(( TRAIN_ITERS > 10 ? 5 : (TRAIN_ITERS > 1 ? 1 : 0) ))}"
 TRAIN_ARGS=(
   --micro-batch-size "${MICRO_BATCH_SIZE:-1}"
   --global-batch-size "${GLOBAL_BATCH_SIZE:-256}"
-  --train-iters "${TRAIN_ITERS:-50}"
-  --lr 1e-5 --min-lr 1e-6 --lr-decay-style cosine --lr-warmup-iters 5
+  --train-iters "${TRAIN_ITERS}"
+  --lr 1e-5 --min-lr 1e-6 --lr-decay-style cosine --lr-warmup-iters "${LR_WARMUP_ITERS}"
   --weight-decay 0.1 --clip-grad 1.0
   --bf16
   --log-interval 1 --eval-interval 1000000 --eval-iters 0
+  --num-workers "${NUM_WORKERS:-0}"
 )
 
-LOAD_ARGS=(--load "${CHECKPOINT}" --no-load-optim --no-load-rng --dist-ckpt-strictness log_unexpected)
+if [[ "${MOCK}" == "1" ]]; then
+  LOAD_ARGS=()                              # random init, no checkpoint
+else
+  LOAD_ARGS=(--load "${CHECKPOINT}" --no-load-optim --no-load-rng --dist-ckpt-strictness log_unexpected)
+fi
 [[ -n "${SAVE_DIR}" ]] && LOAD_ARGS+=(--save "${SAVE_DIR}" --save-interval "${SAVE_INTERVAL:-1000}")
 
 DISTRIBUTED_ARGS=(
@@ -117,8 +167,19 @@ DISTRIBUTED_ARGS=(
   --master_port "${MASTER_PORT}"
 )
 
+# Tee stdout+stderr to a timestamped per-node log (pipefail keeps torchrun's exit code); override path via LOG_FILE, disable with LOG=0.
+LOG="${LOG:-1}"
+LOG_FILE="${LOG_FILE:-${EPLB_DIR}/logs/real_${MODEL}_${EPLB_MODE}_node${NODE_RANK}.log}"
 echo "[run_real_moe] model=${MODEL} mode=${EPLB_MODE} world=${WORLD_SIZE} TP=${TP} PP=${PP} EP=${EP}"
-torchrun "${DISTRIBUTED_ARGS[@]}" \
-  "${EPLB_DIR}/scripts/pretrain_eplb_moe.py" \
-  "${MODEL_ARGS[@]}" "${MOE_ARGS[@]}" "${PARALLEL_ARGS[@]}" \
-  "${DATA_ARGS[@]}" "${TRAIN_ARGS[@]}" "${LOAD_ARGS[@]}"
+[[ "${LOG}" != "0" ]] && { mkdir -p "$(dirname "${LOG_FILE}")"; echo "[run_real_moe] logging to ${LOG_FILE}"; }
+run_torchrun() {
+  torchrun "${DISTRIBUTED_ARGS[@]}" \
+    "${EPLB_DIR}/scripts/pretrain_eplb_moe.py" \
+    "${MODEL_ARGS[@]}" "${MOE_ARGS[@]}" "${DEEPEP_ARGS[@]}" "${PARALLEL_ARGS[@]}" \
+    "${DATA_ARGS[@]}" "${TRAIN_ARGS[@]}" "${LOAD_ARGS[@]}"
+}
+if [[ "${LOG}" != "0" ]]; then
+  run_torchrun 2>&1 | tee "${LOG_FILE}"
+else
+  run_torchrun
+fi

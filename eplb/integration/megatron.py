@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from . import profiling
 from ..config import EPLBConfig
 from ..loads import Loads
 from ..metrics import compute_metrics
@@ -97,11 +98,13 @@ class MegatronEPLBHook:
     def _log(self, plan, layer_id: int, micro_batch_id: int) -> None:
         lam = self.reb._lambda_ring[(int(layer_id), int(micro_batch_id))]
         m = compute_metrics(plan, Loads(lam), self.reb.topo, self.reb.spec, self.reb.cfg)
+        extra = f" solve_ms={profiling.last_ms('solve'):.3f}" if profiling.enabled() else ""
         self.logger(
             f"[EPLB] layer={layer_id} mb={micro_batch_id} "
             f"tau={m.tau} imbalance={m.imbalance:.3f} "
-            f"replicas={m.total_replicas} phi_token={m.phi_token}"
+            f"replicas={m.total_replicas} phi_token={m.phi_token}{extra}"
         )
+        profiling.maybe_summary(self.logger)
 
 
 def _extract_routing_map(output, num_experts: int) -> torch.Tensor:
@@ -177,9 +180,7 @@ def setup_eplb_observer(
     micro_batch_id_fn=None,
     router_class_name: str = "TopKRouter",
 ):
-    """One-call Phase B setup: read Megatron's EP state, build the rebalancer, attach observers.
-
-    Call once after the model is built; imports ``megatron`` lazily so CPU tests stay clean.
+    """One-call Phase B setup (call once after model build): read Megatron's EP state, build the rebalancer, attach observers.
 
     Args:
         model: The Megatron model (``nn.Module``) after construction.

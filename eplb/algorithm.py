@@ -357,15 +357,7 @@ def solve_bisect(
     spec: ProblemSpec,
     cfg: EPLBConfig | None = None,
 ) -> Plan:
-    """tau-bisection solver (CPU reference): Stage 0/1 as usual, then a makespan-bisection
-    descent driven by an expert-granular incremental relief oracle.
-
-    Each step targets the midpoint between the even-split lower bound and the current exact
-    makespan; an oracle proposes a *batch* of intra-domain replicas (expert-granular:
-    replicate the bottleneck rank's top contributor, re-waterfill its in-domain tokens),
-    then one exact :func:`_assign_quota` reseeds the next step so optimism cannot drift. This
-    needs only ``O(log L)`` exact routes vs the greedy solver's ``O(#replicas)`` re-routes,
-    so it is a *different* heuristic and is not bit-identical to :func:`solve`.
+    """tau-bisection solver (CPU reference): Stage 0/1 then a makespan-bisection descent (a different heuristic, not bit-identical to :func:`solve`).
 
     Args:
         loads: Dynamic load matrix ``Lambda`` (already all-gathered).
@@ -394,11 +386,7 @@ def solve_bisect(
     su = su.tolist()
 
     def _propose(load: list, contrib: torch.Tensor, x: torch.Tensor, target: int) -> list:
-        """Propose intra-domain replicas to push every rank's load <= ``target``.
-
-        Decides on an expert-granular incremental model (replicate the bottleneck rank's
-        top contributor, re-waterfill that expert's in-domain tokens). Seeded from the
-        caller's *exact* per-rank ``load`` so optimism cannot accumulate across iterations.
+        """Propose intra-domain replicas to push every rank's load <= ``target`` (seeded from the exact ``load``).
 
         Args:
             load: Exact per-rank token load (length ``R``) from the latest route.
@@ -456,8 +444,7 @@ def solve_bisect(
             added.append((e_star, t))
             stuck = set()  # loads changed; re-evaluate every rank
 
-    # makespan-bisection descent: each step halves the gap to the even-split lower bound,
-    # reseeding the oracle from the *exact* route so the proposal stays grounded. O(log L) routes.
+    # makespan-bisection descent: each step halves the gap to the even-split lower bound (O(log L) routes)
     lo = (int(lam.sum().item()) + R - 1) // R
     best_x = x_cur.clone()
     best_q, best_load = _assign_quota(lam, best_x, cost, dom)

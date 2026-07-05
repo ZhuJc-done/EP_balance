@@ -30,15 +30,40 @@ and validated on:
 
 | Component | Version |
 |---|---|
-| Hardware | 4× NVIDIA GB200 (single node, `aarch64` Grace-Blackwell) |
-| OS / Python | Linux `aarch64` / Python 3.12.4 |
-| CUDA | 13.1 |
-| PyTorch | 2.9.1 (cu13 build) |
-| TransformerEngine | 2.16.0 (built from source for `sm_100`) |
-| Megatron-Core / Megatron-LM | 0.19.0 (`main`) |
-| NCCL / cuDNN | `nvidia-nccl-cu13` 2.30.7 / `nvidia-cudnn-cu13` 9.22 |
+| Hardware | NVIDIA GB200 (`aarch64` Grace-Blackwell), driver 580.126.20 |
+| OS / Python | Linux `aarch64` (kernel 6.14) / Python 3.12.4 |
+| CUDA | 13.2 (PyTorch cu13 build) |
+| PyTorch | 2.11.0 (cu13 build) |
+| Megatron-Core / Megatron-LM | 0.19.0 (`main`, commit `0ff7226f6`) |
+| NCCL / cuDNN | 2.28.9 / 9.22 |
 
-## Quick start
+Megatron-LM, DeepEP and Transformer Engine are **external dependencies** (not vendored):
+install them with the helper scripts below, which pin versions and self-check the import.
+
+### Cluster install (Megatron integration)
+
+```bash
+# 1) clone this repo
+git clone https://github.com/ZhuJc-done/EP_balance.git
+cd /home/tiger/EP_balance
+
+# 2) external deps (each pins a commit / self-checks the import)
+bash scripts/install_megatron.sh     # required: community Megatron-LM -> $MEGATRON_DIR
+bash scripts/install_deepep.sh       # optional: DeepEP transport (NCCL Gin backend)
+bash scripts/install_te.sh           # optional: Transformer Engine (TE + grouped-GEMM fast path)
+
+# 3) make `eplb` importable
+pip install -e /home/tiger/EP_balance
+```
+
+`install_deepep.sh` / `install_te.sh` are optional: the launchers run without them
+(`AllToAllAdapter` for dispatch, `--transformer-impl local` for experts). Install
+**DeepEP** for high-performance all-to-all transport, and **Transformer Engine** for
+fused kernels + grouped-GEMM.
+Run recipes (single-node, multi-node 2×4 / 4×4, observe/apply, baselines) are in
+[`scripts/README.md`](scripts/README.md).
+
+## Quick start (CPU solver / simulation)
 
 ```bash
 pip install -e ".[dev]"

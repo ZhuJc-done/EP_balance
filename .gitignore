@@ -40,3 +40,4 @@ htmlcov/
 checkpoints/
 outputs/
 wandb/
+logs/
