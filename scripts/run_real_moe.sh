@@ -113,7 +113,7 @@ if [[ "${DEEPEP:-0}" == "1" ]]; then
   if [[ "${EPLB_MODE}" == "apply" ]]; then
     echo "[run_real_moe] DEEPEP=1 ignored in apply mode (EPLB owns the dispatcher; DeepEPAdapter not wired yet)"
   else
-    DEEPEP_ARGS=(--moe-token-dispatcher-type flex --moe-enable-deepep)   # overrides the alltoall set in MOE_ARGS (argparse: last wins)
+    DEEPEP_ARGS=(--moe-token-dispatcher-type flex --moe-enable-deepep --moe-router-dtype fp32)   # overrides the alltoall set in MOE_ARGS (argparse: last wins); DeepEP requires fp32 probs
     echo "[run_real_moe] DEEPEP=1 -> Megatron native DeepEP dispatch (flex)"
   fi
 fi
