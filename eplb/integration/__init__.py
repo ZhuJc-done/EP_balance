@@ -11,7 +11,7 @@ from .comm import all_to_all_single, broadcast_from_main
 from .physical import assign_physical, build_phys_slot_table
 from .grouped_mlp import grouped_expert_mlp, make_batched_gated_mlp
 from .overlap import WeightPool, overlapped_grouped_expert_mlp
-from .sync_free import (
+from .eplb_manager import (
     CommAdapter,
     AllToAllAdapter,
     DeepEPAdapter,

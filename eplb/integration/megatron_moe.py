@@ -12,7 +12,7 @@ import torch.distributed as dist
 from . import profiling
 from ..problem import ProblemSpec
 from .grouped_mlp import make_batched_gated_mlp
-from .sync_free import AllToAllAdapter, DeepEPAdapter, sync_free_moe_forward
+from .eplb_manager import AllToAllAdapter, DeepEPAdapter, sync_free_moe_forward
 
 
 def _env_flag(name: str) -> bool:

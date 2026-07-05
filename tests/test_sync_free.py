@@ -7,7 +7,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from eplb import EPLBConfig, ProblemSpec, Topology, solve
-from eplb.integration.sync_free import AllToAllAdapter, sync_free_moe_forward
+from eplb.integration.eplb_manager import AllToAllAdapter, sync_free_moe_forward
 from eplb.loads import Loads
 
 W = 4

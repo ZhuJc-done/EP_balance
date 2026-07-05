@@ -1,4 +1,13 @@
-"""Sync-free Phase C forward: physical-id routing + grouped compute behind a swappable comm adapter (AllToAll fallback / DeepEP)."""
+"""EPLB apply-mode manager: the sync-free Phase C MoE forward and its swappable transport.
+
+Pipeline (per MoE layer, per forward). Two concerns are kept orthogonal:
+
+  * TRANSPORT  - moving tokens between ranks (all-to-all), behind :class:`CommAdapter`
+                 (``AllToAllAdapter`` fallback / ``DeepEPAdapter``).
+  * REPLICATION - broadcasting a replicated expert's weight from its main owner and
+                 reducing that expert's grad back to main. This lives in the compute
+                 stage (``broadcast_from_main`` / overlap) and is adapter-independent.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +22,12 @@ from ..problem import ProblemSpec
 from .comm import all_to_all_single, broadcast_from_main
 from .grouped_mlp import grouped_expert_mlp
 from .overlap import overlapped_grouped_expert_mlp
-from .physical import assign_physical, build_phys_slot_table
+from .physical import assign_physical
+
+
+# ============================== Transport adapters ==============================
+# A CommAdapter is the only place a token-channel all-to-all happens. Swapping the
+# adapter changes the transport but not the routing/compute math above it.
 
 
 class CommAdapter(Protocol):
@@ -41,12 +55,15 @@ class _DeepEPDispatch(torch.autograd.Function):
     """Forward all-to-all (scatter) via DeepEP ``dispatch``; backward is the paired ``combine`` (gather)."""
 
     @staticmethod
-    def forward(ctx, inp, buffer, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, holder):
+    def forward(ctx, inp, buffer, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, num_worst_tokens, holder):
+        # num_worst_tokens > 0 statically sizes the recv buffer to a host-known worst case, so DeepEP
+        # skips the D2H that would read the actual recv count -> no CPU sync, CUDA-graph capturable.
         recv, _, _, _, handle, _ = buffer.dispatch(
             x=inp.contiguous(),
             num_tokens_per_rank=num_tokens_per_rank,
             is_token_in_rank=is_token_in_rank,
             num_tokens_per_expert=num_tokens_per_expert,
+            num_worst_tokens=int(num_worst_tokens),
         )
         ctx.buffer = buffer
         ctx.handle = handle
@@ -57,7 +74,7 @@ class _DeepEPDispatch(torch.autograd.Function):
     def backward(ctx, grad_recv):
         # each token is routed to exactly one rank, so the gather (combine) is the exact transpose
         grad_in, _, _ = ctx.buffer.combine(x=grad_recv.contiguous(), handle=ctx.handle)
-        return grad_in, None, None, None, None, None
+        return grad_in, None, None, None, None, None, None
 
 
 class _DeepEPCombine(torch.autograd.Function):
@@ -84,9 +101,20 @@ class DeepEPAdapter:
     ``[Ntok, H]`` token channel goes through DeepEP (NVLink, fully on-device); narrow / non-16B-aligned
     metadata (e.g. ``[U, 1]`` phys ids) transparently falls back to ``all_to_all_single`` whose ordering is
     bit-identical to DeepEP dispatch, so the two channels stay consistent.
+
+    Sync-free knob: ``max_recv_tokens`` is a host-static worst-case bound (``= n_slot * cap``, guaranteed
+    tight by the EPLB capacity policy). When set, dispatch runs with ``num_worst_tokens=max_recv_tokens``
+    so the recv buffer is statically sized and DeepEP never does the D2H that reads the true recv count
+    -> zero CPU sync, CUDA-graph capturable. Left unset, it uses the plain dynamic path (one recv-count
+    D2H per dispatch, same behaviour as Megatron's flex+DeepEP integration).
     """
 
-    def __init__(self, num_nvl_bytes: Optional[int] = None, num_qps_per_rank: int = 1):
+    def __init__(
+        self,
+        num_nvl_bytes: Optional[int] = None,
+        num_qps_per_rank: int = 1,
+        max_recv_tokens: Optional[int] = None,
+    ):
         try:
             import deep_ep  # noqa: F401
         except Exception as e:  # pragma: no cover - environment-dependent
@@ -99,9 +127,15 @@ class DeepEPAdapter:
         self._deep_ep = deep_ep
         self._num_nvl_bytes = int(num_nvl_bytes or os.environ.get("EPLB_DEEPEP_NVL_BYTES", 1_000_000_000))
         self._num_qps_per_rank = int(num_qps_per_rank)
+        env_max = os.environ.get("EPLB_DEEPEP_MAX_RECV")
+        self._max_recv_tokens = int(max_recv_tokens if max_recv_tokens is not None else (env_max or 0))
         self._buffer = None
         self._group = None
         self._pending = None  # holder dict of the in-flight dispatch handle, consumed by the paired combine
+
+    def set_max_recv_tokens(self, n: int) -> None:
+        """Set the host-static worst-case recv bound (``n_slot * cap``) that enables the sync-free path."""
+        self._max_recv_tokens = int(n)
 
     def _get_buffer(self, group):
         if self._buffer is None:
@@ -133,7 +167,9 @@ class DeepEPAdapter:
             self._pending = None
             return _DeepEPCombine.apply(inp, buffer, handle)
 
-        # forward dispatch: rows arrive pre-grouped by destination rank, so split sizes define the layout
+        # forward dispatch: rows arrive pre-grouped by destination rank, so split sizes define the layout.
+        # DeepEP models one "expert" per destination rank here; we regroup received tokens by physical
+        # slot ourselves afterwards, so num_tokens_per_expert == num_tokens_per_rank is consistent.
         R = int(in_splits.shape[0])
         device = inp.device
         counts = in_splits.to(torch.long)
@@ -142,19 +178,112 @@ class DeepEPAdapter:
         is_token_in_rank[torch.arange(inp.shape[0], device=device), dst] = True
         npr = in_splits.to(torch.int32)
         holder: Dict[str, object] = {}
-        recv = _DeepEPDispatch.apply(inp, buffer, npr, is_token_in_rank, npr, holder)
+        recv = _DeepEPDispatch.apply(
+            inp, buffer, npr, is_token_in_rank, npr, self._max_recv_tokens, holder
+        )
         self._pending = holder  # consumed by the paired combine (reverse leg) above
         return recv
 
 
+# ============================ Routing & grouping helpers ============================
+
+
+def _split_sizes(plan: Plan, my_rank: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Device-side split sizes for this rank from the routing quota ``plan.q``.
+
+    Returns:
+        ``(sent_per_dst, recv_per_src, recv_per_expert)`` int64 tensors:
+        tokens this rank sends to each dst (sums to ``U``), receives from each src,
+        and receives for each logical expert it hosts.
+    """
+    sent_per_dst = plan.q[my_rank].sum(dim=0).to(torch.int64)         # [R], sums to U
+    recv_per_src = plan.q[:, :, my_rank].sum(dim=1).to(torch.int64)   # [R]
+    recv_per_expert = plan.q[:, :, my_rank].sum(dim=0).to(torch.int64)  # [E]
+    return sent_per_dst, recv_per_src, recv_per_expert
+
+
 def _slot_to_expert(x: torch.Tensor, my_rank: int, n_slot: int) -> torch.Tensor:
     """int64 ``[n_slot]``: logical expert hosted at each local slot on ``my_rank`` (-1 if empty)."""
-    E, R = x.shape
     col = x[:, my_rank].to(torch.bool)  # [E]
     experts = torch.nonzero(col, as_tuple=False).flatten()  # ascending e (fallback: host op)
     out = torch.full((n_slot,), -1, dtype=torch.int64, device=x.device)
     out[: experts.numel()] = experts
     return out
+
+
+def _group_sizes_by_slot(
+    slot_to_e: torch.Tensor, recv_per_expert: torch.Tensor, n_slot: int, device
+) -> torch.Tensor:
+    """int64 ``[n_slot]``: number of received tokens landing in each local slot."""
+    valid_slot = slot_to_e >= 0
+    group_sizes = torch.zeros(n_slot, dtype=torch.int64, device=device)
+    group_sizes[valid_slot] = recv_per_expert[slot_to_e[valid_slot]]
+    return group_sizes
+
+
+# ===================== Expert compute (replication + grouped MLP) =====================
+
+
+def _make_materialize_and_compute(
+    *,
+    replicated,
+    spec: ProblemSpec,
+    weights_local: Dict[int, Tuple[torch.Tensor, ...]],
+    weight_shapes: Sequence[torch.Size],
+    slot_to_e: torch.Tensor,
+    recv_slot: torch.Tensor,
+    group_sizes: torch.Tensor,
+    batched_mlp_fn: Callable,
+    cap: int,
+    n_slot: int,
+    dtype: torch.dtype,
+    device,
+    group,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Build the plain/Level-A compute closure: broadcast replica weights then run one batched MLP.
+
+    Returned as a closure so :func:`torch.utils.checkpoint` can recompute the broadcasts in backward
+    (Level A re-materialisation). Backward grads reduce to main(e) via ``broadcast_from_main``.
+    """
+
+    def _materialize_and_compute(recv_tokens: torch.Tensor) -> torch.Tensor:
+        # replicate: materialise each replicated expert's weight from its main owner (grads reduce to main)
+        We: Dict[int, Tuple[torch.Tensor, ...]] = {}
+        for e in replicated:
+            main_local = int(spec.main_rank[e].item())
+            local_w = weights_local.get(e)
+            We[e] = tuple(
+                broadcast_from_main(
+                    local_w[j] if local_w is not None else None,
+                    weight_shapes[j], dtype, device, main_local, group,
+                )
+                for j in range(len(weight_shapes))
+            )
+        # stack per-slot weights (zeros for empty slots)
+        w_stacked = []
+        for j in range(len(weight_shapes)):
+            buf = torch.zeros((n_slot, *weight_shapes[j]), dtype=dtype, device=device)
+            for s in range(n_slot):
+                e = int(slot_to_e[s].item())
+                if e < 0:
+                    continue
+                w = We[e][j] if e in We else weights_local[e][j]
+                buf[s] = w
+            w_stacked.append(buf)
+        out_units_recv = grouped_expert_mlp(
+            recv_tokens, recv_slot, group_sizes, tuple(w_stacked), batched_mlp_fn, cap
+        )
+        # keepalive: make output depend on every broadcast so all ranks hit the matching reduce in backward
+        keep = recv_tokens.sum() * 0.0
+        for e in replicated:
+            for w in We[e]:
+                keep = keep + w.sum() * 0.0
+        return out_units_recv + keep
+
+    return _materialize_and_compute
+
+
+# ================================= Public forward =================================
 
 
 def sync_free_moe_forward(
@@ -207,89 +336,53 @@ def sync_free_moe_forward(
     device = tokens.device
     dtype = tokens.dtype
     H = tokens.shape[1]
-    E = int(spec.num_experts)
-    R = int(plan.num_ranks)
     n_slot = int(spec.n_slot)
     my_rank = dist.get_rank(group) if dist.is_initialized() else 0
+    replicated = (plan.num_replicas() > 1).nonzero(as_tuple=False).flatten().tolist()
 
-    num_replicas = plan.num_replicas()
-    replicated = (num_replicas > 1).nonzero(as_tuple=False).flatten().tolist()
-
-    # --- routing: each unit -> physical instance id + destination rank (sync-free) ----------
+    # --- STAGE 1: ROUTE each unit -> (physical id, dst rank); order by dst; split sizes ------
     phys_id, dst_rank = assign_physical(unit_expert, plan, spec, my_rank)
     perm = torch.argsort(dst_rank, stable=True)
+    sent_per_dst, recv_per_src, recv_per_expert = _split_sizes(plan, my_rank)
 
-    # split sizes as device tensors: recv_per_src = output split, sent_per_dst = input split
-    sent_per_dst = plan.q[my_rank].sum(dim=0).to(torch.int64)        # sums to U
-    recv_per_src = plan.q[:, :, my_rank].sum(dim=1).to(torch.int64)
-
+    # --- STAGE 2: DISPATCH tokens (+ their physical ids) to the owning ranks -----------------
     send_tokens = tokens[unit_token_idx][perm]
     send_phys = phys_id[perm]
     recv_tokens = adapter.all_to_all(send_tokens, recv_per_src, sent_per_dst, group)
     recv_phys = adapter.all_to_all(
         send_phys.unsqueeze(1).to(dtype), recv_per_src, sent_per_dst, group
     ).squeeze(1).round().to(torch.int64)
-    if cap is None:                                                  # host-static upper bound: all received tokens could land in one slot
+    if cap is None:  # host-static upper bound: all received tokens could land in one slot
         cap = max(int(recv_tokens.shape[0]), 1)
 
-    # --- group received tokens by local physical slot, run one batched MLP -----------------
-    recv_slot = recv_phys - my_rank * n_slot                         # local slot in [0, n_slot)
+    # --- STAGE 3: GROUP received tokens by local physical slot -------------------------------
+    recv_slot = recv_phys - my_rank * n_slot                          # local slot in [0, n_slot)
     slot_to_e = _slot_to_expert(plan.x, my_rank, n_slot)
-    recv_per_expert = plan.q[:, :, my_rank].sum(dim=0).to(torch.int64)  # tokens per expert on this rank
-    valid_slot = slot_to_e >= 0
-    group_sizes = torch.zeros(n_slot, dtype=torch.int64, device=device)
-    group_sizes[valid_slot] = recv_per_expert[slot_to_e[valid_slot]]
+    group_sizes = _group_sizes_by_slot(slot_to_e, recv_per_expert, n_slot, device)
 
-    def _materialize_and_compute(recv_tokens: torch.Tensor) -> torch.Tensor:
-        # materialise replica weights from main(e) (collective; recomputed in backward when checkpointed)
-        We: Dict[int, Tuple[torch.Tensor, ...]] = {}
-        for e in replicated:
-            main_local = int(spec.main_rank[e].item())
-            local_w = weights_local.get(e)
-            We[e] = tuple(
-                broadcast_from_main(
-                    local_w[j] if local_w is not None else None,
-                    weight_shapes[j], dtype, device, main_local, group,
-                )
-                for j in range(len(weight_shapes))
-            )
-        # stacked per-slot weights (zeros for empty slots)
-        w_stacked = []
-        for j in range(len(weight_shapes)):
-            buf = torch.zeros((n_slot, *weight_shapes[j]), dtype=dtype, device=device)
-            for s in range(n_slot):
-                e = int(slot_to_e[s].item())
-                if e < 0:
-                    continue
-                w = We[e][j] if e in We else weights_local[e][j]
-                buf[s] = w
-            w_stacked.append(buf)
-        out_units_recv = grouped_expert_mlp(
-            recv_tokens, recv_slot, group_sizes, tuple(w_stacked), batched_mlp_fn, cap
-        )
-        # keepalive: make output depend on every broadcast so all ranks hit the matching reduce in backward
-        keep = recv_tokens.sum() * 0.0
-        for e in replicated:
-            for w in We[e]:
-                keep = keep + w.sum() * 0.0
-        return out_units_recv + keep
-
-    if overlap:
+    # --- STAGE 4: COMPUTE (replicate weights + batched expert MLP) ---------------------------
+    if overlap:  # Level B: async re-materialisation overlapped with Wgrad, grads reduce to main
         out_units_recv = overlapped_grouped_expert_mlp(
             recv_tokens, recv_slot, group_sizes, weights_local, slot_to_e,
             spec.main_rank, replicated, weight_shapes, cap,
             gated=gated, act=act, transpose_w=transpose_w,
             my_rank=my_rank, n_slot=n_slot, group=group,
         )
-    elif rematerialize:
-        out_units_recv = checkpoint(_materialize_and_compute, recv_tokens, use_reentrant=False, preserve_rng_state=False)
     else:
-        out_units_recv = _materialize_and_compute(recv_tokens)
+        compute = _make_materialize_and_compute(
+            replicated=replicated, spec=spec, weights_local=weights_local,
+            weight_shapes=weight_shapes, slot_to_e=slot_to_e, recv_slot=recv_slot,
+            group_sizes=group_sizes, batched_mlp_fn=batched_mlp_fn, cap=cap,
+            n_slot=n_slot, dtype=dtype, device=device, group=group,
+        )
+        if rematerialize:  # Level A: recompute the broadcasts in backward instead of holding them
+            out_units_recv = checkpoint(compute, recv_tokens, use_reentrant=False, preserve_rng_state=False)
+        else:
+            out_units_recv = compute(recv_tokens)
 
-    # --- combine: send outputs back, invert the dst-grouping permutation -------------------
+    # --- STAGE 5: COMBINE outputs back, invert the permutation, gate-weight, scatter ---------
     combined_back = adapter.all_to_all(out_units_recv, sent_per_dst, recv_per_src, group)
     out_per_unit = combined_back[torch.argsort(perm)]
-
     result = torch.zeros((tokens.shape[0], H), dtype=out_per_unit.dtype, device=device)
     result = result.index_add(0, unit_token_idx, unit_prob.unsqueeze(1) * out_per_unit)
     return result

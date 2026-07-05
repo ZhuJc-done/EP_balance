@@ -57,8 +57,9 @@ pip install -e /home/tiger/EP_balance
 ```
 
 `install_deepep.sh` / `install_te.sh` are optional: the launchers run without them
-(`AllToAllAdapter` for dispatch, `--transformer-impl local` for experts). Install them
-for the fully sync-free DeepEP path and the fast TE grouped-GEMM path respectively.
+(`AllToAllAdapter` for dispatch, `--transformer-impl local` for experts). Install
+**DeepEP** for high-performance all-to-all transport, and **Transformer Engine** for
+fused kernels + grouped-GEMM.
 Run recipes (single-node, multi-node 2×4 / 4×4, observe/apply, baselines) are in
 [`scripts/README.md`](scripts/README.md).
 
