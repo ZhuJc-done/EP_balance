@@ -200,7 +200,11 @@ class DeepEPAdapter:
         R = int(in_splits.shape[0])
         device = inp.device
         counts = in_splits.to(torch.long)
-        dst = torch.repeat_interleave(torch.arange(R, device=device), counts)
+        # output_size == number of local rows (host-static): lets repeat_interleave skip the
+        # sum().item() it would otherwise do to size its output -> no D2H on the token channel.
+        dst = torch.repeat_interleave(
+            torch.arange(R, device=device), counts, output_size=inp.shape[0]
+        )
         is_token_in_rank = torch.zeros(inp.shape[0], R, dtype=torch.bool, device=device)
         is_token_in_rank[torch.arange(inp.shape[0], device=device), dst] = True
         npr = in_splits.to(torch.int32)
@@ -429,10 +433,15 @@ def sync_free_moe_forward(
     # --- STAGE 2: DISPATCH tokens (+ their physical ids) to the owning ranks -----------------
     send_tokens = tokens[unit_token_idx][perm]
     send_phys = phys_id[perm]
-    recv_tokens = adapter.all_to_all(send_tokens, recv_per_src, sent_per_dst, group)
-    recv_phys = adapter.all_to_all(
-        send_phys.unsqueeze(1).to(dtype), recv_per_src, sent_per_dst, group
-    ).squeeze(1).round().to(torch.int64)
+    elem = send_tokens.element_size()
+    pad_bytes = (16 - (H * elem) % 16) % 16 or 16                 # >=1 col; makes (H+pad)*elem 16B-aligned
+    pad_cols = pad_bytes // elem
+    meta = send_tokens.new_zeros((send_tokens.shape[0], pad_cols))
+    meta[:, 0] = send_phys.to(dtype)                             # phys carried (rounded) through the token dtype
+    send_payload = torch.cat([send_tokens, meta], dim=1)
+    recv_payload = adapter.all_to_all(send_payload, recv_per_src, sent_per_dst, group)
+    recv_tokens = recv_payload[:, :H].contiguous()
+    recv_phys = recv_payload[:, H].round().to(torch.int64)
     if cap is None:  # host-static upper bound: all received tokens could land in one slot
         cap = max(int(recv_tokens.shape[0]), 1)
 
