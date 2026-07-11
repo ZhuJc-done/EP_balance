@@ -11,6 +11,7 @@ Pipeline (per MoE layer, per forward). Two concerns are kept orthogonal:
 
 from __future__ import annotations
 
+import os
 from typing import Callable, Dict, Optional, Protocol, Sequence, Tuple
 
 import torch
@@ -20,9 +21,35 @@ from torch.utils.checkpoint import checkpoint
 from ..plan import Plan
 from ..problem import ProblemSpec
 from .comm import all_to_all_single, broadcast_from_main
+from .gin_weights import GinWeightReplicator, gin_enabled
 from .grouped_mlp import grouped_expert_mlp
 from .overlap import overlapped_grouped_expert_mlp
 from .physical import assign_physical
+
+
+def _env_truthy(name: str) -> bool:
+    """Truthy parse of an on/off environment toggle."""
+    return os.environ.get(name, "0").strip().lower() not in ("0", "", "false", "no")
+
+
+# Cache one GIN replicator per (group, layout, dtype) so the symmetric buffers + static main(e)
+# layout are allocated once and recycled across layers/steps.
+_GIN_REPLICATORS: Dict[tuple, GinWeightReplicator] = {}
+
+
+def _get_gin_replicator(group, spec, weight_shapes, dtype, device) -> GinWeightReplicator:
+    key = (
+        id(group), int(spec.n_slot), int(spec.num_experts),
+        tuple(tuple(s) for s in weight_shapes), dtype,
+    )
+    r = _GIN_REPLICATORS.get(key)
+    if r is None:
+        r = GinWeightReplicator(
+            group=group, num_experts=int(spec.num_experts), n_slot=int(spec.n_slot),
+            main_rank=spec.main_rank, weight_shapes=weight_shapes, dtype=dtype, device=device,
+        )
+        _GIN_REPLICATORS[key] = r
+    return r
 
 
 # ============================== Transport adapters ==============================
@@ -202,13 +229,32 @@ def _split_sizes(plan: Plan, my_rank: int) -> Tuple[torch.Tensor, torch.Tensor, 
     return sent_per_dst, recv_per_src, recv_per_expert
 
 
-def _slot_to_expert(x: torch.Tensor, my_rank: int, n_slot: int) -> torch.Tensor:
-    """int64 ``[n_slot]``: logical expert hosted at each local slot on ``my_rank`` (-1 if empty)."""
-    col = x[:, my_rank].to(torch.bool)  # [E]
-    experts = torch.nonzero(col, as_tuple=False).flatten()  # ascending e (fallback: host op)
-    out = torch.full((n_slot,), -1, dtype=torch.int64, device=x.device)
-    out[: experts.numel()] = experts
-    return out
+def _slot_tables(
+    x: torch.Tensor, my_rank: int, n_slot: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sync-free slot tables for ``my_rank`` (no ``nonzero``/host ops).
+
+    Returns three device tensors:
+      * ``slot_to_e`` int64 ``[n_slot]``: logical expert at each local slot (-1 if empty),
+        experts placed in ascending id order (matches the old ``nonzero`` ordering).
+      * ``slot_of_e`` int64 ``[E]``: local slot index of expert ``e`` (valid only where hosted).
+      * ``hosted``    bool  ``[E]``: whether ``my_rank`` holds an instance of expert ``e``.
+
+    Built purely with ``cumsum``/``scatter``/``where`` so the whole thing stays on device.
+    """
+    E = x.shape[0]
+    device = x.device
+    col = x[:, my_rank].to(torch.int64)            # [E] in {0, 1}
+    hosted = col.bool()                            # [E]
+    slot_of_e = (col.cumsum(0) - 1).clamp_(min=0)  # [E]; ascending-id slot for hosted experts
+    e_ids = torch.arange(E, device=device, dtype=torch.int64)
+    # scatter each expert id into its slot; non-hosted experts go to an overflow bucket (index n_slot)
+    dump = torch.full_like(slot_of_e, n_slot)
+    tgt = torch.where(hosted, slot_of_e, dump)     # [E]
+    ext = torch.full((n_slot + 1,), -1, dtype=torch.int64, device=device)
+    ext.scatter_(0, tgt, e_ids)
+    slot_to_e = ext[:n_slot].clone()
+    return slot_to_e, slot_of_e, hosted
 
 
 def _group_sizes_by_slot(
@@ -226,11 +272,12 @@ def _group_sizes_by_slot(
 
 def _make_materialize_and_compute(
     *,
-    replicated,
-    spec: ProblemSpec,
+    replicated: Sequence[int],
+    replicated_main: Sequence[int],
     weights_local: Dict[int, Tuple[torch.Tensor, ...]],
     weight_shapes: Sequence[torch.Size],
-    slot_to_e: torch.Tensor,
+    slot_of_e: torch.Tensor,
+    hosted: torch.Tensor,
     recv_slot: torch.Tensor,
     group_sizes: torch.Tensor,
     batched_mlp_fn: Callable,
@@ -244,13 +291,19 @@ def _make_materialize_and_compute(
 
     Returned as a closure so :func:`torch.utils.checkpoint` can recompute the broadcasts in backward
     (Level A re-materialisation). Backward grads reduce to main(e) via ``broadcast_from_main``.
+
+    Sync-free: the per-slot weight stack is assembled with device ``index_copy_`` using the
+    precomputed ``slot_of_e`` / ``hosted`` tensors, so there is no per-slot ``.item()``. The only
+    host-side inputs are the (already materialised) ``replicated`` / ``replicated_main`` control
+    lists, which drive the per-expert broadcast collectives (``dist.broadcast`` needs a host ``src``).
     """
+    replicated_set = set(replicated)
 
     def _materialize_and_compute(recv_tokens: torch.Tensor) -> torch.Tensor:
-        # replicate: materialise each replicated expert's weight from its main owner (grads reduce to main)
+        # replicate: materialise each replicated expert's weight from its (static) main owner.
+        # every rank enters these collectives in the same ascending-id order -> grads reduce to main.
         We: Dict[int, Tuple[torch.Tensor, ...]] = {}
-        for e in replicated:
-            main_local = int(spec.main_rank[e].item())
+        for e, main_local in zip(replicated, replicated_main):
             local_w = weights_local.get(e)
             We[e] = tuple(
                 broadcast_from_main(
@@ -259,17 +312,22 @@ def _make_materialize_and_compute(
                 )
                 for j in range(len(weight_shapes))
             )
-        # stack per-slot weights (zeros for empty slots)
+        # stack per-slot weights via device scatter into a [n_slot + 1, *w] buffer; row n_slot is the
+        # overflow bucket for weights not hosted on this rank (dropped by the trailing [:n_slot] slice).
+        overflow = torch.full((1,), n_slot, dtype=torch.int64, device=device)
         w_stacked = []
         for j in range(len(weight_shapes)):
-            buf = torch.zeros((n_slot, *weight_shapes[j]), dtype=dtype, device=device)
-            for s in range(n_slot):
-                e = int(slot_to_e[s].item())
-                if e < 0:
-                    continue
-                w = We[e][j] if e in We else weights_local[e][j]
-                buf[s] = w
-            w_stacked.append(buf)
+            buf = torch.zeros((n_slot + 1, *weight_shapes[j]), dtype=dtype, device=device)
+            # resident (non-replicated) mains: keys are static, slot index is a device tensor
+            for e, wt in weights_local.items():
+                if e in replicated_set:
+                    continue  # placed via the broadcast path below (grads must reduce to main)
+                buf.index_copy_(0, slot_of_e[e:e + 1], wt[j].to(dtype).unsqueeze(0))
+            # replicated experts: place into this rank's slot iff hosted, else into the overflow row
+            for e in replicated:
+                tgt = torch.where(hosted[e], slot_of_e[e:e + 1], overflow)
+                buf.index_copy_(0, tgt, We[e][j].to(dtype).unsqueeze(0))
+            w_stacked.append(buf[:n_slot])
         out_units_recv = grouped_expert_mlp(
             recv_tokens, recv_slot, group_sizes, tuple(w_stacked), batched_mlp_fn, cap
         )
@@ -319,6 +377,7 @@ def sync_free_moe_forward(
         batched_mlp_fn: ``(x[S, cap, H], stacked_weights) -> y[S, cap, H]`` batched expert forward.
         cap: Per-slot capacity (host-static). If None, derived as this rank's received-token count
             (safe upper bound for the all-to-all fallback; a DeepEP adapter would pass a static value).
+            Required to be host-static (pass ``cap`` or set ``EPLB_CAP``) when ``EPLB_DEEPEP_STATIC=1``.
         group: EP process group.
         adapter: Transport backend (defaults to :class:`AllToAllAdapter`).
         rematerialize: If True, free replica weights after forward and re-broadcast them in
@@ -338,7 +397,29 @@ def sync_free_moe_forward(
     H = tokens.shape[1]
     n_slot = int(spec.n_slot)
     my_rank = dist.get_rank(group) if dist.is_initialized() else 0
-    replicated = (plan.num_replicas() > 1).nonzero(as_tuple=False).flatten().tolist()
+
+    # Control plane for the replica broadcasts. `dist.broadcast` needs a host-side `src`, so the set of
+    # replicated experts and their (static) main ranks are read to host in ONE consolidated D2H here --
+    # ~E ints, not per-slot/per-token. Everything else on this path stays on device. The GIN weight
+    # backend drives its own device-side schedule instead, so this D2H is skipped there.
+    replicated, replicated_main = [], []
+    if overlap or not gin_enabled():
+        rep_e = (plan.num_replicas() > 1).nonzero(as_tuple=False).flatten()   # ascending expert ids
+        rep_pairs = torch.stack([rep_e, spec.main_rank.index_select(0, rep_e)]).tolist()
+        replicated, replicated_main = (rep_pairs[0], rep_pairs[1]) if rep_pairs else ([], [])
+
+    # EPLB_DEEPEP_STATIC: statically size the DeepEP recv buffer (num_worst_tokens = n_slot * cap) so the
+    # token channel does no recv-count D2H and stays CUDA-graph capturable. Needs a host-static `cap`.
+    if _env_truthy("EPLB_DEEPEP_STATIC"):
+        if cap is None:
+            env_cap = os.environ.get("EPLB_CAP")
+            if env_cap is None:
+                raise ValueError(
+                    "EPLB_DEEPEP_STATIC needs a host-static per-slot cap: pass cap=... or set EPLB_CAP"
+                )
+            cap = int(env_cap)
+        if hasattr(adapter, "set_max_recv_tokens"):
+            adapter.set_max_recv_tokens(n_slot * cap)
 
     # --- STAGE 1: ROUTE each unit -> (physical id, dst rank); order by dst; split sizes ------
     phys_id, dst_rank = assign_physical(unit_expert, plan, spec, my_rank)
@@ -357,7 +438,7 @@ def sync_free_moe_forward(
 
     # --- STAGE 3: GROUP received tokens by local physical slot -------------------------------
     recv_slot = recv_phys - my_rank * n_slot                          # local slot in [0, n_slot)
-    slot_to_e = _slot_to_expert(plan.x, my_rank, n_slot)
+    slot_to_e, slot_of_e, hosted = _slot_tables(plan.x, my_rank, n_slot)
     group_sizes = _group_sizes_by_slot(slot_to_e, recv_per_expert, n_slot, device)
 
     # --- STAGE 4: COMPUTE (replicate weights + batched expert MLP) ---------------------------
@@ -368,10 +449,16 @@ def sync_free_moe_forward(
             gated=gated, act=act, transpose_w=transpose_w,
             my_rank=my_rank, n_slot=n_slot, group=group,
         )
+    elif gin_enabled():  # device-initiated replication over NCCL GIN (no dist.broadcast / host weight bytes)
+        replicator = _get_gin_replicator(group, spec, weight_shapes, dtype, device)
+        w_stacked = replicator.materialize(plan.x, weights_local)  # (W_j[n_slot, *shape_j], ...)
+        out_units_recv = grouped_expert_mlp(
+            recv_tokens, recv_slot, group_sizes, w_stacked, batched_mlp_fn, cap
+        )
     else:
         compute = _make_materialize_and_compute(
-            replicated=replicated, spec=spec, weights_local=weights_local,
-            weight_shapes=weight_shapes, slot_to_e=slot_to_e, recv_slot=recv_slot,
+            replicated=replicated, replicated_main=replicated_main, weights_local=weights_local,
+            weight_shapes=weight_shapes, slot_of_e=slot_of_e, hosted=hosted, recv_slot=recv_slot,
             group_sizes=group_sizes, batched_mlp_fn=batched_mlp_fn, cap=cap,
             n_slot=n_slot, dtype=dtype, device=device, group=group,
         )

@@ -21,7 +21,13 @@ def _env_flag(name: str) -> bool:
 
 
 def _make_adapter():
-    """Select the sync-free transport backend from ``EPLB_ADAPTER`` (``alltoall`` default | ``deepep``)."""
+    """Select the sync-free transport backend from ``EPLB_ADAPTER`` (``alltoall`` default | ``deepep``).
+
+    ``EPLB_DEEPEP_STATIC=1`` forces the DeepEP backend (static ``num_worst_tokens`` recv sizing is then
+    applied inside :func:`sync_free_moe_forward`), regardless of ``EPLB_ADAPTER``.
+    """
+    if _env_flag("EPLB_DEEPEP_STATIC"):
+        return DeepEPAdapter()
     name = os.environ.get("EPLB_ADAPTER", "alltoall").strip().lower()
     if name in ("deepep", "deep_ep"):
         return DeepEPAdapter()
