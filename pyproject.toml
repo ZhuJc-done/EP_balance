@@ -20,7 +20,7 @@ oracle = ["ortools>=9.7"]
 dev = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]
-include = ["eplb*"]
+include = ["eplb*", "baseline*", "sim*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

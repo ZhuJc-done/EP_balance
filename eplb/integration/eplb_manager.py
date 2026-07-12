@@ -11,8 +11,9 @@ Pipeline (per MoE layer, per forward). Two concerns are kept orthogonal:
 
 from __future__ import annotations
 
+import contextlib
 import os
-from typing import Callable, Dict, Optional, Protocol, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -23,7 +24,7 @@ from ..problem import ProblemSpec
 from .comm import all_to_all_single, broadcast_from_main
 from .gin_weights import GinWeightReplicator, gin_enabled
 from .grouped_mlp import grouped_expert_mlp
-from .overlap import overlapped_grouped_expert_mlp
+from .overlap import _comm_stream, overlapped_grouped_expert_mlp
 from .physical import assign_physical
 
 
@@ -76,6 +77,18 @@ class AllToAllAdapter:
     def all_to_all(self, inp, out_splits, in_splits, group) -> torch.Tensor:
         # NCCL/Gloo need host-side split lists; this .tolist() is the one allowed D2H here
         return all_to_all_single(inp, out_splits.tolist(), in_splits.tolist(), group)
+
+    # ---- two-chunk pipeline hooks (symmetric: dispatch and combine are both a plain a2a) ----
+    def needs_recv_counts(self) -> bool:
+        """all_to_all_single needs the per-src recv counts on host, so the caller must supply them."""
+        return True
+
+    def dispatch_chunk(self, payload, sent_per_dst, recv_per_src, group, tag: int = 0):
+        return all_to_all_single(payload, recv_per_src.tolist(), sent_per_dst.tolist(), group)
+
+    def combine_chunk(self, y, sent_per_dst, recv_per_src, group, tag: int = 0):
+        # reverse leg: send back what we received, receive back what we sent
+        return all_to_all_single(y, sent_per_dst.tolist(), recv_per_src.tolist(), group)
 
 
 class _DeepEPDispatch(torch.autograd.Function):
@@ -159,6 +172,7 @@ class DeepEPAdapter:
         self._buffer = None
         self._group = None
         self._pending = None  # holder dict of the in-flight dispatch handle, consumed by the paired combine
+        self._handles: Dict[int, Dict[str, object]] = {}  # per-chunk dispatch handles (two-chunk pipeline)
 
     def set_max_recv_tokens(self, n: int) -> None:
         """Set the host-static worst-case recv bound (``n_slot * cap``) that enables the sync-free path."""
@@ -182,18 +196,9 @@ class DeepEPAdapter:
             and (inp.shape[1] * inp.element_size()) % 16 == 0
         )
 
-    def all_to_all(self, inp, out_splits, in_splits, group):
-        if not self._deepep_eligible(inp):
-            # metadata channel: exact, ordering matches DeepEP dispatch (one small D2H on the splits)
-            return all_to_all_single(inp, out_splits.tolist(), in_splits.tolist(), group)
-
+    def _dispatch(self, inp, in_splits, group) -> Tuple[torch.Tensor, Dict[str, object]]:
+        """Run one DeepEP dispatch keyed by device-side per-dst counts; return ``(recv, handle_holder)``."""
         buffer = self._get_buffer(group)
-        if self._pending is not None:
-            # second aligned call of this forward == the reverse leg -> combine reusing the dispatch layout
-            handle = self._pending["handle"]
-            self._pending = None
-            return _DeepEPCombine.apply(inp, buffer, handle)
-
         # forward dispatch: rows arrive pre-grouped by destination rank, so split sizes define the layout.
         # DeepEP models one "expert" per destination rank here; we regroup received tokens by physical
         # slot ourselves afterwards, so num_tokens_per_expert == num_tokens_per_rank is consistent.
@@ -212,8 +217,42 @@ class DeepEPAdapter:
         recv = _DeepEPDispatch.apply(
             inp, buffer, npr, is_token_in_rank, npr, self._max_recv_tokens, holder
         )
+        return recv, holder
+
+    def all_to_all(self, inp, out_splits, in_splits, group):
+        if not self._deepep_eligible(inp):
+            # metadata channel: exact, ordering matches DeepEP dispatch (one small D2H on the splits)
+            return all_to_all_single(inp, out_splits.tolist(), in_splits.tolist(), group)
+
+        buffer = self._get_buffer(group)
+        if self._pending is not None:
+            # second aligned call of this forward == the reverse leg -> combine reusing the dispatch layout
+            handle = self._pending["handle"]
+            self._pending = None
+            return _DeepEPCombine.apply(inp, buffer, handle)
+
+        recv, holder = self._dispatch(inp, in_splits, group)
         self._pending = holder  # consumed by the paired combine (reverse leg) above
         return recv
+
+    # ---- two-chunk pipeline hooks (explicit per-chunk handles so 2 dispatch + 2 combine don't collide) ----
+    def needs_recv_counts(self) -> bool:
+        """DeepEP sizes recv statically (``num_worst_tokens``); it does not need host-side recv counts."""
+        return False
+
+    def dispatch_chunk(self, payload, sent_per_dst, recv_per_src, group, tag: int = 0):
+        if not self._deepep_eligible(payload):
+            return all_to_all_single(payload, recv_per_src.tolist(), sent_per_dst.tolist(), group)
+        recv, holder = self._dispatch(payload, sent_per_dst, group)
+        self._handles[tag] = holder  # combine_chunk(tag) reuses this exact dispatch layout
+        return recv
+
+    def combine_chunk(self, y, sent_per_dst, recv_per_src, group, tag: int = 0):
+        if not self._deepep_eligible(y):
+            return all_to_all_single(y, sent_per_dst.tolist(), recv_per_src.tolist(), group)
+        buffer = self._get_buffer(group)
+        holder = self._handles.pop(tag)
+        return _DeepEPCombine.apply(y, buffer, holder["handle"])
 
 
 # ============================ Routing & grouping helpers ============================
@@ -345,6 +384,203 @@ def _make_materialize_and_compute(
     return _materialize_and_compute
 
 
+# ============================ Two-chunk fine-grained overlap ============================
+# Split this rank's routing units into ``EPLB_CHUNKS`` token-chunks and pipeline
+# dispatch(comm) / expert-GEMM(compute) / combine(comm) across a compute stream and a comm
+# side stream, so dispatch(c2) overlaps compute(c1) and combine(c1) overlaps compute(c2)
+# (the SCALE-EPLB forward timeline). The backward overlap is obtained for free: PyTorch's
+# autograd engine runs each grad_fn on the stream its forward ran on, so combine^-1 / dispatch^-1
+# / Wgrad-reduce land on the comm stream and Dgrad/Wgrad on the compute stream -- mirroring the
+# backward timeline without a hand-written backward. Replica weights are re-materialised ONCE and
+# shared by both chunks (grads from both accumulate, then reduce to main once).
+#
+# Correctness is order-invariant: the final output is ``sum_units prob * expert(token)`` scattered
+# by ``index_add`` on the token index, so any disjoint partition of the units yields the same result.
+
+
+def _sctx(stream):
+    """Context manager that enqueues on ``stream`` (no-op / current stream on CPU)."""
+    return torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+
+
+def _rec(t: torch.Tensor, stream) -> None:
+    """Mark ``t`` as used on ``stream`` so the caching allocator won't free/reuse it too early."""
+    if stream is not None and t.is_cuda:
+        t.record_stream(stream)
+
+
+def _exchange_recv_counts(send_counts: torch.Tensor, group) -> torch.Tensor:
+    """All-to-all the per-dst send counts -> per-src recv counts (uniform 1-int-per-rank split).
+
+    Only used by adapters whose ``needs_recv_counts()`` is True (``AllToAllAdapter``); DeepEP sizes
+    the recv buffer statically and skips this. ``send_counts`` is int64 ``[R]`` (== world size).
+    """
+    if not dist.is_initialized():
+        return send_counts
+    recv = torch.empty_like(send_counts)
+    dist.all_to_all_single(recv, send_counts.contiguous(), group=group)
+    return recv
+
+
+def _materialize_w_stacked(
+    *,
+    replicated: Sequence[int],
+    replicated_main: Sequence[int],
+    weights_local: Dict[int, Tuple[torch.Tensor, ...]],
+    weight_shapes: Sequence[torch.Size],
+    slot_of_e: torch.Tensor,
+    hosted: torch.Tensor,
+    n_slot: int,
+    dtype: torch.dtype,
+    device,
+    group,
+) -> Tuple[Tuple[torch.Tensor, ...], Optional[torch.Tensor]]:
+    """Broadcast-path replica weights, materialised ONCE for the whole layer (shared across chunks).
+
+    Same per-slot assembly as :func:`_make_materialize_and_compute`, but returned as a standalone
+    stacked-weight tuple (not a recompute closure) so both chunks' MLPs read the same tensors; grads
+    from both chunks accumulate into each replica broadcast, whose backward reduces to ``main(e)`` once.
+
+    Returns ``(w_stacked, keepalive)`` where ``keepalive`` is a scalar tied to every replica broadcast
+    so all ranks hit the matching reduce in backward even for replicas that receive no tokens.
+    """
+    replicated_set = set(replicated)
+    We: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    for e, main_local in zip(replicated, replicated_main):
+        local_w = weights_local.get(e)
+        We[e] = tuple(
+            broadcast_from_main(
+                local_w[j] if local_w is not None else None,
+                weight_shapes[j], dtype, device, main_local, group,
+            )
+            for j in range(len(weight_shapes))
+        )
+    overflow = torch.full((1,), n_slot, dtype=torch.int64, device=device)
+    w_stacked: List[torch.Tensor] = []
+    for j in range(len(weight_shapes)):
+        buf = torch.zeros((n_slot + 1, *weight_shapes[j]), dtype=dtype, device=device)
+        for e, wt in weights_local.items():
+            if e in replicated_set:
+                continue
+            buf.index_copy_(0, slot_of_e[e:e + 1], wt[j].to(dtype).unsqueeze(0))
+        for e in replicated:
+            tgt = torch.where(hosted[e], slot_of_e[e:e + 1], overflow)
+            buf.index_copy_(0, tgt, We[e][j].to(dtype).unsqueeze(0))
+        w_stacked.append(buf[:n_slot])
+    keep: Optional[torch.Tensor] = None
+    for e in replicated:
+        for w in We[e]:
+            term = w.sum() * 0.0
+            keep = term if keep is None else keep + term
+    return tuple(w_stacked), keep
+
+
+def _moe_forward_two_chunks(
+    *,
+    tokens: torch.Tensor,
+    unit_token_idx: torch.Tensor,
+    unit_prob: torch.Tensor,
+    phys_id: torch.Tensor,
+    dst_rank: torch.Tensor,
+    w_stacked: Tuple[torch.Tensor, ...],
+    keepalive: Optional[torch.Tensor],
+    batched_mlp_fn: Callable,
+    cap: int,
+    group,
+    adapter,
+    my_rank: int,
+    n_slot: int,
+    H: int,
+    dtype: torch.dtype,
+    device,
+    R: int,
+    num_chunks: int,
+) -> torch.Tensor:
+    """Token-chunked dispatch/compute/combine pipeline over compute + comm streams (weights pre-materialised).
+
+    ``phys_id`` / ``dst_rank`` are the full-set routing results (STAGE 1 must run on all units so the
+    quota-based physical assignment is consistent); we split the units by contiguous halves here.
+    """
+    U = int(unit_token_idx.shape[0])
+    cs = _comm_stream(device)                                            # comm side stream (None on CPU)
+    ms = torch.cuda.current_stream(device) if device.type == "cuda" else None
+    on_cuda = cs is not None
+
+    # ---- per-chunk static prep (cheap, on the default stream) ----------------------------------
+    chunk_units = torch.chunk(torch.arange(U, device=device), num_chunks)
+    prep: List[Dict[str, torch.Tensor]] = []
+    for idx in chunk_units:
+        dst_c = dst_rank.index_select(0, idx)
+        perm_c = torch.argsort(dst_c, stable=True)
+        idx_p = idx.index_select(0, perm_c)                              # unit ids in send (by-dst) order
+        sent_c = torch.bincount(dst_c, minlength=R).to(torch.int64)      # [R] tokens sent to each dst
+        utok_c = unit_token_idx.index_select(0, idx_p)                   # [Uc] owning token of each sent unit
+        prob_c = unit_prob.index_select(0, idx_p)                        # [Uc] gate weight
+        phys_c = phys_id.index_select(0, idx_p)                          # [Uc] target physical id
+        send_tokens_c = tokens.index_select(0, utok_c)                   # [Uc, H]
+        elem = send_tokens_c.element_size()
+        pad_bytes = (16 - (H * elem) % 16) % 16 or 16                    # keep payload 16B-aligned for DeepEP
+        pad_cols = pad_bytes // elem
+        m = send_tokens_c.new_zeros((send_tokens_c.shape[0], pad_cols))
+        m[:, 0] = phys_c.to(dtype)                                       # phys id carried through the token dtype
+        payload_c = torch.cat([send_tokens_c, m], dim=1)
+        recv_c = _exchange_recv_counts(sent_c, group) if adapter.needs_recv_counts() else sent_c
+        prep.append({"sent": sent_c, "recv": recv_c, "payload": payload_c, "utok": utok_c, "prob": prob_c})
+
+    nc = len(prep)
+    recv: List[Optional[torch.Tensor]] = [None] * nc
+    disp_evt: List[Optional[torch.cuda.Event]] = [None] * nc
+
+    # ---- issue every chunk's dispatch on the comm stream ---------------------------------------
+    with _sctx(cs):
+        for k in range(nc):
+            recv[k] = adapter.dispatch_chunk(prep[k]["payload"], prep[k]["sent"], prep[k]["recv"], group, tag=k)
+            if on_cuda:
+                _rec(recv[k], ms)
+                disp_evt[k] = torch.cuda.Event()
+                disp_evt[k].record(cs)
+
+    # ---- interleave: compute(k) on compute stream, combine(k) on comm stream -------------------
+    # compute(k) waits only for dispatch(k) (not later dispatches) so dispatch(k+1) overlaps compute(k),
+    # and combine(k) (comm) overlaps compute(k+1).
+    comb: List[Optional[torch.Tensor]] = [None] * nc
+    for k in range(nc):
+        if on_cuda:
+            ms.wait_event(disp_evt[k])
+        rp = recv[k]
+        recv_tokens_k = rp[:, :H].contiguous()
+        recv_phys_k = rp[:, H].round().to(torch.int64)
+        recv_slot_k = recv_phys_k - my_rank * n_slot                     # local slot in [0, n_slot)
+        group_sizes_k = torch.bincount(
+            recv_slot_k.clamp(min=0, max=n_slot - 1), minlength=n_slot
+        ).to(torch.int64)
+        y_k = grouped_expert_mlp(recv_tokens_k, recv_slot_k, group_sizes_k, w_stacked, batched_mlp_fn, cap)
+        if on_cuda:
+            comp_evt = torch.cuda.Event()
+            comp_evt.record(ms)
+            _rec(y_k, cs)
+        with _sctx(cs):
+            if on_cuda:
+                cs.wait_event(comp_evt)
+            comb[k] = adapter.combine_chunk(y_k, prep[k]["sent"], prep[k]["recv"], group, tag=k)
+            if on_cuda:
+                _rec(comb[k], ms)
+
+    if on_cuda:
+        ms.wait_stream(cs)                                               # gather after all combines land
+
+    # ---- scatter each chunk's gate-weighted output back to its owning tokens (additive) --------
+    out_dtype = comb[0].dtype
+    result = torch.zeros((tokens.shape[0], H), dtype=out_dtype, device=device)
+    for k in range(nc):
+        result = result.index_add(
+            0, prep[k]["utok"], prep[k]["prob"].unsqueeze(1).to(out_dtype) * comb[k]
+        )
+    if keepalive is not None:
+        result = result + keepalive.to(out_dtype)
+    return result
+
+
 # ================================= Public forward =================================
 
 
@@ -426,7 +662,37 @@ def sync_free_moe_forward(
             adapter.set_max_recv_tokens(n_slot * cap)
 
     # --- STAGE 1: ROUTE each unit -> (physical id, dst rank); order by dst; split sizes ------
+    # Physical assignment must see ALL units (it distributes them by the quota plan.q), so STAGE 1
+    # always runs on the full set even when the transport is later chunked.
     phys_id, dst_rank = assign_physical(unit_expert, plan, spec, my_rank)
+
+    # EPLB_CHUNKS >= 2: fine-grained two-chunk overlap. Weights are re-materialised once (shared by
+    # both chunks) and the dispatch/compute/combine pipeline is interleaved on compute + comm streams.
+    # Mutually exclusive with the Level-B `overlap` path (which owns its own custom backward).
+    num_chunks = int(os.environ.get("EPLB_CHUNKS", "1") or "1")
+    if num_chunks >= 2 and not overlap:
+        _, slot_of_e, hosted = _slot_tables(plan.x, my_rank, n_slot)
+        if gin_enabled():  # device-initiated replication; its backward reduces to main on its own stream
+            replicator = _get_gin_replicator(group, spec, weight_shapes, dtype, device)
+            w_stacked = replicator.materialize(plan.x, weights_local)
+            keepalive = None
+        else:
+            w_stacked, keepalive = _materialize_w_stacked(
+                replicated=replicated, replicated_main=replicated_main, weights_local=weights_local,
+                weight_shapes=weight_shapes, slot_of_e=slot_of_e, hosted=hosted,
+                n_slot=n_slot, dtype=dtype, device=device, group=group,
+            )
+        if cap is None:  # per-slot upper bound: no slot can hold more than this rank's total units
+            env_cap = os.environ.get("EPLB_CAP")
+            cap = int(env_cap) if env_cap else max(int(unit_token_idx.shape[0]), 1)
+        return _moe_forward_two_chunks(
+            tokens=tokens, unit_token_idx=unit_token_idx, unit_prob=unit_prob,
+            phys_id=phys_id, dst_rank=dst_rank, w_stacked=w_stacked, keepalive=keepalive,
+            batched_mlp_fn=batched_mlp_fn, cap=cap, group=group, adapter=adapter,
+            my_rank=my_rank, n_slot=n_slot, H=H, dtype=dtype, device=device,
+            R=int(plan.q.shape[0]), num_chunks=num_chunks,
+        )
+
     perm = torch.argsort(dst_rank, stable=True)
     sent_per_dst, recv_per_src, recv_per_expert = _split_sizes(plan, my_rank)
 

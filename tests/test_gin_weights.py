@@ -128,3 +128,24 @@ def _gin_available() -> bool:
                     reason="needs RUN_GIN_TESTS=1, >=2 GPUs with GIN-capable NCCL, and nccl_gin built")
 def test_gin_weights_compute_invariant():
     mp.spawn(_worker, args=(6031,), nprocs=W, join=True)
+
+
+def test_replica_schedule_device_math():
+    """CPU check of the D2H-free replication schedule (no nccl_gin / CUDA needed).
+
+    2 ranks, experts 0,1 main on rank0 and 2,3 on rank1 -> local_slot_of_e = [0,1,0,1].
+    From rank 0's view, a slot layout [expert2(remote), expert0(local), empty] must yield a get
+    schedule that fetches only the remote slot and gathers the local one on device.
+    """
+    from eplb.integration.gin_weights import _replica_schedule
+
+    local_slot_of_e = torch.tensor([0, 1, 0, 1], dtype=torch.int64)  # main_rank = [0,0,1,1]
+    slot_to_e = torch.tensor([2, 0, -1], dtype=torch.int64)          # rank 0's local slots
+    main_of_slot = torch.tensor([1, 0, -1], dtype=torch.int64)
+
+    peers, ls, is_local = _replica_schedule(slot_to_e, main_of_slot, local_slot_of_e, my_rank=0)
+
+    assert peers.dtype == torch.int32
+    assert peers.tolist() == [1, -1, -1]          # only slot 0 (expert2 on rank1) is a remote get
+    assert ls.tolist() == [0, 0, 0]               # local_slot(e2)=0, local_slot(e0)=0
+    assert is_local.tolist() == [False, True, False]  # slot 1 (expert0) filled by on-device gather

@@ -52,9 +52,14 @@ def _ground_truth(unit_expert, unit_prob, tokens, base_w1, base_w2):
     return torch.stack(results), gt_w1, gt_w2
 
 
-def _worker(rank, port, rematerialize=False, overlap=False):
+def _worker(rank, port, rematerialize=False, overlap=False, chunks=1):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
+    # EPLB_CHUNKS drives the two-chunk overlap path inside sync_free_moe_forward (env read at call time)
+    if chunks >= 2:
+        os.environ["EPLB_CHUNKS"] = str(chunks)
+    else:
+        os.environ.pop("EPLB_CHUNKS", None)
     dist.init_process_group(backend="gloo", rank=rank, world_size=W)
 
     unit_expert, unit_prob, tokens, base_w1, base_w2 = _global_data()
@@ -110,6 +115,13 @@ def test_sync_free_rematerialize_matches_reference():
 def test_sync_free_overlap_matches_reference():
     # Level B: async re-materialisation + hand-written GEMM backward must match the reference grads
     mp.spawn(_worker, args=(6023, False, True), nprocs=W, join=True)
+
+
+def test_sync_free_two_chunk_matches_reference():
+    # EPLB_CHUNKS=2: token-chunked dispatch/compute/combine pipeline (weights re-materialised once,
+    # shared by both chunks). On CPU/gloo the comm stream is a no-op, so this validates the chunk
+    # split/merge + shared-weight grad math (compute-invariance) rather than the GPU stream overlap.
+    mp.spawn(_worker, args=(6024, False, False, 2), nprocs=W, join=True)
 
 
 def test_overlap_backward_matches_autograd_gated_transpose():
