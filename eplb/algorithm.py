@@ -26,7 +26,12 @@ def _lexsort_keys(*keys: torch.Tensor) -> torch.Tensor:
     return order
 
 
-def _waterfill(need: int, base: torch.Tensor, tie: torch.Tensor) -> torch.Tensor:
+def _waterfill(
+    need: int,
+    base: torch.Tensor,
+    tie: torch.Tensor,
+    u_min: int = 1,
+) -> torch.Tensor:
     """Distribute ``need`` units to minimise max(base+add), tie-broken by ``tie`` then index.
 
     Args:
@@ -48,6 +53,22 @@ def _waterfill(need: int, base: torch.Tensor, tie: torch.Tensor) -> torch.Tensor
     # order destinations by (current load, tie key, original index)
     idx = torch.arange(D, dtype=torch.int64, device=base.device)
     order = _lexsort_keys(base, tie, idx)
+    if u_min > 1 and need >= u_min:
+        # Activate only as many destinations as can receive a legal floor, then
+        # water-fill the remainder over that least-loaded prefix.
+        count = min(D, need // u_min)
+        selected = order[:count]
+        add[selected] = u_min
+        remaining = need - count * u_min
+        if remaining > 0:
+            add[selected] += _waterfill(
+                remaining,
+                base[selected] + u_min,
+                tie[selected],
+                1,
+            )
+        return add
+
     b = base[order]
 
     rem = int(need)
@@ -77,6 +98,7 @@ def _assign_quota(
     x: torch.Tensor,
     cost: torch.Tensor,
     dom: torch.Tensor,
+    u_min: int = 1,
 ):
     """Route tokens under strict domain-local serving (cross-domain only when no in-domain instance).
 
@@ -119,11 +141,54 @@ def _assign_quota(
         # prefer in-domain instances, fall back cross-domain if none
         in_domain = inst[dom[inst] == d]
         dests = in_domain if in_domain.numel() > 0 else inst
-        add = _waterfill(need, load[dests], cost[r, dests])
+        add = _waterfill(need, load[dests], cost[r, dests], u_min)
         q[r, e, dests] += add
         load[dests] += add
 
     return q, load
+
+
+def _plan_quota_transfer(
+    q_from: torch.Tensor,
+    q_to: torch.Tensor,
+    limit: int,
+    u_min: int,
+) -> tuple[torch.Tensor, int]:
+    """Plan a deterministic source-wise quota transfer without creating sub-floor fragments.
+
+    Sources are visited by rank id.  A source quota is either moved completely,
+    or enough is left behind to satisfy ``u_min``; a newly non-zero destination
+    quota must also satisfy ``u_min``.
+    """
+    moves = torch.zeros_like(q_from)
+    remaining = int(limit)
+    if remaining <= 0:
+        return moves, 0
+
+    for src in range(q_from.numel()):
+        if remaining <= 0:
+            break
+        src_quota = int(q_from[src].item())
+        dst_quota = int(q_to[src].item())
+        upper = min(src_quota, remaining)
+        if upper <= 0:
+            continue
+
+        move = 0
+        if upper == src_quota and dst_quota + upper >= u_min:
+            move = upper  # emptying the donor is always floor-safe
+        else:
+            partial_cap = min(upper, src_quota - u_min)
+            min_move = 1 if dst_quota > 0 else u_min
+            if partial_cap >= min_move:
+                move = partial_cap
+
+        if move > 0:
+            moves[src] = move
+            remaining -= move
+
+    moved = int(moves.sum().item())
+    return moves, moved
 
 
 def solve(
@@ -156,6 +221,12 @@ def solve(
         topo.validate()
         spec.validate(R)
         loads.validate(R, E)
+        if cfg.u_min > 1:
+            infeasible = (loads.lam > 0) & (loads.lam < cfg.u_min)
+            if torch.any(infeasible):
+                raise ValueError(
+                    "u_min is infeasible: every positive Lambda[r,e] must be >= u_min"
+                )
 
     backend = os.environ.get("EPLB_SOLVER_BACKEND", "auto")
 
@@ -229,18 +300,19 @@ def solve(
                 x[e, chosen] = 1
                 slot_used[chosen] += 1
 
-    # Stage 2: relieve the busiest rank by replicating its top expert inside its own domain
-    q, load = _assign_quota(lam, x, cost, dom)
-    tau = int(load.max().item()) if R > 0 else 0
+    # Stage 2: monotonic incremental relief inside each domain.  The initial
+    # route above is the only full route; every accepted action moves one
+    # expert's existing quotas between two same-domain ranks.
+    q, load = _assign_quota(lam, x, cost, dom, int(cfg.u_min))
+    contrib = q.sum(dim=0).to(torch.int64)  # [E, R]
     stuck = torch.zeros(R, dtype=torch.bool, device=device)
 
     iters = 0
     while iters < cfg.max_stage2_iters:
         iters += 1
-        if int((slot_used < n_slot).sum().item()) == 0:
-            break  # no free slots anywhere (C4 saturated)
 
-        # busiest rank we have not already failed to relieve
+        # Busiest rank not yet proven locally irreducible.  Full slots do not
+        # stop the search: an already-present replica can absorb more quota.
         masked = load.clone()
         masked[stuck] = -1
         max_load = int(masked.max().item())
@@ -250,38 +322,77 @@ def solve(
         r_star = int(bottleneck_ranks.min().item())
         d_star = int(dom[r_star].item())
 
-        # expert contributing the most tokens to r_star, tie by expert id
-        contrib = q[:, :, r_star].sum(dim=0)
-        max_contrib = int(contrib.max().item())
-        if max_contrib == 0:
+        # Search every (expert, target) pair.  Existing replicas are free to
+        # reuse; a new replica is legal only where a slot remains.  floor(gap/2)
+        # prevents a one-token load gap from oscillating between two ranks.
+        best = None
+        for e in range(E):
+            available = int(contrib[e, r_star].item())
+            if available <= 0:
+                continue
+            for target in range(R):
+                if int(dom[target].item()) != d_star:
+                    continue
+                target_load = int(load[target].item())
+                if target_load >= max_load:
+                    continue
+                is_host = int(x[e, target].item()) != 0
+                if not is_host and int(slot_used[target].item()) >= n_slot:
+                    continue
+                desired = min(available, (max_load - target_load) // 2)
+                if desired < cfg.u_min:
+                    continue
+                # Maximise transfer, then prefer the emptier/cheaper target,
+                # lower expert id, and lower rank id.
+                key = (desired, -target_load, -int(cost[r_star, target].item()), -e, -target)
+                if best is None or key > best[0]:
+                    best = (key, e, target, desired)
+
+        if best is None:
             stuck[r_star] = True
+            if bool(torch.all(stuck).item()):
+                break
             continue
-        cand_experts = torch.nonzero(contrib == max_contrib, as_tuple=False).flatten()
-        e_star = int(cand_experts.min().item())
 
-        # target: same domain, free slot, not already hosting e_star; pick max slack
-        hosts = x[e_star] == 1
-        eligible_mask = (slot_used < n_slot) & (~hosts) & (dom == d_star)
-        eligible = torch.nonzero(eligible_mask, as_tuple=False).flatten()
-        if eligible.numel() == 0:
+        _, e_star, target, desired = best
+        moves, delta = _plan_quota_transfer(
+            q[:, e_star, r_star],
+            q[:, e_star, target],
+            desired,
+            int(cfg.u_min),
+        )
+        if delta < cfg.u_min:
+            # A quota fragment may straddle the half-gap.  Moving it whole is
+            # still strictly monotonic as long as the transfer stays below the
+            # full load gap.
+            moves, delta = _plan_quota_transfer(
+                q[:, e_star, r_star],
+                q[:, e_star, target],
+                max_load - int(load[target].item()) - 1,
+                int(cfg.u_min),
+            )
+        if delta < cfg.u_min:
             stuck[r_star] = True
+            if bool(torch.all(stuck).item()):
+                break
             continue
 
-        place_order = _lexsort_keys(load[eligible], cost[r_star, eligible], eligible)
-        target = int(eligible[place_order[0]].item())
-
-        # tentatively add the intra-domain replica and re-route domain-locally
-        x[e_star, target] = 1
-        new_q, new_load = _assign_quota(lam, x, cost, dom)
-        new_tau = int(new_load.max().item())
-        if int(new_load[r_star].item()) < int(load[r_star].item()) and new_tau <= tau:
+        if int(x[e_star, target].item()) == 0:
+            x[e_star, target] = 1
             slot_used[target] += 1
-            q, load, tau = new_q, new_load, new_tau
-            stuck[:] = False  # loads changed; re-evaluate every rank
-        else:
-            x[e_star, target] = 0  # revert; did not relieve r_star
-            stuck[r_star] = True
 
+        q[:, e_star, r_star] -= moves
+        q[:, e_star, target] += moves
+        contrib[e_star, r_star] -= delta
+        contrib[e_star, target] += delta
+        load[r_star] -= delta
+        load[target] += delta
+
+        # Only this destination domain changed; failures in other domains remain
+        # valid and need not be reconsidered.
+        stuck[dom == d_star] = False
+
+    tau = int(load.max().item()) if R > 0 else 0
     return Plan(x=x, q=q, tau=tau)
 
 
@@ -435,7 +546,7 @@ def solve_bisect(
             pool = sum(cell[h].get(e_star, 0) for h in H)
             base_t = torch.tensor(base_vals, dtype=torch.int64, device=device)
             tie_t = torch.zeros(len(H), dtype=torch.int64, device=device)
-            addv = _waterfill(pool, base_t, tie_t).tolist()
+            addv = _waterfill(pool, base_t, tie_t, int(cfg.u_min)).tolist()
             for h, a, b in zip(H, addv, base_vals):
                 load[h] = b + a
                 cell[h][e_star] = a
@@ -447,10 +558,10 @@ def solve_bisect(
     # makespan-bisection descent: each step halves the gap to the even-split lower bound (O(log L) routes)
     lo = (int(lam.sum().item()) + R - 1) // R
     best_x = x_cur.clone()
-    best_q, best_load = _assign_quota(lam, best_x, cost, dom)
+    best_q, best_load = _assign_quota(lam, best_x, cost, dom, int(cfg.u_min))
     best_tau = int(best_load.max().item())
     for _ in range(int(cfg.tau_bisect_iters)):
-        q, load = _assign_quota(lam, x_cur, cost, dom)
+        q, load = _assign_quota(lam, x_cur, cost, dom, int(cfg.u_min))
         tau = int(load.max().item())
         if tau < best_tau:
             best_tau, best_x, best_q = tau, x_cur.clone(), q
