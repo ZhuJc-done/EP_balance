@@ -18,9 +18,10 @@ except Exception:  # triton missing or unimportable -> caller falls back to the 
 if HAS_TRITON:
 
     @triton.jit
-    def _route(lam_ptr, x_ptr, cost_ptr, dom_ptr, order_ptr, q_ptr,
-               R, E, WRITE_Q: tl.constexpr, BLOCK_R: tl.constexpr):
-        """Serial LPT routing over the precomputed (r,e) order; returns load[BLOCK_R], writes q iff WRITE_Q."""
+    def _route(lam_ptr, x_ptr, cost_ptr, dom_ptr, order_ptr, q_ptr, u_ptr,
+               R, E, WRITE_Q: tl.constexpr, U_MIN: tl.constexpr,
+               BLOCK_R: tl.constexpr):
+        """Serial LPT route; optionally commit both source quotas and expert contributions."""
         lane = tl.arange(0, BLOCK_R)
         lane_mask = lane < R
         lane64 = lane.to(tl.int64)
@@ -66,18 +67,55 @@ if HAS_TRITON:
             add = tl.where(first_k, (level_floor - base) + share, zeros)
             add = tl.where(first_k & (pos < extra), add + 1, add)
             add = tl.where(need > 0, add, zeros)
+            if U_MIN > 1:
+                # Reserve a legal floor on the least-loaded prefix, then
+                # water-fill the remainder over that prefix.  If need<U_MIN,
+                # C1 is preserved; such an input has no C5-feasible split.
+                active_count = tl.sum(active.to(tl.int64))
+                floor_k = tl.minimum(active_count, need // U_MIN)
+                floor_active = active & (pos < floor_k)
+                rem = need - floor_k * U_MIN
+                base2 = base + U_MIN
+                s_excl2 = tl.sum(before_i * base2[None, :], axis=1)
+                cond2 = (floor_active & (pos >= 1)
+                         & (base2 * pos - s_excl2 <= rem))
+                k2 = 1 + tl.sum(cond2.to(tl.int64))
+                level2 = tl.sum(tl.where(floor_active & (pos == (k2 - 1)),
+                                         base2, 0))
+                sum2 = tl.sum(tl.where(floor_active & (pos < k2), base2, 0))
+                base_cost2 = level2 * k2 - sum2
+                rem2 = rem - base_cost2
+                share2 = rem2 // k2
+                extra2 = rem2 - share2 * k2
+                first2 = floor_active & (pos < k2)
+                extra_add = tl.where(first2, (level2 - base2) + share2, zeros)
+                extra_add = tl.where(first2 & (pos < extra2), extra_add + 1, extra_add)
+                floor_add = tl.where(floor_active, U_MIN, zeros) + extra_add
+                add = tl.where(need >= U_MIN, floor_add, add)
             if WRITE_Q:
                 tl.store(q_ptr + (r * E + e) * R + lane64, add, mask=lane_mask)
+                old_u = tl.load(u_ptr + e * R + lane64, mask=lane_mask, other=0)
+                tl.store(u_ptr + e * R + lane64, old_u + add, mask=lane_mask)
             load = load + add
         return load
 
     @triton.jit
-    def _solve_kernel(lam_ptr, x_ptr, cost_ptr, dom_ptr, order_ptr, q_ptr,
+    def _safe_move(src_q, dst_q, remaining, u_min):
+        """Largest source-local move within ``remaining`` that preserves the quota floor."""
+        upper = tl.minimum(src_q, remaining)
+        empty_donor = (upper == src_q) & (dst_q + upper >= u_min)
+        partial_cap = tl.minimum(upper, tl.maximum(src_q - u_min, 0))
+        min_partial = tl.where(dst_q > 0, 1, u_min)
+        partial = tl.where(partial_cap >= min_partial, partial_cap, 0)
+        return tl.where((upper > 0) & empty_donor, upper, tl.where(upper > 0, partial, 0))
+
+    @triton.jit
+    def _solve_kernel(lam_ptr, x_ptr, cost_ptr, dom_ptr, order_ptr, q_ptr, u_ptr,
                       cand_e_ptr, cand_d_ptr, cand_valid_ptr, slot_used_ptr,
                       load_out_ptr,
                       R, E, M, EM, n_slot, allow_cd, max_iters,
-                      BLOCK_R: tl.constexpr, BLOCK_E: tl.constexpr):
-        """One program: Stage 1 admission scan + Stage 2 relief loop entirely on-device (no host sync)."""
+                      U_MIN: tl.constexpr, BLOCK_R: tl.constexpr):
+        """One program: Stage 1, one full route, then monotonic incremental Stage 2."""
         BIG = 1 << 62
         lane = tl.arange(0, BLOCK_R)
         lane_mask = lane < R
@@ -105,65 +143,141 @@ if HAS_TRITON:
                 tl.store(x_ptr + e * R + lane64, tl.full([BLOCK_R], 1, tl.int8), mask=sel)
                 slot_used = tl.where(sel, slot_used + 1, slot_used)
 
-        # commit initial routing
-        load = _route(lam_ptr, x_ptr, cost_ptr, dom_ptr, order_ptr, q_ptr, R, E, True, BLOCK_R)
-        tau = tl.max(tl.where(lane_mask, load, -BIG))
+        # The only full route.  It commits Q and U[e,dst] on device.
+        load = _route(lam_ptr, x_ptr, cost_ptr, dom_ptr, order_ptr, q_ptr, u_ptr,
+                      R, E, True, U_MIN, BLOCK_R)
         stuck = lane < 0  # all False
 
-        ce = tl.arange(0, BLOCK_E)
-        ce_mask = ce < E
-        ce_i = ce.to(tl.int64)
         TRUE_VEC = lane >= 0
         FALSE_VEC = lane < 0
+        ZERO = tl.sum(tl.zeros([BLOCK_R], tl.int64))
 
         done = False
         for _it in range(max_iters):
             if not done:
-                has_free_any = tl.sum(tl.where(lane_mask & (slot_used < n_slot), 1, 0)) > 0
                 masked = tl.where(stuck, tl.full([BLOCK_R], -1, tl.int64), load)
                 max_load = tl.max(tl.where(lane_mask, masked, -BIG))
-                if (not has_free_any) or (max_load <= 0):
+                if max_load <= 0:
                     done = True
                 else:
                     r_star = tl.min(tl.where(lane_mask & (masked == max_load), lane_i, BIG))
                     d_star = tl.load(dom_ptr + r_star)
-                    contrib = tl.zeros([BLOCK_E], tl.int64)
-                    for r in range(R):
-                        off = ce_i * R + (r * E * R + r_star)
-                        contrib += tl.load(q_ptr + off, mask=ce_mask, other=0)
-                    max_contrib = tl.max(tl.where(ce_mask, contrib, -BIG))
-                    if max_contrib == 0:
+                    cost_rstar = tl.load(cost_ptr + r_star * R + lane64,
+                                         mask=lane_mask, other=BIG)
+
+                    # Search every (expert, same-domain target).  Loop experts
+                    # serially to avoid materialising an E x R register tensor;
+                    # target ranks are compared in parallel across BLOCK_R.
+                    best_delta = ZERO
+                    best_load = BIG
+                    best_cost = BIG
+                    best_e = BIG
+                    best_t = BIG
+                    for e in range(E):
+                        available = tl.load(u_ptr + e * R + r_star)
+                        hosts = tl.load(x_ptr + e * R + lane64,
+                                        mask=lane_mask, other=0) != 0
+                        legal_slot = hosts | (slot_used < n_slot)
+                        gap = max_load - load
+                        delta = tl.minimum(available, gap // 2)
+                        eligible = (lane_mask
+                                    & (dom_all == d_star)
+                                    & (load < max_load)
+                                    & legal_slot
+                                    & (delta >= U_MIN))
+                        cand_delta = tl.where(eligible, delta, 0)
+                        e_delta = tl.max(cand_delta)
+                        d1 = eligible & (cand_delta == e_delta)
+                        e_load = tl.min(tl.where(d1, load, BIG))
+                        d2 = d1 & (load == e_load)
+                        e_cost = tl.min(tl.where(d2, cost_rstar, BIG))
+                        d3 = d2 & (cost_rstar == e_cost)
+                        e_target = tl.min(tl.where(d3, lane_i, BIG))
+
+                        better = ((e_delta > best_delta)
+                                  | ((e_delta == best_delta) & (e_load < best_load))
+                                  | ((e_delta == best_delta) & (e_load == best_load)
+                                     & (e_cost < best_cost))
+                                  | ((e_delta == best_delta) & (e_load == best_load)
+                                     & (e_cost == best_cost) & (e < best_e))
+                                  | ((e_delta == best_delta) & (e_load == best_load)
+                                     & (e_cost == best_cost) & (e == best_e)
+                                     & (e_target < best_t)))
+                        better = better & (e_delta > 0)
+                        best_delta = tl.where(better, e_delta, best_delta)
+                        best_load = tl.where(better, e_load, best_load)
+                        best_cost = tl.where(better, e_cost, best_cost)
+                        best_e = tl.where(better, e, best_e)
+                        best_t = tl.where(better, e_target, best_t)
+
+                    if best_delta <= 0:
                         stuck = tl.where(lane_i == r_star, TRUE_VEC, stuck)
                     else:
-                        e_star = tl.min(tl.where(ce_mask & (contrib == max_contrib), ce_i, BIG))
-                        x_estar = tl.load(x_ptr + e_star * R + lane64, mask=lane_mask, other=0)
-                        hosts_b = x_estar != 0
-                        elig = lane_mask & (slot_used < n_slot) & (~hosts_b) & (dom_all == d_star)
-                        has_elig = tl.sum(elig.to(tl.int64)) > 0
-                        if not has_elig:
+                        # First pass computes the exact floor-safe transfer.
+                        transfer_limit = best_delta
+                        remaining = transfer_limit
+                        actual = ZERO
+                        for src in range(R):
+                            from_off = (src * E + best_e) * R + r_star
+                            to_off = (src * E + best_e) * R + best_t
+                            src_q = tl.load(q_ptr + from_off)
+                            dst_q = tl.load(q_ptr + to_off)
+                            move = _safe_move(src_q, dst_q, remaining, U_MIN)
+                            remaining -= move
+                            actual += move
+
+                        if actual < U_MIN:
+                            # If a source quota straddles the half-gap, allow a
+                            # whole-fragment move below the full gap.  This may
+                            # reverse the pair's order, but strictly decreases
+                            # its squared-load potential and cannot oscillate.
+                            transfer_limit = max_load - best_load - 1
+                            remaining = transfer_limit
+                            actual = ZERO
+                            for src in range(R):
+                                from_off = (src * E + best_e) * R + r_star
+                                to_off = (src * E + best_e) * R + best_t
+                                src_q = tl.load(q_ptr + from_off)
+                                dst_q = tl.load(q_ptr + to_off)
+                                move = _safe_move(src_q, dst_q, remaining, U_MIN)
+                                remaining -= move
+                                actual += move
+
+                        if actual < U_MIN:
                             stuck = tl.where(lane_i == r_star, TRUE_VEC, stuck)
                         else:
-                            cost_rstar = tl.load(cost_ptr + r_star * R + lane64, mask=lane_mask, other=0)
-                            m1 = tl.min(tl.where(elig, load, BIG))
-                            e1 = elig & (load == m1)
-                            m2 = tl.min(tl.where(e1, cost_rstar, BIG))
-                            e2 = e1 & (cost_rstar == m2)
-                            target = tl.min(tl.where(e2, lane_i, BIG))
-                            sel_t = lane_mask & (lane_i == target)
-                            tl.store(x_ptr + e_star * R + lane64, tl.full([BLOCK_R], 1, tl.int8), mask=sel_t)
-                            new_load = _route(lam_ptr, x_ptr, cost_ptr, dom_ptr, order_ptr, q_ptr, R, E, False, BLOCK_R)
-                            new_tau = tl.max(tl.where(lane_mask, new_load, -BIG))
-                            nl_rstar = tl.sum(tl.where(lane_i == r_star, new_load, 0))
-                            l_rstar = tl.sum(tl.where(lane_i == r_star, load, 0))
-                            accept = (nl_rstar < l_rstar) & (new_tau <= tau)
-                            if accept:
-                                slot_used = tl.where(sel_t, slot_used + 1, slot_used)
-                                load = _route(lam_ptr, x_ptr, cost_ptr, dom_ptr, order_ptr, q_ptr, R, E, True, BLOCK_R)
-                                tau = new_tau
-                                stuck = FALSE_VEC
-                            else:
-                                tl.store(x_ptr + e_star * R + lane64, tl.zeros([BLOCK_R], tl.int8), mask=sel_t)
-                                stuck = tl.where(lane_i == r_star, TRUE_VEC, stuck)
+                            was_host = tl.load(x_ptr + best_e * R + best_t) != 0
+                            is_new = not was_host
+                            tl.store(x_ptr + best_e * R + best_t, 1, mask=is_new)
+                            slot_used = tl.where(
+                                lane_mask & (lane_i == best_t) & is_new,
+                                slot_used + 1,
+                                slot_used,
+                            )
+
+                            # Second pass commits exactly the transfer measured
+                            # above, preserving C1 and the quota floor.
+                            remaining = transfer_limit
+                            for src in range(R):
+                                from_off = (src * E + best_e) * R + r_star
+                                to_off = (src * E + best_e) * R + best_t
+                                src_q = tl.load(q_ptr + from_off)
+                                dst_q = tl.load(q_ptr + to_off)
+                                move = _safe_move(src_q, dst_q, remaining, U_MIN)
+                                tl.store(q_ptr + from_off, src_q - move)
+                                tl.store(q_ptr + to_off, dst_q + move)
+                                remaining -= move
+
+                            from_u = tl.load(u_ptr + best_e * R + r_star)
+                            to_u = tl.load(u_ptr + best_e * R + best_t)
+                            tl.store(u_ptr + best_e * R + r_star, from_u - actual)
+                            tl.store(u_ptr + best_e * R + best_t, to_u + actual)
+                            load = (load
+                                    - tl.where(lane_i == r_star, actual, ZERO)
+                                    + tl.where(lane_i == best_t, actual, ZERO))
+
+                            # Only this destination domain changed.
+                            stuck = tl.where(dom_all == d_star, FALSE_VEC, stuck)
 
         tl.store(load_out_ptr + lane, load, mask=lane_mask)
 
@@ -225,14 +339,15 @@ def solve_fused(loads, topo, spec, cfg) -> Plan:
     cand_valid = valid[cand_order].to(torch.int64).contiguous()
 
     q = torch.zeros((R, E, R), dtype=torch.int64, device=dev)
+    u = torch.zeros((E, R), dtype=torch.int64, device=dev)
     load_out = torch.zeros(R, dtype=torch.int64, device=dev)
     BLOCK_R = triton.next_power_of_2(max(R, 1))
-    BLOCK_E = triton.next_power_of_2(max(E, 1))
     _solve_kernel[(1,)](
-        flat_lam, x, cost, dom, order, q,
+        flat_lam, x, cost, dom, order, q, u,
         cand_e, cand_d, cand_valid, slot_used, load_out,
-        R, E, M, E * M, n_slot, 1 if cfg.allow_cross_domain else 0, cfg.max_stage2_iters,
-        BLOCK_R=BLOCK_R, BLOCK_E=BLOCK_E,
+        R, E, M, E * M, n_slot,
+        1 if cfg.allow_cross_domain else 0, cfg.max_stage2_iters,
+        U_MIN=int(cfg.u_min), BLOCK_R=BLOCK_R,
     )
     # fully sync-free: tau stays a 0-dim device tensor (tau == max committed rank load).
     # the hot dispatch path never reads tau; consumers needing a Python int coerce lazily via int(plan.tau).

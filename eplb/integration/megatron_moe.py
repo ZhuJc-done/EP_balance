@@ -21,7 +21,13 @@ def _env_flag(name: str) -> bool:
 
 
 def _make_adapter():
-    """Select the sync-free transport backend from ``EPLB_ADAPTER`` (``alltoall`` default | ``deepep``)."""
+    """Select the sync-free transport backend from ``EPLB_ADAPTER`` (``alltoall`` default | ``deepep``).
+
+    ``EPLB_DEEPEP_STATIC=1`` forces the DeepEP backend (static ``num_worst_tokens`` recv sizing is then
+    applied inside :func:`sync_free_moe_forward`), regardless of ``EPLB_ADAPTER``.
+    """
+    if _env_flag("EPLB_DEEPEP_STATIC"):
+        return DeepEPAdapter()
     name = os.environ.get("EPLB_ADAPTER", "alltoall").strip().lower()
     if name in ("deepep", "deep_ep"):
         return DeepEPAdapter()
@@ -65,6 +71,7 @@ def _routing_to_units(
     routing_map: torch.Tensor,
     num_tokens: int,
     num_experts: int,
+    topk: int | None = None,
 ):
     """Flatten a router's per-token top-k selection into flat routing units.
 
@@ -73,15 +80,34 @@ def _routing_to_units(
         routing_map: bool/int ``[N, E]`` selection mask.
         num_tokens: ``N`` (for validation).
         num_experts: ``E``.
+        topk: If given (the router's fixed top-k), take the sync-free path where ``U = N*topk``
+            is host-static -- no ``torch.nonzero`` (whose output size would force a D2H). Leave
+            ``None`` for the generic reference path (variable selections per row).
 
     Returns:
-        ``(unit_token_idx [U], unit_expert [U], unit_prob [U])`` in row-major (token, expert) order.
+        ``(unit_token_idx [U], unit_expert [U], unit_prob [U])``. Unit order is irrelevant to
+        the dispatcher (outputs are scattered back by an ``index_add`` over ``unit_token_idx``).
     """
     rmap = routing_map.bool().reshape(num_tokens, num_experts)
-    nz = torch.nonzero(rmap, as_tuple=False)
-    unit_token_idx = nz[:, 0].contiguous().to(torch.int64)
-    unit_expert = nz[:, 1].contiguous().to(torch.int64)
-    unit_prob = probs.reshape(num_tokens, num_experts)[unit_token_idx, unit_expert].contiguous()
+    if topk is None:
+        # generic path: variable #selections per row; nonzero syncs to discover the count
+        nz = torch.nonzero(rmap, as_tuple=False)
+        unit_token_idx = nz[:, 0].contiguous().to(torch.int64)
+        unit_expert = nz[:, 1].contiguous().to(torch.int64)
+        unit_prob = probs.reshape(num_tokens, num_experts)[unit_token_idx, unit_expert].contiguous()
+        return unit_token_idx, unit_expert, unit_prob
+
+    # sync-free fixed-topk path: stable argsort puts the selected columns (key 0) first, in
+    # ascending expert-id order; the first ``topk`` of them are this token's experts.
+    k = int(topk)
+    order = torch.argsort((~rmap).to(torch.int8), dim=1, stable=True)          # [N, E]
+    sel = order[:, :k].contiguous().to(torch.int64)                           # [N, k] expert ids
+    unit_expert = sel.reshape(-1).contiguous()
+    unit_token_idx = (
+        torch.arange(num_tokens, device=rmap.device, dtype=torch.int64)
+        .view(num_tokens, 1).expand(num_tokens, k).reshape(-1).contiguous()
+    )
+    unit_prob = probs.reshape(num_tokens, num_experts).gather(1, sel).reshape(-1).contiguous()
     return unit_token_idx, unit_expert, unit_prob
 
 
@@ -98,7 +124,8 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
     with profiling.record("apply/route", time_it=True, device=tokens.device):
         probs, routing_map = self.router(hidden_states)
         unit_token_idx, unit_expert, unit_prob = _routing_to_units(
-            probs, routing_map, tokens.shape[0], spec.num_experts
+            probs, routing_map, tokens.shape[0], spec.num_experts,
+            topk=getattr(self.config, "moe_router_topk", None),
         )
         local_row = torch.bincount(unit_expert, minlength=spec.num_experts).to(torch.int64)
 
