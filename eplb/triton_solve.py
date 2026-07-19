@@ -297,9 +297,9 @@ def solve_fused(loads, topo, spec, cfg) -> Plan:
     dev = loads.device
     R = topo.num_ranks
     E = spec.num_experts
-    # sync-free upper bound on domain count (domains <= ranks); empty padding domains
-    # yield zero-demand candidates that the C6 gate filters out, so the plan is unchanged.
-    M = R
+    # Constructors such as ``from_nvlink_rdma`` carry the host-side domain count.
+    # Custom CUDA-resident topologies fall back to the sync-free upper bound R.
+    M = topo.sync_free_num_domains
     lam = loads.lam.to(torch.int64)
     dom = topo.domain_of_rank.to(torch.int64).contiguous()
     cost = topo.cost.to(torch.int64).contiguous()

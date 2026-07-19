@@ -234,7 +234,16 @@ def solve(
     if backend == "bisect":
         return solve_bisect(loads, topo, spec, cfg)
 
-    # GPU fast path: run the whole solver in one Triton launch (zero host sync), bit-identical to the reference
+    # Parallel CUDA backend: deterministic and constraint-preserving, but it
+    # intentionally does not preserve the serial LPT solver's bitwise plan.
+    if backend in ("fast", "cuda"):
+        if not (R > 0 and E > 0 and loads.lam.is_cuda):
+            raise RuntimeError("EPLB_SOLVER_BACKEND=fast requires non-empty CUDA inputs")
+        from .cuda_solve import solve_cuda
+
+        return solve_cuda(loads, topo, spec, cfg)
+
+    # Exact GPU path: one Triton launch, zero host sync, and bit-identical to the reference.
     if (
         R > 0
         and E > 0

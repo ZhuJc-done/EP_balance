@@ -13,10 +13,13 @@ class Topology:
 
     domain_of_rank: torch.Tensor  # int64 [R], contiguous domain id 0..M-1
     cost: torch.Tensor  # int64 [R, R] per-token comm cost, c[r,r]=0
+    num_domains_hint: int | None = None  # host-side metadata for sync-free GPU solvers
 
     def __post_init__(self) -> None:
         self.domain_of_rank = self.domain_of_rank.to(torch.int64)
         self.cost = self.cost.to(torch.int64)
+        if self.num_domains_hint is not None and int(self.num_domains_hint) < 0:
+            raise ValueError("num_domains_hint must be non-negative")
 
     @property
     def num_ranks(self) -> int:
@@ -24,9 +27,16 @@ class Topology:
 
     @property
     def num_domains(self) -> int:
+        if self.num_domains_hint is not None:
+            return int(self.num_domains_hint)
         if self.num_ranks == 0:
             return 0
         return int(self.domain_of_rank.max().item()) + 1
+
+    @property
+    def sync_free_num_domains(self) -> int:
+        """Known domain count, or the rank-count upper bound without a device read."""
+        return int(self.num_domains_hint) if self.num_domains_hint is not None else self.num_ranks
 
     @property
     def device(self) -> torch.device:
@@ -48,6 +58,13 @@ class Topology:
         expected = torch.arange(doms.numel(), device=self.device, dtype=torch.int64)
         if not torch.equal(doms, expected):
             raise ValueError("domain ids must be contiguous starting at 0")
+        if (
+            self.num_domains_hint is not None
+            and int(self.num_domains_hint) != int(doms.numel())
+        ):
+            raise ValueError(
+                "num_domains_hint must equal the number of domains in domain_of_rank"
+            )
 
     @staticmethod
     def from_nvlink_rdma(
@@ -78,6 +95,6 @@ class Topology:
             torch.full((R, R), int(inter_cost), dtype=torch.int64, device=device),
         )
         cost.fill_diagonal_(0)
-        topo = Topology(dom, cost)
+        topo = Topology(dom, cost, num_domains_hint=num_nodes)
         topo.validate()
         return topo
