@@ -16,10 +16,19 @@ class EPLBConfig:
     u_min: int = 1  # minimum routing quota granularity (C5)
     allow_cross_domain: bool = True  # if False, Stage 1 is skipped (single-domain runs)
     max_stage2_iters: int = 4096  # safety cap on replicas Stage 2 may add
+    max_fast_stage2_iters: int = 64  # bounded repair budget for the latency backend
     tau_bisect_iters: int = 24  # reserved for an explicit tau-bisection variant
 
     def __post_init__(self) -> None:
-        for name in ("alpha", "beta", "gamma", "eta_milli", "u_min", "max_stage2_iters"):
+        for name in (
+            "alpha",
+            "beta",
+            "gamma",
+            "eta_milli",
+            "u_min",
+            "max_stage2_iters",
+            "max_fast_stage2_iters",
+        ):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"EPLBConfig.{name} must be a positive integer")
 

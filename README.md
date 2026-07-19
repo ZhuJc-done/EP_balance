@@ -78,6 +78,22 @@ python -m sim.run_dist --world-size 8 --experts 64 --skew 1.5
 pytest -q
 ```
 
+## GPU solver backends
+
+```bash
+# Select the CUDA path in an application whose load/topology/spec tensors are on CUDA.
+export EPLB_SOLVER_BACKEND=fast
+
+# CUDA fast path (default benchmark mode)
+python tests/test_gpu_solver.py --nodes 4 --gpus-per-node 8 --experts 640
+
+# Exact Triton comparison
+python tests/test_gpu_solver.py --solver triton --nodes 4 --gpus-per-node 8 --experts 640
+```
+
+The CUDA extension is compiled and cached on first use; JIT build time is
+reported separately and is not part of steady-state solver latency.
+
 Example `run_sim` output (imbalance 8.9× → 2.2×):
 
 ```

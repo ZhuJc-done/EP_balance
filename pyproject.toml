@@ -22,6 +22,9 @@ dev = ["pytest>=7.0"]
 [tool.setuptools.packages.find]
 include = ["eplb*", "baseline*", "sim*"]
 
+[tool.setuptools.package-data]
+eplb = ["csrc/*.cu"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
