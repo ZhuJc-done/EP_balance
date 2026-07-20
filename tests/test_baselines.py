@@ -4,13 +4,19 @@ import pytest
 import torch
 
 from baseline.adapters import (
+    FlexMoECostModel,
     LPLBBaseline,
     LPLBUnavailableError,
+    ShadowCostModel,
     cube8_topology,
     run_deepseek_eplb,
+    run_fastermoe,
+    run_flexmoe,
     run_scale_eplb,
 )
 from baseline.deepseek_eplb import rebalance_experts
+from baseline.fastermoe import select_shadow_experts
+from baseline.flexmoe import flexmoe_schedule
 from eplb import EPLBConfig, ProblemSpec, Topology
 from eplb.loads import Loads
 
@@ -89,6 +95,103 @@ def test_scale_adapter_reports_realized_quota_load():
 
     assert result.metadata["load_kind"] == "realized quota load"
     assert result.rank_load.sum().item() == loads.lam.sum().item()
+
+
+def test_fastermoe_shadows_hot_expert_and_conserves_load():
+    # Expert 0 (home rank 0) is hammered by every rank; the rest are cool.
+    lam = torch.tensor(
+        [
+            [100, 1, 1, 1],
+            [100, 1, 1, 1],
+            [100, 1, 1, 1],
+            [100, 1, 1, 1],
+        ],
+        dtype=torch.int64,
+    )
+    loads = Loads(lam)
+    spec = ProblemSpec(
+        num_experts=4,
+        main_rank=torch.tensor([0, 1, 2, 3]),
+        weight_bytes=torch.tensor([1000, 1000, 1000, 1000]),
+        s_tok=100,
+        n_slot=4,
+    )
+
+    result = run_fastermoe(loads, spec, num_ranks=4)
+
+    baseline_tau = float(lam.sum(dim=0).max().item())  # 400 tokens on rank 0
+    assert result.metadata["shadowed_experts"] >= 1
+    assert result.placement is not None
+    # A shadowed expert is replicated onto every rank.
+    assert bool(result.placement[0].all())
+    # Redistribution strictly lowers the peak and conserves total token work.
+    assert result.tau < baseline_tau
+    assert torch.isclose(result.rank_load.sum(), loads.lam.sum().double())
+
+
+def test_fastermoe_leaves_balanced_load_untouched():
+    loads = Loads(torch.full((4, 4), 10, dtype=torch.int64))
+    spec = ProblemSpec(
+        num_experts=4,
+        main_rank=torch.tensor([0, 1, 2, 3]),
+        weight_bytes=torch.tensor([44_000_000] * 4),
+        s_tok=14336,
+        n_slot=4,
+    )
+
+    shadow_mask, rank_load = select_shadow_experts(
+        loads.lam, spec.main_rank, spec.weight_bytes, spec.s_tok, 4, ShadowCostModel()
+    )
+
+    # Already balanced: broadcasting weights only adds overhead, so shadow nothing.
+    assert int(shadow_mask.sum().item()) == 0
+    assert torch.equal(rank_load, torch.full((4,), 40.0, dtype=torch.float64))
+
+
+def test_flexmoe_replicates_hot_expert_and_conserves_load():
+    # Expert 0 is extremely hot; the other three are cold. R=4, n_slot=2 -> 8 slots.
+    lam = torch.tensor(
+        [
+            [200, 1, 1, 1],
+            [200, 1, 1, 1],
+            [200, 1, 1, 1],
+            [200, 1, 1, 1],
+        ],
+        dtype=torch.int64,
+    )
+    loads = Loads(lam)
+    spec = ProblemSpec(
+        num_experts=4,
+        main_rank=torch.tensor([0, 1, 2, 3]),
+        weight_bytes=torch.tensor([1000, 1000, 1000, 1000]),
+        s_tok=100,
+        n_slot=2,
+    )
+
+    result = run_flexmoe(loads, spec, num_ranks=4, cost=FlexMoECostModel(threshold=1.2))
+
+    baseline_tau = float(lam.sum(dim=0).max().item())  # 800 tokens if not replicated
+    # The hot expert must receive multiple vExperts, cutting the peak load.
+    assert result.metadata["replicas"] > spec.num_experts
+    assert bool(result.placement[0].sum() >= 2)
+    assert result.tau < baseline_tau
+    assert torch.isclose(result.rank_load.sum(), loads.lam.sum().double())
+    assert result.metadata["balance_ratio"] <= 1.2 + 1e-6
+
+
+def test_flexmoe_threshold_controls_replication_effort():
+    lam = torch.tensor([[100, 20, 5, 1]] * 4, dtype=torch.int64)
+    weight_bytes = torch.tensor([1] * 4)
+
+    tight = flexmoe_schedule(lam, weight_bytes, 4, 3, FlexMoECostModel(threshold=1.05))
+    loose = flexmoe_schedule(lam, weight_bytes, 4, 3, FlexMoECostModel(threshold=2.0))
+
+    tight_ratio = tight[1].max().item() / tight[1].mean().item()
+    loose_ratio = loose[1].max().item() / loose[1].mean().item()
+
+    # A tighter threshold spends more vExperts and reaches a flatter distribution.
+    assert sum(tight[0]) >= sum(loose[0])
+    assert tight_ratio <= loose_ratio + 1e-9
 
 
 def test_cube8_topology_matches_lplb_shape_contract():

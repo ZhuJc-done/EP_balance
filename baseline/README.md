@@ -6,6 +6,10 @@ This directory provides a common benchmark harness for:
 - `deepseek-eplb`: the official DeepSeek EPLB placement heuristic, vendored
   from the MIT-licensed reference implementation to avoid the `eplb` package
   name collision.
+- `fastermoe`: FasterMoE's dynamic-shadowing load balancer (PPoPP'22,
+  Algorithm 1), adapted from the reference `_global_policy` prototype.
+- `flexmoe`: FlexMoE's dynamic device-placement load balancer (SIGMOD'23,
+  Algorithms 1-2), a vExpert-based Expand/Shrink greedy.
 - `lplb`: an adapter around the official compiled LPLB `Planner`.
 
 ## Run
@@ -13,14 +17,14 @@ This directory provides a common benchmark harness for:
 ```bash
 cd /home/tiger/EP_balance
 
-# Scale-EPLB + DeepSeek EPLB (works with this repository's dependencies)
-python -m baseline.benchmark --strategies scale,eplb
+# Scale-EPLB + DeepSeek EPLB + FasterMoE + FlexMoE (works with this repository's deps)
+python -m baseline.benchmark --strategies scale,eplb,fastermoe,flexmoe
 
 # Include official LPLB after building its CUDA extension
-python -m baseline.benchmark --strategies scale,eplb,lplb
+python -m baseline.benchmark --strategies scale,eplb,fastermoe,flexmoe,lplb
 
 # Machine-readable output
-python -m baseline.benchmark --strategies scale,eplb --json
+python -m baseline.benchmark --strategies scale,eplb,fastermoe,flexmoe --json
 ```
 
 LPLB must be built separately because it requires CUDA >= 12.6.3,
@@ -66,6 +70,16 @@ The algorithms do not expose identical outputs:
   directly from that quota tensor.
 - DeepSeek EPLB emits placement only; its reported load uses the algorithm's
   ideal equal-split-across-replicas assumption.
+- FasterMoE emits a per-batch set of shadowed (globally replicated) hot experts;
+  its reported load is the token load after each shadowed expert is spread back
+  onto its source ranks. Its shadow decision is dynamic (recomputed every batch)
+  and, like the original, is unconstrained by `--n-slot`, since shadowing is a
+  transient per-iteration weight broadcast rather than a permanent slot placement.
+- FlexMoE replicates hot experts across `--n-slot` vExpert slots per rank until the
+  balance ratio (`max_g load_g / mean_g`) drops under `--flexmoe-threshold`, then
+  packs the vExperts onto ranks; its reported load is the even-split per-vExpert
+  load (Eq. 6). It never changes token routing and deliberately tolerates residual
+  imbalance up to the threshold, so it may use fewer than all available slots.
 - LPLB emits LP split ratios for a fixed redundant topology; its reported load
   is reconstructed from those ratios.
 

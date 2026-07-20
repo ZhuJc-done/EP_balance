@@ -1,16 +1,22 @@
-"""Level B apply-mode backward: re-materialise replica expert weights via async broadcast on a side
-stream, overlapping the re-materialisation with weight-gradient (Wgrad) compute; grads reduce to main(e).
+"""Level B apply-mode backward: re-materialise replica expert weights on a side stream, overlapping the
+re-materialisation with weight-gradient (Wgrad) compute; grads reduce to main(e).
 
 The key fact that makes the overlap valid: ``Wgrad = x^T . grad_y`` needs only saved activations (no
 weight), while ``Dgrad = grad_y . W`` needs the weight. So at backward start we launch the replica
-re-broadcast asynchronously and compute Wgrad while it is in flight, then consume the weight for Dgrad.
-Only the standard gated/plain 2-GEMM expert MLP is supported (the structure ``grouped_mlp`` produces).
+re-materialisation asynchronously and compute Wgrad while it is in flight, then consume the weight for
+Dgrad. Only the standard gated/plain 2-GEMM expert MLP is supported (``grouped_mlp``'s structure).
+
+The transport that actually moves replica weights (materialise) and their grads (reduce-to-main) is
+pluggable via a :class:`ReplicaTransport`: the default :class:`BroadcastReplicaTransport` uses
+``dist.broadcast``/``dist.reduce``; the GIN backend injects a device-initiated get/put transport
+(:class:`~eplb.integration.gin_weights.GinReplicaTransport`). The Wgrad/Dgrad overlap skeleton is
+transport-agnostic, so it is validated once by the broadcast tests and reused by GIN.
 """
 
 from __future__ import annotations
 
 import contextlib
-from typing import Callable, Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -108,68 +114,42 @@ def _activation(meta, h_pre: torch.Tensor) -> torch.Tensor:
     return meta["act"](h_pre)
 
 
-class _OverlappedExperts(torch.autograd.Function):
-    """Batched expert 2-GEMM whose backward re-materialises replica weights (async) and reduces grads to main."""
+class ReplicaTransport(Protocol):
+    """Pluggable replica-weight transport for the overlapped expert backward.
 
-    @staticmethod
-    def forward(ctx, x_pad, meta, *main_w):  # x_pad: [S, cap, H]
-        device, dtype = x_pad.device, x_pad.dtype
-        S = int(meta["n_slot"])
-        main_of = {e: (main_w[2 * i], main_w[2 * i + 1]) for i, e in enumerate(meta["main_experts"])}
-        w1_eff = torch.zeros((S, *meta["w1_eff_shape"]), dtype=dtype, device=device)
-        w2_eff = torch.zeros((S, *meta["w2_eff_shape"]), dtype=dtype, device=device)
+    Three ops, all keyed off the static per-layer ``meta``:
+      * :meth:`fill_main_slots` writes this rank's resident (main-owned) weights into their slots.
+      * :meth:`materialize_replicas` fills the replica slots of the effective-layout weight stacks; it
+        may enqueue its collectives on the side stream ``cs`` so the transfer overlaps the weight-free
+        Wgrad compute.
+      * :meth:`reduce_grads` reduces each replicated expert's per-slot Wgrad (parameter layout) to its
+        ``main(e)`` owner and returns this rank's main-expert grads as ``[g1_e0, g2_e0, g1_e1, ...]``.
+    """
+
+    def fill_main_slots(self, meta, main_of, w1_eff, w2_eff, dtype, device) -> None:
+        ...
+
+    def materialize_replicas(self, meta, main_of, w1_eff, w2_eff, dtype, device, cs) -> None:
+        ...
+
+    def reduce_grads(self, meta, grad_w1_slot, grad_w2_slot, dtype, device) -> List[torch.Tensor]:
+        ...
+
+
+class BroadcastReplicaTransport:
+    """``dist.broadcast`` / ``dist.reduce`` replica transport (the tested default)."""
+
+    def __init__(self, pool: "WeightPool" = _POOL) -> None:
+        self.pool = pool
+
+    def fill_main_slots(self, meta, main_of, w1_eff, w2_eff, dtype, device) -> None:
         _fill_main_slots(meta, main_of, w1_eff, w2_eff)
-        _broadcast_replicas(meta, main_of, w1_eff, w2_eff, dtype, device, _POOL, cs=None)
 
-        h_pre = torch.bmm(x_pad, w1_eff)
-        a = _activation(meta, h_pre)
-        y = torch.bmm(a, w2_eff)
+    def materialize_replicas(self, meta, main_of, w1_eff, w2_eff, dtype, device, cs) -> None:
+        _broadcast_replicas(meta, main_of, w1_eff, w2_eff, dtype, device, self.pool, cs)
 
-        ctx.meta = meta
-        ctx.save_for_backward(x_pad, h_pre, *main_w)
-        return y
-
-    @staticmethod
-    def backward(ctx, grad_y):  # grad_y: [S, cap, H]
-        meta = ctx.meta
-        saved = ctx.saved_tensors
-        x_pad, h_pre = saved[0], saved[1]
-        main_w = saved[2:]
-        device, dtype = x_pad.device, x_pad.dtype
-        S = int(meta["n_slot"])
-        transpose_w = meta["transpose_w"]
-        main_of = {e: (main_w[2 * i], main_w[2 * i + 1]) for i, e in enumerate(meta["main_experts"])}
-        cs = _comm_stream(device)
-
-        # resident (main-owned) weights are available immediately; replicas come via async broadcast
-        w1_eff = torch.zeros((S, *meta["w1_eff_shape"]), dtype=dtype, device=device)
-        w2_eff = torch.zeros((S, *meta["w2_eff_shape"]), dtype=dtype, device=device)
-        _fill_main_slots(meta, main_of, w1_eff, w2_eff)
-        if cs is not None:
-            cs.wait_stream(torch.cuda.current_stream())
-        _broadcast_replicas(meta, main_of, w1_eff, w2_eff, dtype, device, _POOL, cs)
-
-        # --- Wgrad of GEMM-2 needs no weight -> overlaps the in-flight re-materialisation ---
-        a = _activation(meta, h_pre)                                   # [S, cap, F]
-        grad_w2_eff = torch.bmm(a.transpose(1, 2), grad_y)             # [S, F, H]
-
-        if cs is not None:                                             # replica weights are now needed
-            torch.cuda.current_stream().wait_stream(cs)
-
-        # --- Dgrad chain (needs weights) ---
-        grad_a = torch.bmm(grad_y, w2_eff.transpose(1, 2))            # [S, cap, F]
-        with torch.enable_grad():
-            hp = h_pre.detach().requires_grad_(True)
-            a_g = _activation(meta, hp)
-            (grad_h_pre,) = torch.autograd.grad(a_g, hp, grad_a)      # [S, cap, Fout]
-        grad_w1_eff = torch.bmm(x_pad.transpose(1, 2), grad_h_pre)    # [S, H, Fout]
-        grad_x = torch.bmm(grad_h_pre, w1_eff.transpose(1, 2))        # [S, cap, H]
-
-        # back to per-expert parameter layout
-        grad_w1_slot = grad_w1_eff.transpose(1, 2) if transpose_w else grad_w1_eff  # [S, *w1_shape]
-        grad_w2_slot = grad_w2_eff.transpose(1, 2) if transpose_w else grad_w2_eff  # [S, *w2_shape]
-
-        # --- reduce each replicated expert's Wgrad to its main owner (full-group collective) ---
+    def reduce_grads(self, meta, grad_w1_slot, grad_w2_slot, dtype, device) -> List[torch.Tensor]:
+        # reduce each replicated expert's Wgrad to its main owner (full-group collective)
         slot_of: Dict[int, int] = {}
         for s, e in enumerate(meta["slot_to_e"]):
             if e >= 0:
@@ -197,6 +177,72 @@ class _OverlappedExperts(torch.autograd.Function):
                 s = slot_of[e]
                 g1, g2 = grad_w1_slot[s].contiguous(), grad_w2_slot[s].contiguous()
             grads.extend([g1, g2])
+        return grads
+
+
+class _OverlappedExperts(torch.autograd.Function):
+    """Batched expert 2-GEMM whose backward re-materialises replica weights (async) and reduces grads to main."""
+
+    @staticmethod
+    def forward(ctx, x_pad, meta, *main_w):  # x_pad: [S, cap, H]
+        device, dtype = x_pad.device, x_pad.dtype
+        S = int(meta["n_slot"])
+        main_of = {e: (main_w[2 * i], main_w[2 * i + 1]) for i, e in enumerate(meta["main_experts"])}
+        w1_eff = torch.zeros((S, *meta["w1_eff_shape"]), dtype=dtype, device=device)
+        w2_eff = torch.zeros((S, *meta["w2_eff_shape"]), dtype=dtype, device=device)
+        meta["transport"].fill_main_slots(meta, main_of, w1_eff, w2_eff, dtype, device)
+        meta["transport"].materialize_replicas(meta, main_of, w1_eff, w2_eff, dtype, device, cs=None)
+
+        h_pre = torch.bmm(x_pad, w1_eff)
+        a = _activation(meta, h_pre)
+        y = torch.bmm(a, w2_eff)
+
+        ctx.meta = meta
+        ctx.save_for_backward(x_pad, h_pre, *main_w)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_y):  # grad_y: [S, cap, H]
+        meta = ctx.meta
+        saved = ctx.saved_tensors
+        x_pad, h_pre = saved[0], saved[1]
+        main_w = saved[2:]
+        device, dtype = x_pad.device, x_pad.dtype
+        S = int(meta["n_slot"])
+        transpose_w = meta["transpose_w"]
+        main_of = {e: (main_w[2 * i], main_w[2 * i + 1]) for i, e in enumerate(meta["main_experts"])}
+        cs = _comm_stream(device)
+
+        # resident (main-owned) weights are available immediately; replicas re-materialise async on cs
+        w1_eff = torch.zeros((S, *meta["w1_eff_shape"]), dtype=dtype, device=device)
+        w2_eff = torch.zeros((S, *meta["w2_eff_shape"]), dtype=dtype, device=device)
+        meta["transport"].fill_main_slots(meta, main_of, w1_eff, w2_eff, dtype, device)
+        if cs is not None:
+            cs.wait_stream(torch.cuda.current_stream())
+        meta["transport"].materialize_replicas(meta, main_of, w1_eff, w2_eff, dtype, device, cs)
+
+        # --- Wgrad of GEMM-2 needs no weight -> overlaps the in-flight re-materialisation ---
+        a = _activation(meta, h_pre)                                   # [S, cap, F]
+        grad_w2_eff = torch.bmm(a.transpose(1, 2), grad_y)             # [S, F, H]
+
+        if cs is not None:                                             # replica weights are now needed
+            torch.cuda.current_stream().wait_stream(cs)
+
+        # --- Dgrad chain (needs weights) ---
+        grad_a = torch.bmm(grad_y, w2_eff.transpose(1, 2))            # [S, cap, F]
+        with torch.enable_grad():
+            hp = h_pre.detach().requires_grad_(True)
+            a_g = _activation(meta, hp)
+            (grad_h_pre,) = torch.autograd.grad(a_g, hp, grad_a)      # [S, cap, Fout]
+        grad_w1_eff = torch.bmm(x_pad.transpose(1, 2), grad_h_pre)    # [S, H, Fout]
+        grad_x = torch.bmm(grad_h_pre, w1_eff.transpose(1, 2))        # [S, cap, H]
+
+        # back to per-expert parameter layout
+        grad_w1_slot = grad_w1_eff.transpose(1, 2) if transpose_w else grad_w1_eff  # [S, *w1_shape]
+        grad_w2_slot = grad_w2_eff.transpose(1, 2) if transpose_w else grad_w2_eff  # [S, *w2_shape]
+
+        # reduce each replicated expert's Wgrad to its main owner (transport-specific)
+        grads = meta["transport"].reduce_grads(meta, grad_w1_slot, grad_w2_slot, dtype, device)
 
         return (grad_x, None, *grads)
 
@@ -219,6 +265,7 @@ def overlapped_grouped_expert_mlp(
     n_slot: int,
     group=None,
     pool: WeightPool = _POOL,
+    transport: "Optional[ReplicaTransport]" = None,
 ) -> torch.Tensor:
     """Grouped expert MLP whose backward re-materialises replica weights with comm/Wgrad overlap.
 
@@ -239,12 +286,14 @@ def overlapped_grouped_expert_mlp(
         n_slot: number of local physical slots.
         group: EP process group.
         pool: scratch buffer pool reused across layers.
+        transport: replica-weight transport (defaults to :class:`BroadcastReplicaTransport`).
 
     Returns:
         float ``[T, H]`` expert outputs in the original ``recv_tokens`` order.
     """
     T, H = recv_tokens.shape
     device = recv_tokens.device
+    transport = transport or BroadcastReplicaTransport(pool)
 
     order = torch.argsort(recv_slot, stable=True)
     slot_sorted = recv_slot[order]
@@ -259,11 +308,19 @@ def overlapped_grouped_expert_mlp(
 
     w1_shape = tuple(weight_shapes[0])
     w2_shape = tuple(weight_shapes[1])
+    # slot_to_e/main_rank host lists + root_global drive the broadcast transport's host-side main-slot
+    # fill and dist.broadcast/reduce (a per-slot/per-expert D2H). The GIN transport fills main slots and
+    # schedules entirely on device, so these host copies are skipped there -> the GIN path is 0 D2H.
+    is_broadcast = isinstance(transport, BroadcastReplicaTransport)
+    root_global = (
+        {int(e): global_rank(group, int(main_rank[int(e)].item())) for e in replicated}
+        if is_broadcast else {}
+    )
     meta = {
-        "slot_to_e": [int(v) for v in slot_to_e.tolist()],
-        "main_rank": [int(v) for v in main_rank.tolist()],
+        "slot_to_e": [int(v) for v in slot_to_e.tolist()] if is_broadcast else None,
+        "main_rank": [int(v) for v in main_rank.tolist()] if is_broadcast else None,
         "replicated": [int(v) for v in replicated],
-        "root_global": {int(e): global_rank(group, int(main_rank[int(e)].item())) for e in replicated},
+        "root_global": root_global,
         "main_experts": sorted(int(e) for e in weights_local.keys()),
         "w1_shape": w1_shape,
         "w2_shape": w2_shape,
@@ -276,6 +333,7 @@ def overlapped_grouped_expert_mlp(
         "n_slot": int(n_slot),
         "group": group,
         "pool": pool,
+        "transport": transport,
     }
     main_w: List[torch.Tensor] = []
     for e in meta["main_experts"]:

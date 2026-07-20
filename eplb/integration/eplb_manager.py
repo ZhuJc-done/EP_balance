@@ -22,7 +22,7 @@ from torch.utils.checkpoint import checkpoint
 from ..plan import Plan
 from ..problem import ProblemSpec
 from .comm import all_to_all_single, broadcast_from_main
-from .gin_weights import GinWeightReplicator, gin_enabled
+from .gin_weights import GinReplicaTransport, GinWeightReplicator, gin_enabled
 from .grouped_mlp import grouped_expert_mlp
 from .overlap import _comm_stream, overlapped_grouped_expert_mlp
 from .physical import assign_physical
@@ -622,8 +622,10 @@ def sync_free_moe_forward(
         adapter: Transport backend (defaults to :class:`AllToAllAdapter`).
         rematerialize: If True, free replica weights after forward and re-broadcast them in
             backward (weight recompute) instead of holding them across fwd->bwd.
-        overlap: If True, use the Level-B custom backward that re-broadcasts replica weights on a
+        overlap: If True, use the Level-B custom backward that re-materialises replica weights on a
             side stream overlapped with Wgrad (implies re-materialisation; needs ``gated``/``act``).
+            The transport is ``dist.broadcast``/``reduce`` by default, or device-initiated GIN
+            ``get``/``put`` when ``EPLB_WEIGHT_COMM=gin`` (no replica clone held across forward).
         gated: Whether GEMM-1 is gated (only used when ``overlap``).
         act: Activation function (only used when ``overlap``).
         transpose_w: True if weights are ``[out, in]`` (Megatron) and used as ``x @ W.t()`` (overlap only).
@@ -641,9 +643,10 @@ def sync_free_moe_forward(
     # Control plane for the replica broadcasts. `dist.broadcast` needs a host-side `src`, so the set of
     # replicated experts and their (static) main ranks are read to host in ONE consolidated D2H here --
     # ~E ints, not per-slot/per-token. Everything else on this path stays on device. The GIN weight
-    # backend drives its own device-side schedule instead, so this D2H is skipped there.
+    # backend drives its own device-side schedule instead (for both the plain and overlap paths), so
+    # this D2H is skipped whenever GIN is selected.
     replicated, replicated_main = [], []
-    if overlap or not gin_enabled():
+    if not gin_enabled():
         rep_e = (plan.num_replicas() > 1).nonzero(as_tuple=False).flatten()   # ascending expert ids
         rep_pairs = torch.stack([rep_e, spec.main_rank.index_select(0, rep_e)]).tolist()
         replicated, replicated_main = (rep_pairs[0], rep_pairs[1]) if rep_pairs else ([], [])
@@ -718,11 +721,17 @@ def sync_free_moe_forward(
 
     # --- STAGE 4: COMPUTE (replicate weights + batched expert MLP) ---------------------------
     if overlap:  # Level B: async re-materialisation overlapped with Wgrad, grads reduce to main
+        # GIN backend: re-pull replica weights device-side in backward (get_batched) instead of
+        # re-broadcasting; forward holds no replica clone (rematerialise). Broadcast path: transport=None.
+        transport = None
+        if gin_enabled():
+            replicator = _get_gin_replicator(group, spec, weight_shapes, dtype, device)
+            transport = GinReplicaTransport(replicator, plan.x)
         out_units_recv = overlapped_grouped_expert_mlp(
             recv_tokens, recv_slot, group_sizes, weights_local, slot_to_e,
             spec.main_rank, replicated, weight_shapes, cap,
             gated=gated, act=act, transpose_w=transpose_w,
-            my_rank=my_rank, n_slot=n_slot, group=group,
+            my_rank=my_rank, n_slot=n_slot, group=group, transport=transport,
         )
     elif gin_enabled():  # device-initiated replication over NCCL GIN (no dist.broadcast / host weight bytes)
         replicator = _get_gin_replicator(group, spec, weight_shapes, dtype, device)

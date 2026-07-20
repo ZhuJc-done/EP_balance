@@ -1,7 +1,7 @@
-"""Benchmark Scale-EPLB against DeepSeek EPLB and optional compiled LPLB.
+"""Benchmark Scale-EPLB against DeepSeek EPLB, FasterMoE, FlexMoE, and optional LPLB.
 
 Run from the repository root:
-    python -m baseline.benchmark --strategies scale,eplb,lplb
+    python -m baseline.benchmark --strategies scale,eplb,fastermoe,flexmoe,lplb
 """
 
 from __future__ import annotations
@@ -18,12 +18,18 @@ from eplb import EPLBConfig, ProblemSpec, Topology, solve
 from sim.workload import make_loads
 
 from .adapters import (
+    FlexMoECostModel,
     LPLBBaseline,
     LPLBUnavailableError,
+    ShadowCostModel,
     run_deepseek_eplb,
+    run_fastermoe,
+    run_flexmoe,
     run_scale_eplb,
 )
 from .deepseek_eplb import rebalance_experts
+from .fastermoe import select_shadow_experts
+from .flexmoe import flexmoe_schedule
 
 
 def _time_cpu(fn: Callable[[], Any], warmup: int, iterations: int) -> float:
@@ -74,7 +80,7 @@ def _row(name: str, result, **timings: float | None) -> dict[str, Any]:
 
 def benchmark(args: argparse.Namespace) -> list[dict[str, Any]]:
     strategies = {x.strip().lower() for x in args.strategies.split(",") if x.strip()}
-    unknown = strategies - {"scale", "eplb", "lplb"}
+    unknown = strategies - {"scale", "eplb", "fastermoe", "flexmoe", "lplb"}
     if unknown:
         raise ValueError(f"unknown strategies: {sorted(unknown)}")
 
@@ -180,6 +186,61 @@ def benchmark(args: argparse.Namespace) -> list[dict[str, Any]]:
             )
         )
 
+    if "fastermoe" in strategies:
+        fm_cost = ShadowCostModel(
+            bw_net=args.fastermoe_bw_net,
+            bw_mm=args.fastermoe_bw_mm,
+        )
+
+        def fastermoe_selection():
+            # Include the GPU->CPU transfer of the load matrix when the input is CUDA.
+            return select_shadow_experts(
+                loads.lam, spec.main_rank, spec.weight_bytes, spec.s_tok, ranks, fm_cost
+            )
+
+        selection_ms = (
+            _time_mixed_cuda(fastermoe_selection, args.warmup, args.iterations)
+            if device.type == "cuda"
+            else _time_cpu(fastermoe_selection, args.warmup, args.iterations)
+        )
+        result = run_fastermoe(loads, spec, num_ranks=ranks, cost=fm_cost)
+        rows.append(
+            _row(
+                "fastermoe",
+                result,
+                solve_ms=selection_ms,
+                placement_ms=None,
+                routing_ms=None,
+                total_ms=selection_ms,
+            )
+        )
+
+    if "flexmoe" in strategies:
+        fm_cost = FlexMoECostModel(threshold=args.flexmoe_threshold)
+
+        def flexmoe_scheduling():
+            # Include the GPU->CPU transfer of the load matrix when the input is CUDA.
+            return flexmoe_schedule(
+                loads.lam, spec.weight_bytes, ranks, args.n_slot, fm_cost
+            )
+
+        schedule_ms = (
+            _time_mixed_cuda(flexmoe_scheduling, args.warmup, args.iterations)
+            if device.type == "cuda"
+            else _time_cpu(flexmoe_scheduling, args.warmup, args.iterations)
+        )
+        result = run_flexmoe(loads, spec, num_ranks=ranks, cost=fm_cost)
+        rows.append(
+            _row(
+                "flexmoe",
+                result,
+                solve_ms=schedule_ms,
+                placement_ms=None,
+                routing_ms=None,
+                total_ms=schedule_ms,
+            )
+        )
+
     if "lplb" in strategies:
         try:
             planner = LPLBBaseline(
@@ -231,7 +292,7 @@ def benchmark(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--strategies", default="scale,eplb,lplb")
+    parser.add_argument("--strategies", default="scale,eplb,fastermoe,flexmoe,lplb")
     parser.add_argument("--nodes", type=int, default=4)
     parser.add_argument("--gpus-per-node", type=int, default=8)
     parser.add_argument("--experts", type=int, default=64)
@@ -253,6 +314,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mapping-iterations", type=int, default=3)
     parser.add_argument("--lplb-root", default="/home/tiger/LPLB")
     parser.add_argument("--require-lplb", action="store_true")
+    parser.add_argument("--fastermoe-bw-net", type=float, default=50e9 / 8)
+    parser.add_argument("--fastermoe-bw-mm", type=float, default=11.5e12)
+    parser.add_argument("--flexmoe-threshold", type=float, default=1.2)
     parser.add_argument("--json", action="store_true")
     return parser.parse_args()
 

@@ -66,7 +66,7 @@ def _ground_truth(unit_expert, unit_prob, tokens, base_w1, base_w2):
     return torch.stack(results), gt_w1, gt_w2
 
 
-def _worker(rank, port):
+def _worker(rank, port, overlap=False):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["EPLB_WEIGHT_COMM"] = "gin"
@@ -93,6 +93,9 @@ def _worker(rank, port):
         plan=plan, spec=spec, weights_local=weights_local,
         weight_shapes=[(H, F), (F, H)], batched_mlp_fn=_batched_mlp, cap=W * T,
         adapter=AllToAllAdapter(),
+        # overlap=True routes through GinReplicaTransport: no replica clone held; backward re-pulls
+        # weights via get_batched on a side stream (rematerialise) and reduces grads with put_batched.
+        overlap=overlap, gated=False, act=torch.relu, transpose_w=False,
     )
     result.sum().backward()
 
@@ -127,7 +130,17 @@ def _gin_available() -> bool:
 @pytest.mark.skipif(not _gin_available(),
                     reason="needs RUN_GIN_TESTS=1, >=2 GPUs with GIN-capable NCCL, and nccl_gin built")
 def test_gin_weights_compute_invariant():
-    mp.spawn(_worker, args=(6031,), nprocs=W, join=True)
+    mp.spawn(_worker, args=(6031, False), nprocs=W, join=True)
+
+
+@pytest.mark.skipif(not _gin_available(),
+                    reason="needs RUN_GIN_TESTS=1, >=2 GPUs with GIN-capable NCCL, and nccl_gin built")
+def test_gin_weights_overlap_rematerialize_compute_invariant():
+    """GIN rematerialise/overlap path (GinReplicaTransport): backward re-pulls weights, no held clone.
+
+    Same compute-invariance bar as the hold path -- outputs and main(e) grads must match the
+    single-device ground truth. Cluster-only (real GIN get/put + side-stream re-pull)."""
+    mp.spawn(_worker, args=(6032, True), nprocs=W, join=True)
 
 
 def test_replica_schedule_device_math():
