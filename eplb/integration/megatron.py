@@ -65,6 +65,10 @@ class MegatronEPLBHook:
         mode: str = "observe",
         ep_group=None,
         logger=None,
+        *,
+        trace_out: str | None = None,
+        trace_max: int = 0,
+        trace_every: int = 25,
     ) -> None:
         if mode not in ("observe", "apply"):
             raise ValueError("mode must be 'observe' or 'apply'")
@@ -73,6 +77,19 @@ class MegatronEPLBHook:
         self.ep_group = ep_group
         self.logger = logger
         self.last_plan = None
+
+        # Optional: persist the real gathered Lambda[R,E] per (layer, mb) so the
+        # baseline harness can replay this exact routing through every strategy.
+        self.trace_out = trace_out
+        self.trace_max = int(trace_max)
+        self.trace_every = max(1, int(trace_every))
+        self._trace_samples: list[dict] = []
+        self._trace_dirty = 0
+        if self.trace_out is not None:
+            self._trace_meta = self._build_trace_meta()
+            import atexit
+
+            atexit.register(self.flush_trace)
 
     def step(self, local_counts: torch.Tensor, layer_id: int, micro_batch_id: int):
         """Run one rebalance for ``(layer, mb)`` from this rank's expert counts.
@@ -89,6 +106,7 @@ class MegatronEPLBHook:
         self.last_plan = res.plan
         if self.logger is not None:
             self._log(res.plan, layer_id, micro_batch_id)
+        self._maybe_dump(layer_id, micro_batch_id)
         return res.plan
 
     def backward(self, layer_id: int, micro_batch_id: int):
@@ -105,6 +123,57 @@ class MegatronEPLBHook:
             f"replicas={m.total_replicas} phi_token={m.phi_token}{extra}"
         )
         profiling.maybe_summary(self.logger)
+
+    # -- trace capture (Phase B -> baseline replay) -----------------------------
+    def _build_trace_meta(self) -> dict:
+        """Self-describing header so the replay rebuilds an identical Topology/ProblemSpec."""
+        spec, topo = self.reb.spec, self.reb.topo
+        return {
+            "num_ranks": topo.num_ranks,
+            "num_experts": int(spec.num_experts),
+            "s_tok": int(spec.s_tok),
+            "n_slot": int(spec.n_slot),
+            "num_domains": topo.num_domains,
+            "main_rank": spec.main_rank.detach().cpu().clone(),
+            "weight_bytes": spec.weight_bytes.detach().cpu().clone(),
+            "domain_of_rank": topo.domain_of_rank.detach().cpu().clone(),
+            "cost": topo.cost.detach().cpu().clone(),
+        }
+
+    def _maybe_dump(self, layer_id: int, micro_batch_id: int) -> None:
+        """Append the gathered ``Lambda[R,E]`` for this (layer, mb) and periodically flush."""
+        if self.trace_out is None:
+            return
+        if self.trace_max and len(self._trace_samples) >= self.trace_max:
+            return
+        lam = self.reb._lambda_ring.get((int(layer_id), int(micro_batch_id)))
+        if lam is None:
+            return
+        self._trace_samples.append(
+            {
+                "layer": int(layer_id),
+                "mb": int(micro_batch_id),
+                "lam": lam.detach().to("cpu", torch.int64).clone(),
+            }
+        )
+        self._trace_dirty += 1
+        if self._trace_dirty >= self.trace_every:
+            self.flush_trace()
+
+    def flush_trace(self) -> None:
+        """Atomically write the accumulated trace to ``trace_out`` (safe to call repeatedly)."""
+        if self.trace_out is None or not self._trace_samples:
+            return
+        import os
+        import tempfile
+
+        out_dir = os.path.dirname(self.trace_out) or "."
+        os.makedirs(out_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=out_dir, suffix=".tmp")
+        os.close(fd)
+        torch.save({"meta": self._trace_meta, "samples": self._trace_samples}, tmp)
+        os.replace(tmp, self.trace_out)  # atomic on POSIX
+        self._trace_dirty = 0
 
 
 def _extract_routing_map(output, num_experts: int) -> torch.Tensor:
@@ -179,6 +248,9 @@ def setup_eplb_observer(
     logger=print,
     micro_batch_id_fn=None,
     router_class_name: str = "TopKRouter",
+    trace_out: str | None = None,
+    trace_max: int = 0,
+    trace_every: int = 25,
 ):
     """One-call Phase B setup (call once after model build): read Megatron's EP state, build the rebalancer, attach observers.
 
@@ -195,6 +267,11 @@ def setup_eplb_observer(
         logger: Callable for per-layer metric lines (e.g. ``print``); ``None`` to silence.
         micro_batch_id_fn: Optional ``() -> int`` for the current micro-batch id.
         router_class_name: Router module class name to match.
+        trace_out: If set, persist the gathered ``Lambda[R,E]`` per (layer, mb) to this
+            path so ``baseline.benchmark --trace`` can replay the real routing through
+            every baseline. Pass a non-``None`` value only on the rank that should write.
+        trace_max: Cap on the number of captured samples (0 = unbounded).
+        trace_every: Flush the trace to disk every this many captured samples.
 
     Returns:
         ``(hook, handles)`` -- the :class:`MegatronEPLBHook` and its forward-hook handles.
@@ -215,6 +292,7 @@ def setup_eplb_observer(
     hook = MegatronEPLBHook(
         EPLBRebalancer(topo, spec, cfg or EPLBConfig()),
         mode="observe", ep_group=ep_group, logger=logger,
+        trace_out=trace_out, trace_max=trace_max, trace_every=trace_every,
     )
     handles = attach_router_observers(model, hook, num_experts, micro_batch_id_fn, router_class_name)
     return hook, handles

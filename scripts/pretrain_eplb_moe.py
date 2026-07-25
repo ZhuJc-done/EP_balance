@@ -61,11 +61,18 @@ def model_provider(
     p = _eplb_params(args)
     if mode == "observe":
         rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        # Optional: dump the real routing trace (rank 0 only) for offline baseline replay.
+        trace_out = os.environ.get("EPLB_TRACE_OUT") if rank0 else None
         hook, handles = setup_eplb_observer(
             model, num_experts=p["num_experts"], weight_bytes_each=p["weight_bytes_each"],
             s_tok=p["s_tok"], n_slot=p["n_slot"], gpus_per_node=p["gpus_per_node"],
             logger=(print if rank0 else None),
+            trace_out=trace_out,
+            trace_max=int(os.environ.get("EPLB_TRACE_MAX") or 0),
+            trace_every=int(os.environ.get("EPLB_TRACE_EVERY") or 25),
         )
+        if trace_out:
+            print(f"[run_real_moe] dumping routing trace to {trace_out}")
         _KEEPALIVE.append((hook, handles))
     elif mode == "apply":
         ep_group = mpu.get_expert_model_parallel_group()

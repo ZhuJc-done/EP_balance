@@ -78,17 +78,14 @@ python -m sim.run_dist --world-size 8 --experts 64 --skew 1.5
 pytest -q
 ```
 
-## GPU solver backends
+## GPU solver
 
 ```bash
-# Select the CUDA path in an application whose load/topology/spec tensors are on CUDA.
-export EPLB_SOLVER_BACKEND=fast
-
-# CUDA fast path (default benchmark mode)
+# Benchmark the CUDA solver (defaults to 32 nodes x 8 GPUs, 640 experts)
 python tests/test_gpu_solver.py --nodes 4 --gpus-per-node 8 --experts 640
 
-# Exact Triton comparison
-python tests/test_gpu_solver.py --solver triton --nodes 4 --gpus-per-node 8 --experts 640
+# Force the CUDA backend explicitly (raises if the inputs are not on CUDA)
+export EPLB_SOLVER_BACKEND=cuda
 ```
 
 The CUDA extension is compiled and cached on first use; JIT build time is

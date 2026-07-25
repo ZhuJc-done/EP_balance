@@ -45,6 +45,28 @@ Expected per-forward log on rank 0:
 placement; with `--mock-data` (near-uniform routing) it stays close to 1.0 — use a
 real checkpoint (`convert_hf_to_mcore.sh`) to see meaningful skew.
 
+### Capture a routing trace for the baseline comparison
+
+Set `EPLB_TRACE_OUT` in observe mode to dump the real gathered `Lambda[R, E]`
+per (layer, micro-batch); rank 0 writes a self-describing file (topology, `main(e)`
+placement, weight bytes, `s_tok`, `n_slot`). Replay it through **every** load
+balancer (Scale-EPLB, DeepSeek EPLB, FasterMoE, FlexMoE, LPLB) offline:
+
+```bash
+# capture during a real (or MOCK=1) observe run
+EPLB_MODE=observe EPLB_TRACE_OUT=logs/trace.pt \
+MEGATRON_DIR=/path/to/Megatron-LM EPLB_DIR=/path/to/EP_balance \
+  bash scripts/run_real_moe.sh
+
+# score all baselines on the captured routing (no need to re-pass topology args)
+python -m baseline.benchmark --trace logs/trace.pt \
+  --strategies scale,eplb,fastermoe,flexmoe,lplb
+```
+
+Optional: `EPLB_TRACE_MAX` caps the number of captured samples (0 = all),
+`EPLB_TRACE_EVERY` sets the disk-flush cadence. See `baseline/README.md` for how
+each strategy's reported quality is defined.
+
 ## Phase C — apply (end-to-end training)
 
 ```bash

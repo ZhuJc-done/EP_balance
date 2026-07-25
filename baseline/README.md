@@ -40,6 +40,39 @@ The default comparison uses 32 EP ranks, 64 logical experts and four physical
 slots per rank. This gives two original and two redundant experts per rank,
 which is compatible with LPLB's 8-rank/two-edge cube topology.
 
+## Replay a real routing trace
+
+Instead of the synthetic Zipf workload, every baseline can be scored on the
+*real* per-(layer, micro-batch) routing captured during Megatron training. Run
+observe mode (Phase B) with `EPLB_TRACE_OUT` set to dump the gathered
+`Lambda[R, E]` matrices, then replay that file through the harness:
+
+```bash
+# 1) capture the real trace during training (rank 0 writes the file)
+cd /home/tiger/EP_balance
+EPLB_MODE=observe EPLB_TRACE_OUT=logs/trace.pt \
+MEGATRON_DIR=/home/tiger/Megatron-LM \
+  bash scripts/run_real_moe.sh          # add MODEL/CHECKPOINT/... as usual
+
+# 2) score every baseline on the captured routing
+python -m baseline.benchmark --trace logs/trace.pt \
+  --strategies scale,eplb,fastermoe,flexmoe,lplb
+```
+
+The trace is self-describing: it records the topology, `main(e)` placement,
+per-expert weight bytes, `s_tok` and `n_slot` used during the run, so the replay
+rebuilds an identical `Topology`/`ProblemSpec` automatically — you do **not**
+re-pass `--nodes`, `--experts`, `--n-slot`, etc. Extra knobs:
+
+- `--trace-max-samples N` — replay only the first `N` samples.
+- `EPLB_TRACE_MAX` / `EPLB_TRACE_EVERY` (capture side) — cap the number of
+  captured samples and set the disk-flush cadence.
+
+In `--trace` mode each strategy replans per sample from **that** sample's load
+(so DeepSeek/LPLB use the current batch as their own placement history), and the
+CLI prints per-strategy `solve_ms(mean)`, `tau(mean)`, and `imbalance(mean/p90)`
+aggregated over all replayed samples. The same `quality=` caveats below apply.
+
 ## Interpreting timings
 
 The CLI deliberately does not print a single shared `latency` column because

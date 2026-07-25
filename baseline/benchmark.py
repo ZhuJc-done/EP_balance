@@ -1,7 +1,11 @@
 """Benchmark Scale-EPLB against DeepSeek EPLB, FasterMoE, FlexMoE, and optional LPLB.
 
-Run from the repository root:
+Run from the repository root on a synthetic workload:
     python -m baseline.benchmark --strategies scale,eplb,fastermoe,flexmoe,lplb
+
+Or replay a real routing trace captured during observe-mode training
+(``EPLB_TRACE_OUT=trace.pt EPLB_MODE=observe bash scripts/run_real_moe.sh``):
+    python -m baseline.benchmark --trace trace.pt --strategies scale,eplb,fastermoe,flexmoe,lplb
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from typing import Any
 import torch
 
 from eplb import EPLBConfig, ProblemSpec, Topology, solve
+from eplb.loads import Loads
 from sim.workload import make_loads
 
 from .adapters import (
@@ -290,9 +295,186 @@ def benchmark(args: argparse.Namespace) -> list[dict[str, Any]]:
     return rows
 
 
+# --- real-trace replay --------------------------------------------------------
+def _load_trace(
+    path: str, device: torch.device
+) -> tuple[dict[str, Any], list[dict[str, Any]], Topology, ProblemSpec]:
+    """Load a routing trace dumped by observe mode and rebuild its Topology/ProblemSpec."""
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    meta, samples = blob["meta"], blob["samples"]
+    topo = Topology(
+        meta["domain_of_rank"].to(device),
+        meta["cost"].to(device),
+        num_domains_hint=int(meta["num_domains"]),
+    )
+    spec = ProblemSpec(
+        int(meta["num_experts"]),
+        meta["main_rank"].to(device),
+        meta["weight_bytes"].to(device),
+        int(meta["s_tok"]),
+        int(meta["n_slot"]),
+    )
+    topo.validate()
+    spec.validate(topo.num_ranks)
+    return meta, samples, topo, spec
+
+
+def _safe_num_groups(num_experts: int, num_nodes: int, requested: int) -> int:
+    """Pick a DeepSeek group count that satisfies its divisibility constraints for this trace."""
+    if requested and num_experts % requested == 0 and requested % num_nodes == 0:
+        return requested
+    if num_nodes >= 1 and num_experts % num_nodes == 0:
+        return num_nodes
+    return 1
+
+
+def _run_timed(fn: Callable[[], Any], device: torch.device) -> tuple[Any, float]:
+    """Run ``fn`` once, returning its result and wall time in ms (CUDA-synced)."""
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    out = fn()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    return out, (time.perf_counter() - start) * 1_000
+
+
+def _agg(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {"mean": 0.0, "p50": 0.0, "p90": 0.0}
+    ordered = sorted(values)
+    n = len(ordered)
+
+    def q(p: float) -> float:
+        return ordered[min(n - 1, max(0, round(p * (n - 1))))]
+
+    return {"mean": sum(values) / n, "p50": q(0.5), "p90": q(0.9)}
+
+
+def benchmark_trace(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Replay a real routing trace through every selected baseline and aggregate quality/latency.
+
+    Each sample's own ``Lambda`` is fed to every strategy (i.e. every baseline replans
+    per micro-batch from that batch's load), so the reported numbers are apples-to-apples
+    load-balance quality on the real routing distribution.
+    """
+    strategies = {x.strip().lower() for x in args.strategies.split(",") if x.strip()}
+    unknown = strategies - {"scale", "eplb", "fastermoe", "flexmoe", "lplb"}
+    if unknown:
+        raise ValueError(f"unknown strategies: {sorted(unknown)}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    meta, samples, topo, spec = _load_trace(args.trace, device)
+    ranks, experts, n_slot = topo.num_ranks, spec.num_experts, spec.n_slot
+    num_nodes = topo.num_domains
+    if args.trace_max_samples:
+        samples = samples[: args.trace_max_samples]
+    if not samples:
+        raise ValueError(f"trace {args.trace!r} contains no samples")
+
+    cfg = EPLBConfig()
+    fm_cost = ShadowCostModel(bw_net=args.fastermoe_bw_net, bw_mm=args.fastermoe_bw_mm)
+    flex_cost = FlexMoECostModel(threshold=args.flexmoe_threshold)
+    num_groups = _safe_num_groups(experts, num_nodes, args.num_groups)
+
+    lplb_planner = None
+    lplb_skip: str | None = None
+    if "lplb" in strategies:
+        try:
+            lplb_planner = LPLBBaseline(
+                num_experts=experts, ep_size=ranks, n_slot=n_slot, lplb_root=args.lplb_root
+            )
+        except (LPLBUnavailableError, ValueError) as exc:
+            if args.require_lplb:
+                raise
+            lplb_skip = str(exc)
+
+    acc: dict[str, dict[str, Any]] = {}
+
+    def record(key: str, result, ms: float) -> None:
+        bucket = acc.setdefault(key, {"tau": [], "imb": [], "ms": [], "name": key, "meta": {}})
+        bucket["tau"].append(result.tau)
+        bucket["imb"].append(result.imbalance)
+        bucket["ms"].append(ms)
+        bucket["name"] = result.name
+        bucket["meta"] = result.metadata
+
+    for sample in samples:
+        loads = Loads(sample["lam"].to(device))
+        if "scale" in strategies:
+            res, ms = _run_timed(lambda ld=loads: run_scale_eplb(ld, topo, spec, cfg), device)
+            record("scale", res, ms)
+        if "eplb" in strategies:
+            res, ms = _run_timed(
+                lambda ld=loads: run_deepseek_eplb(
+                    ld,
+                    num_nodes=num_nodes,
+                    num_gpus=ranks,
+                    n_slot=n_slot,
+                    num_groups=num_groups,
+                    placement_loads=ld,
+                ),
+                device,
+            )
+            record("eplb", res, ms)
+        if "fastermoe" in strategies:
+            res, ms = _run_timed(
+                lambda ld=loads: run_fastermoe(ld, spec, num_ranks=ranks, cost=fm_cost), device
+            )
+            record("fastermoe", res, ms)
+        if "flexmoe" in strategies:
+            res, ms = _run_timed(
+                lambda ld=loads: run_flexmoe(ld, spec, num_ranks=ranks, cost=flex_cost), device
+            )
+            record("flexmoe", res, ms)
+        if "lplb" in strategies and lplb_planner is not None:
+            workload = loads.expert_load().to(device="cuda", dtype=torch.int32)
+
+            def solve_lplb(wl=workload, planner=lplb_planner) -> Any:
+                planner.update_mapping(wl)
+                return planner.solve(wl)
+
+            res, ms = _run_timed(solve_lplb, device)
+            record("lplb", res, ms)
+
+    rows: list[dict[str, Any]] = []
+    for key in ("scale", "eplb", "fastermoe", "flexmoe", "lplb"):
+        if key not in strategies:
+            continue
+        if key == "lplb" and lplb_planner is None:
+            rows.append({"strategy": "lplb", "skipped": lplb_skip})
+            continue
+        bucket = acc[key]
+        tau, imb, ms = _agg(bucket["tau"]), _agg(bucket["imb"]), _agg(bucket["ms"])
+        rows.append(
+            {
+                "strategy": bucket["name"],
+                "samples": len(bucket["tau"]),
+                "solve_ms_mean": ms["mean"],
+                "quality_tau_mean": tau["mean"],
+                "quality_imbalance_mean": imb["mean"],
+                "quality_imbalance_p90": imb["p90"],
+                "load_kind": bucket["meta"].get("load_kind", ""),
+            }
+        )
+    return rows
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--strategies", default="scale,eplb,fastermoe,flexmoe,lplb")
+    parser.add_argument(
+        "--trace",
+        default=None,
+        help="Replay a real routing trace (dumped by EPLB_TRACE_OUT in observe mode) "
+        "through every strategy instead of a synthetic workload.",
+    )
+    parser.add_argument(
+        "--trace-max-samples",
+        type=int,
+        default=0,
+        help="Cap the number of trace (layer, micro-batch) samples replayed (0 = all).",
+    )
     parser.add_argument("--nodes", type=int, default=4)
     parser.add_argument("--gpus-per-node", type=int, default=8)
     parser.add_argument("--experts", type=int, default=64)
@@ -321,8 +503,33 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _print_trace_rows(rows: list[dict[str, Any]]) -> None:
+    non_skipped = [r for r in rows if "skipped" not in r]
+    samples = non_skipped[0]["samples"] if non_skipped else 0
+    print(f"replaying {samples} trace sample(s) through {len(rows)} strategy(ies):")
+    for row in rows:
+        if "skipped" in row:
+            print(f"{row['strategy']:<16} skipped: {row['skipped']}")
+            continue
+        print(
+            f"{row['strategy']:<16} solve_ms(mean)={row['solve_ms_mean']:.3f}, "
+            f"tau(mean)={row['quality_tau_mean']:.1f}, "
+            f"imbalance(mean)={row['quality_imbalance_mean']:.4f}, "
+            f"imbalance(p90)={row['quality_imbalance_p90']:.4f}, "
+            f"quality={row['load_kind']}"
+        )
+
+
 def main() -> None:
     args = _parse_args()
+    if args.trace:
+        rows = benchmark_trace(args)
+        if args.json:
+            print(json.dumps(rows, indent=2))
+            return
+        _print_trace_rows(rows)
+        return
+
     rows = benchmark(args)
     if args.json:
         print(json.dumps(rows, indent=2))

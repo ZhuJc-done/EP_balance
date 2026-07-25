@@ -47,6 +47,16 @@ EPLB_MODE="${EPLB_MODE:-observe}"           # off (pure Megatron) | observe (Pha
 export EPLB_MODE GPUS_PER_NODE
 export PYTHONPATH="${MEGATRON_DIR}:${EPLB_DIR}:${PYTHONPATH:-}"
 
+# --- optional routing-trace capture (observe mode) ---------------------------
+# EPLB_TRACE_OUT=<path> makes rank 0 dump the real gathered Lambda[R,E] per
+# (layer, micro-batch); EPLB_TRACE_MAX caps sample count (0=all), EPLB_TRACE_EVERY
+# is the flush cadence. Replay it through every load balancer with:
+#   python -m baseline.benchmark --trace <path> --strategies scale,eplb,fastermoe,flexmoe,lplb
+if [[ -n "${EPLB_TRACE_OUT:-}" ]]; then
+  export EPLB_TRACE_OUT EPLB_TRACE_MAX EPLB_TRACE_EVERY
+  echo "[run_real_moe] EPLB_TRACE_OUT=${EPLB_TRACE_OUT} (routing trace -> baseline replay)"
+fi
+
 # --- per-model architecture args (must match the checkpoint config) -----------
 if [[ "${MODEL}" == "mixtral8x7b" ]]; then
   MODEL_ARGS=(
