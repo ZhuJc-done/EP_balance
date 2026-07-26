@@ -69,26 +69,33 @@ for _knob in EPLB_N_SLOT EPLB_PROFILE EPLB_PROFILE_ALL_RANKS EPLB_PROFILE_EVERY 
 done
 if [[ -n "${EPLB_N_SLOT:-}" ]]; then echo "[run_real_moe] EPLB_N_SLOT=${EPLB_N_SLOT} (slot budget override)"; fi
 
-# PROFILE_TRACE=1 -> Megatron's native PyTorch profiler writes a chrome/perfetto trace to
-# ${PROFILE_DIR}/../torch_profile/rank-<N>.json.gz. The eplb/* record_function labels (solve,
-# all_gather_lambda, apply/dispatch, apply/expert_compute, apply/combine, apply/weight_move) appear
-# inline, so the trace resolves where EP time actually goes. Start past step ~5: the first iterations
-# pay CUDA-solver JIT and cuBLAS autotuning and are not representative.
+# PROFILE_TRACE=1 -> Megatron's native PyTorch profiler writes a chrome/perfetto trace per profiled
+# rank. The eplb/* record_function labels (solve, all_gather_lambda, apply/route, apply/dispatch,
+# apply/expert_compute, apply/combine, apply/weight_move) appear inline, so the trace resolves where
+# EP time actually goes. Start past step ~5: the first iterations pay CUDA-solver JIT and cuBLAS
+# autotuning and are not representative.
+#
+# PROFILE_DIR is one output dir per run, holding tb/ and torch_profile/. Megatron derives the trace
+# path as `<tensorboard-dir>/../torch_profile`, so tb/ is nested one level down to keep the trace
+# inside PROFILE_DIR -- otherwise every run resolves to the same logs/torch_profile and each
+# overwrites the previous rank-<N>.json.gz. Set PROFILE_DIR per run when comparing modes or sweeps.
 PROFILE_ARGS=()
 if [[ "${PROFILE_TRACE:-0}" == "1" ]]; then
+  PROFILE_RUN_DIR="${PROFILE_DIR:-${EPLB_DIR}/logs/prof_${EPLB_MODE}}"
   PROFILE_ARGS=(
     --profile
     --use-pytorch-profiler
     --profile-step-start "${PROFILE_STEP_START:-8}"
     --profile-step-end "${PROFILE_STEP_END:-10}"
     --profile-ranks ${PROFILE_RANKS:-0}                   # unquoted on purpose: PROFILE_RANKS="0 8" must word-split into nargs
-    --tensorboard-dir "${PROFILE_DIR:-${EPLB_DIR}/logs/tb_${EPLB_MODE}}"
+    --tensorboard-dir "${PROFILE_RUN_DIR}/tb"
   )
   # CPU/Python call stacks; off by default because with_stack inflates the trace and slows the
   # profiled steps enough to distort the step time read off the same run.
   [[ "${PROFILE_STACK:-0}" == "1" ]] && PROFILE_ARGS+=(--pytorch-profiler-collect-callstack)
   [[ "${PROFILE_SHAPES:-0}" == "1" ]] && PROFILE_ARGS+=(--pytorch-profiler-collect-shapes)
   echo "[run_real_moe] PROFILE_TRACE=1 -> steps ${PROFILE_STEP_START:-8}..${PROFILE_STEP_END:-10}, ranks ${PROFILE_RANKS:-0}"
+  echo "[run_real_moe] trace -> ${PROFILE_RUN_DIR}/torch_profile/rank-<N>.json.gz"
 fi
 
 # --- per-model architecture args (must match the checkpoint config) -----------

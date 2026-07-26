@@ -119,13 +119,20 @@ against the real CPU and CUDA rows:
 ```bash
 PROFILE_TRACE=1 PROFILE_STEP_START=8 PROFILE_STEP_END=10 \
 EPLB_MODE=apply ... bash scripts/run_real_moe.sh
-# -> <PROFILE_DIR>/../torch_profile/rank-<N>.json.gz   (default PROFILE_DIR=logs/tb_<mode>)
+# -> <PROFILE_DIR>/torch_profile/rank-<N>.json.gz   (default PROFILE_DIR=logs/prof_<mode>)
 ```
 
 Open the `.json.gz` directly at [ui.perfetto.dev](https://ui.perfetto.dev) (gzipped Chrome
 traces are handled natively) and search for `eplb/`. Knobs: `PROFILE_RANKS="0 8"` (space
-separated, default rank 0), `PROFILE_STACK=1` for Python/CPU call stacks, `PROFILE_SHAPES=1`
-for tensor shapes.
+separated, default rank 0 only — on a multi-node run pick one rank per node), `PROFILE_STACK=1`
+for Python/CPU call stacks, `PROFILE_SHAPES=1` for tensor shapes. The launcher echoes the
+resolved trace path. **Set `PROFILE_DIR` per run** when comparing modes or sweeping: the file is
+named only by rank, so two runs sharing a `PROFILE_DIR` overwrite each other.
+
+Only the `apply` trace shows the EP path Scale-EPLB replaces (`apply/dispatch`,
+`apply/expert_compute`, `apply/combine`, `apply/weight_move`). An `observe` trace has just
+`eplb/solve` and `eplb/all_gather_lambda` laid over Megatron's own dispatcher, which is the
+right picture for costing the solver but not for the end-to-end breakdown.
 
 Keep the window short (2–3 steps) and start it past step ~5: the first iterations pay CUDA-solver
 JIT and cuBLAS autotuning, and `PROFILE_STACK=1` inflates the trace enough to distort the step
