@@ -21,10 +21,9 @@ Run MoE on real Megatron-LM with Scale-EPLB, in two stages selected by `EPLB_MOD
 | `run_real_moe.sh` | Real-model launcher (Qwen3-30B-A3B / Mixtral); `REAL=1` from `run_gb200_4x4.sh` forwards here. `MOCK=1` = mock-data + random init, `DEEPEP=1` = native DeepEP dispatch. |
 | `install_megatron.sh` | Clone+install pinned community Megatron-LM, self-check `import megatron`. |
 | `install_deepep.sh` | Optional: clone+build DeepEP (NCCL Gin backend) for the sync-free transport. |
-| `install_te.sh` | Optional: install Transformer Engine for the fast TE + grouped-GEMM path. |
 | `convert_hf_to_mcore.sh` | Optional: convert a HF MoE checkpoint to mcore for realistic skew. |
 
-> **Install** (clone + `install_megatron.sh` / `install_deepep.sh` / `install_te.sh` + `pip install -e`)
+> **Install** (clone + `install_megatron.sh` / `install_deepep.sh` + `pip install -e`)
 > lives in the [top-level README](../README.md#cluster-install-megatron-integration). This file is the
 > **run book**: launchers, run recipes, toggles, and troubleshooting.
 
@@ -44,6 +43,77 @@ Expected per-forward log on rank 0:
 `imbalance` is the would-be makespan ratio under the EPLB plan vs. the current
 placement; with `--mock-data` (near-uniform routing) it stays close to 1.0 — use a
 real checkpoint (`convert_hf_to_mcore.sh`) to see meaningful skew.
+
+### Capture a routing trace for the baseline comparison
+
+Set `EPLB_TRACE_OUT` in observe mode to dump the real gathered `Lambda[R, E]`
+per (layer, micro-batch); rank 0 writes a self-describing file (topology, `main(e)`
+placement, weight bytes, `s_tok`, `n_slot`). Replay it through **every** load
+balancer (Scale-EPLB, DeepSeek EPLB, FasterMoE, FlexMoE, LPLB) offline:
+
+```bash
+# capture during a real (or MOCK=1) observe run
+EPLB_MODE=observe EPLB_TRACE_OUT=logs/trace.pt \
+MEGATRON_DIR=/path/to/Megatron-LM EPLB_DIR=/path/to/EP_balance \
+  bash scripts/run_real_moe.sh
+
+# score all baselines on the captured routing (no need to re-pass topology args)
+python -m baseline.benchmark --trace logs/trace.pt \
+  --strategies scale,eplb,fastermoe,flexmoe,lplb
+```
+
+Optional: `EPLB_TRACE_MAX` caps the number of captured samples (0 = all),
+`EPLB_TRACE_EVERY` sets the disk-flush cadence. See `baseline/README.md` for how
+each strategy's reported quality is defined.
+
+## Measuring: latency breakdown, straggler, and the N_slot sweep
+
+`EPLB_PROFILE=1` emits a periodic per-region summary. CUDA events are **queued** and
+resolved in one batch, so timing injects no per-region host sync — an instrumented run
+and an undisturbed end-to-end step time can come from the same job.
+
+| Region | Covers |
+|---|---|
+| `solve` | the placement + quota solver (CUDA kernel) |
+| `all_gather_lambda` | the single `Lambda[R,E]` all-gather |
+| `apply/route` | router, plus flattening top-k selections into routing units |
+| `apply/dispatch` | Stage 2 token all-to-all |
+| `apply/expert_compute` | Stage 4 replica materialisation + batched expert MLP |
+| `apply/combine` | Stage 5 output all-to-all |
+| `apply/weight_move` | replica weight broadcast / GIN pull (nested inside expert compute) |
+
+A synchronous EP step is paced by its slowest rank, so straggler analysis needs
+**every** rank to report, not just rank 0:
+
+```bash
+EPLB_MODE=apply EPLB_PROFILE=1 EPLB_PROFILE_ALL_RANKS=1 EPLB_PROFILE_RESET_AT=1 \
+  bash scripts/run_real_moe.sh
+# every line is tagged [EPLB-profile r<RANK>] -> compare max vs mean across ranks
+grep 'apply/expert_compute' logs/real_*.log
+```
+
+`N_slot` budget sweep (balance gain vs replica memory and weight-move bandwidth):
+
+```bash
+for NS in 16 20 24 32 48; do
+  EPLB_MODE=apply EPLB_N_SLOT=$NS EPLB_PROFILE=1 EPLB_PROFILE_RESET_AT=1 \
+    LOG_FILE=logs/nslot_${NS}.log bash scripts/run_real_moe.sh
+done
+grep 'peak memory' logs/nslot_*.log
+```
+
+`EPLB_N_SLOT` must be at least the mains each rank hosts (`num_experts / EP`), otherwise
+the launcher fails fast with an explicit error. Under Level A (`EPLB_REMATERIALIZE=1`)
+the `apply/weight_move` count includes the backward recompute — that doubling is exactly
+what re-materialisation trades for memory.
+
+`off` / `observe` / `apply` all run `--transformer-impl local` (SequentialMLP, fusions off),
+so a step-time delta between them comes from the EP part:
+
+```bash
+EPLB_MODE=off   ... bash scripts/run_real_moe.sh   # baseline
+EPLB_MODE=apply ... bash scripts/run_real_moe.sh   # Scale-EPLB
+```
 
 ## Phase C — apply (end-to-end training)
 
@@ -100,18 +170,16 @@ NNODES=2 NODE_RANK=0 MASTER_ADDR=<NODE0_IP> MASTER_PORT=34567 GPUS_PER_NODE=4 \
 
 Toggles: `DEEPEP=1` (native DeepEP dispatch, off/observe only), `EPLB_MODE=observe|apply`
 (attach EPLB), drop `MOCK=1` + add `CHECKPOINT`/`DATA_PATH`/`TOKENIZER_MODEL` for real
-training. Without `install_te.sh`, experts run the slower `local` path — raise
-`GLOBAL_BATCH_SIZE`/`SEQ_LEN` only after installing TE for the fast grouped-GEMM path.
+training. Experts always run the unfused `local` path, so absolute step times are higher
+than a production run — raise `GLOBAL_BATCH_SIZE`/`SEQ_LEN` with that in mind.
 
 ## Notes
 
-- **Do not pass `--moe-grouped-gemm`** in apply mode: the v1 binding supports
-  `SequentialMLP` (clean per-expert weights); `GroupedMLP` fused weights are not yet
-  sliced. Math is identical, just without the fused grouped GEMM kernel.
+- **Do not pass `--moe-grouped-gemm`**: the v1 binding supports `SequentialMLP` (clean
+  per-expert weights); `GroupedMLP` fused weights are not yet sliced. Math is identical,
+  just without the fused grouped GEMM kernel.
 - Tune via env: `GPUS_PER_NODE`, `EP_SIZE`, `NUM_EXPERTS` (divisible by `EP_SIZE`),
   `TOPK`, `TRAIN_ITERS`. `EPLB_MODE=off` runs plain Megatron.
-- `--transformer-impl local` avoids a hard Transformer-Engine dependency; switch to
-  `transformer_engine` if your Megatron build requires it for MoE.
 - Expert bias is ignored in the apply path (v1); peak-performance DeepEP fusion is
   a later step.
 ```

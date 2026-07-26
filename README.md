@@ -37,8 +37,8 @@ and validated on:
 | Megatron-Core / Megatron-LM | 0.19.0 (`main`, commit `0ff7226f6`) |
 | NCCL / cuDNN | 2.28.9 / 9.22 |
 
-Megatron-LM, DeepEP and Transformer Engine are **external dependencies** (not vendored):
-install them with the helper scripts below, which pin versions and self-check the import.
+Megatron-LM and DeepEP are **external dependencies** (not vendored): install them with the
+helper scripts below, which pin versions and self-check the import.
 
 ### Cluster install (Megatron integration)
 
@@ -50,16 +50,13 @@ cd /home/tiger/EP_balance
 # 2) external deps (each pins a commit / self-checks the import)
 bash scripts/install_megatron.sh     # required: community Megatron-LM -> $MEGATRON_DIR
 bash scripts/install_deepep.sh       # optional: DeepEP transport (NCCL Gin backend)
-bash scripts/install_te.sh           # optional: Transformer Engine (TE + grouped-GEMM fast path)
 
 # 3) make `eplb` importable
 pip install -e /home/tiger/EP_balance
 ```
 
-`install_deepep.sh` / `install_te.sh` are optional: the launchers run without them
-(`AllToAllAdapter` for dispatch, `--transformer-impl local` for experts). Install
-**DeepEP** for high-performance all-to-all transport, and **Transformer Engine** for
-fused kernels + grouped-GEMM.
+`install_deepep.sh` is optional — the launchers fall back to `AllToAllAdapter` (torch
+`all_to_all_single`); install **DeepEP** for high-performance all-to-all transport.
 Run recipes (single-node, multi-node 2×4 / 4×4, observe/apply, baselines) are in
 [`scripts/README.md`](scripts/README.md).
 
@@ -78,17 +75,14 @@ python -m sim.run_dist --world-size 8 --experts 64 --skew 1.5
 pytest -q
 ```
 
-## GPU solver backends
+## GPU solver
 
 ```bash
-# Select the CUDA path in an application whose load/topology/spec tensors are on CUDA.
-export EPLB_SOLVER_BACKEND=fast
-
-# CUDA fast path (default benchmark mode)
+# Benchmark the CUDA solver (defaults to 32 nodes x 8 GPUs, 640 experts)
 python tests/test_gpu_solver.py --nodes 4 --gpus-per-node 8 --experts 640
 
-# Exact Triton comparison
-python tests/test_gpu_solver.py --solver triton --nodes 4 --gpus-per-node 8 --experts 640
+# Force the CUDA backend explicitly (raises if the inputs are not on CUDA)
+export EPLB_SOLVER_BACKEND=cuda
 ```
 
 The CUDA extension is compiled and cached on first use; JIT build time is

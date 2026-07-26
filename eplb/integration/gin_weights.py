@@ -12,10 +12,19 @@ Two ordering fences per direction remain (homes-visible-before-get, reads-done-b
 backward puts-landed-before-sum). They default to ``dist.barrier`` (host-launched); set
 ``EPLB_GIN_FENCE=signal`` for the device-stream ``ncclSignal``/``ncclWaitSignal`` fence that is CUDA-graph
 capturable (cluster-validate the signal-counter epochs before relying on it in capture).
+
+Two consumption strategies share these primitives:
+  * ``GinWeightReplicator.materialize`` (**hold**): forward pulls the per-slot weight stack once; the
+    downstream GEMM's autograd saves it, so backward reuses the held copy (no re-pull, more memory).
+  * :class:`GinReplicaTransport` (**rematerialise**, plugged into ``overlap.overlapped_grouped_expert_mlp``):
+    forward holds no replica clone; backward re-pulls replica weights on a side stream (``get_batched``),
+    overlapping the pull with the weight-free Wgrad, then consumes them for Dgrad. Trades bandwidth for
+    memory. Grad reduction to ``main(e)`` uses ``put_batched`` + a local sum, same as the hold path.
 """
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 from typing import Dict, List, Sequence, Tuple
@@ -265,3 +274,110 @@ class _GinReplicate(torch.autograd.Function):
                 stacked = seg.view(repl.dtype).reshape(world, *repl.weight_shapes[j])
                 grads.append(stacked.sum(dim=0))
         return (None, None, None, None, *grads)
+
+
+class GinReplicaTransport:
+    """GIN ``get``/``put`` replica transport for :func:`overlap.overlapped_grouped_expert_mlp`.
+
+    This is the *rematerialise* strategy for the GIN backend: expert weights are **not** cloned/held
+    across forward; instead the overlapped Function re-pulls replica weights in its backward on a side
+    stream and consumes them for Dgrad (weight-free Wgrad overlaps the pull). This trades a second
+    ``get_batched`` (bandwidth) for not holding an [n_layers x replica-W] set of clones (memory).
+
+    A transport instance is bound to one micro-batch's plan (``plan_x``): forward and backward share the
+    same device schedule, so the get (materialise) and put (reduce) are guaranteed consistent. Both ops
+    fill/consume the effective-layout stacks the overlap skeleton owns; only replica (non-main) slots are
+    touched here -- main-owned slots are filled locally by ``overlap._fill_main_slots`` and their grads
+    stay local.
+
+    Note (perf, cluster-validate): the get is enqueued on the side stream ``cs`` for overlap, but the
+    ordering fence defaults to a host ``dist.barrier`` which is not stream-ordered; set
+    ``EPLB_GIN_FENCE=signal`` for a device-stream fence so the pull truly overlaps Wgrad.
+    """
+
+    def __init__(self, replicator: GinWeightReplicator, plan_x: torch.Tensor) -> None:
+        self.r = replicator
+        slot_to_e, main_of_slot = replicator.slot_tables(plan_x)
+        peers, ls, is_local = _replica_schedule(
+            slot_to_e, main_of_slot, replicator.local_slot_dev, replicator.my_rank
+        )
+        self.peers, self.ls, self.is_local = peers, ls, is_local
+        self.is_remote = peers >= 0
+        self.col = ls * replicator.world + replicator.my_rank  # scratch column of each slot's put
+
+    @staticmethod
+    def _sctx(cs):
+        return torch.cuda.stream(cs) if cs is not None else contextlib.nullcontext()
+
+    def fill_main_slots(self, meta, main_of, w1_eff, w2_eff, dtype, device) -> None:
+        # No host-side fill: GIN gathers local (main==my_rank) slots from the just-published home
+        # buffer inside `materialize_replicas`, using the device schedule (is_local/ls). This is what
+        # lets the GIN overlap path skip the slot_to_e/main_rank .tolist() D2H entirely (0 D2H).
+        return
+
+    def materialize_replicas(self, meta, main_of, w1_eff, w2_eff, dtype, device, cs) -> None:
+        r = self.r
+        J, wb, nb = r.J, r.wb, r.n_slot
+        w_eff = (w1_eff, w2_eff)
+        main_expert_ids = meta["main_experts"]
+        arange = r.slot_arange
+        with self._sctx(cs):
+            # publish this rank's resident (main-owned) weights into the symmetric home buffers
+            # (static host loop over the few experts this rank owns -- data-independent, no D2H)
+            for e in main_expert_ids:
+                base = r.local_slot_of_e[e]
+                for j in range(J):
+                    r._copy_into(r.home[j], base * wb[j], main_of[e][j])
+            r.fence(0)  # homes globally visible before any get
+
+            for j in range(J):
+                remote_off = self.ls * wb[j]
+                local_off = arange * wb[j]
+                nbytes = torch.full((nb,), wb[j], dtype=torch.int64, device=device)
+                # replica slots only: peers<0 (empty / main==me) skipped on device
+                r._gin.get_batched(
+                    r.home[j], r.slot[j], remote_off, local_off, nbytes, self.peers,
+                    blocks_per_desc=r.grid,
+                )
+                # remote slots: pulled bytes -> effective-layout stack (transpose for Megatron)
+                slot_param = r.slot[j].view(dtype).reshape(nb, *r.weight_shapes[j])
+                eff = slot_param.transpose(1, 2) if meta["transpose_w"] else slot_param
+                w_eff[j][self.is_remote] = eff[self.is_remote]
+                # local slots: device gather from the just-published home (no host loop, no D2H)
+                if r.home_cap > 0:
+                    home_param = r.home[j].view(dtype).reshape(r.home_cap, *r.weight_shapes[j])
+                    home_eff = home_param.transpose(1, 2) if meta["transpose_w"] else home_param
+                    w_eff[j][self.is_local] = home_eff[self.ls[self.is_local]]
+            r.fence(1)  # peers finished reading my home before it is recycled
+
+    def reduce_grads(self, meta, grad_w1_slot, grad_w2_slot, dtype, device) -> List[torch.Tensor]:
+        r = self.r
+        J, wb, nb, world = r.J, r.wb, r.n_slot, r.world
+        grad_slot = (grad_w1_slot, grad_w2_slot)
+        arange = r.slot_arange
+        for j in range(J):
+            r.scratch[j].zero_()
+            g_bytes = grad_slot[j].detach().contiguous().view(torch.uint8).reshape(nb, wb[j])
+            r.slot[j].view(nb, wb[j]).copy_(g_bytes)
+            src_off = arange * wb[j]
+            dst_off = self.col * wb[j]
+            nbytes = torch.full((nb,), wb[j], dtype=torch.int64, device=device)
+            # replica slots: GIN put grad -> main(e)'s scratch column (peers<0 skipped on device)
+            r._gin.put_batched(
+                r.slot[j], r.scratch[j], src_off, dst_off, nbytes, self.peers,
+                blocks_per_desc=r.grid,
+            )
+            # local slots: on-device copy grad -> my own scratch column
+            scratch_view = r.scratch[j].view(r.home_cap * world, wb[j]) if r.home_cap > 0 \
+                else r.scratch[j].view(0, wb[j])
+            scratch_view[self.col[self.is_local]] = g_bytes[self.is_local]
+        r.fence(2)  # all remote grad puts landed before local sum
+
+        grads: List[torch.Tensor] = []
+        for e in meta["main_experts"]:
+            base = r.local_slot_of_e[e]
+            for j in range(J):
+                seg = r.scratch[j].narrow(0, base * world * wb[j], world * wb[j])
+                stacked = seg.view(dtype).reshape(world, *r.weight_shapes[j])
+                grads.append(stacked.sum(dim=0))
+        return grads

@@ -14,6 +14,7 @@ from megatron.training import get_args, pretrain
 
 from eplb import EPLBConfig, Topology
 from eplb.integration import EPLBRebalancer, bind_eplb_to_moe_layer, find_moe_layers
+from eplb.integration import profiling
 from eplb.integration.megatron import build_spec_for_megatron, setup_eplb_observer
 
 _KEEPALIVE = []  # keep hooks / rebalancers alive for the process lifetime
@@ -27,6 +28,26 @@ def _expert_param_bytes(args) -> int:
     return int(num_params * dtype_bytes)
 
 
+def _n_slot(args, ep: int) -> int:
+    """Per-rank physical slot budget ``N_slot`` (default 2x mains-per-rank; ``EPLB_N_SLOT`` overrides).
+
+    Every slot beyond the mains this rank must host can carry one extra expert replica, so this is the
+    knob that trades balance quality against replica memory and weight-move bandwidth. Sweep it with
+    ``EPLB_N_SLOT`` and read the memory cost off the ``peak memory`` line of the EPLB profile summary.
+    """
+    mains_per_rank = args.num_experts // ep
+    override = os.environ.get("EPLB_N_SLOT")
+    if not override:
+        return max(2, 2 * mains_per_rank)
+    n_slot = int(override)
+    if n_slot < mains_per_rank:
+        raise ValueError(
+            f"EPLB_N_SLOT={n_slot} is below the {mains_per_rank} main experts each rank must host "
+            f"(num_experts={args.num_experts}, EP={ep})"
+        )
+    return n_slot
+
+
 def _eplb_params(args):
     """Common (num_experts, ep, weight_bytes, s_tok, n_slot, gpus_per_node) for the solver."""
     dtype_bytes = 2 if (getattr(args, "bf16", False) or getattr(args, "fp16", False)) else 4
@@ -36,7 +57,7 @@ def _eplb_params(args):
         ep=ep,
         weight_bytes_each=_expert_param_bytes(args),
         s_tok=args.hidden_size * dtype_bytes,
-        n_slot=max(2, 2 * (args.num_experts // ep)),
+        n_slot=_n_slot(args, ep),
         gpus_per_node=int(os.environ.get("GPUS_PER_NODE", "8")),
     )
 
@@ -61,11 +82,18 @@ def model_provider(
     p = _eplb_params(args)
     if mode == "observe":
         rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        # Optional: dump the real routing trace (rank 0 only) for offline baseline replay.
+        trace_out = os.environ.get("EPLB_TRACE_OUT") if rank0 else None
         hook, handles = setup_eplb_observer(
             model, num_experts=p["num_experts"], weight_bytes_each=p["weight_bytes_each"],
             s_tok=p["s_tok"], n_slot=p["n_slot"], gpus_per_node=p["gpus_per_node"],
-            logger=(print if rank0 else None),
+            logger=(print if (rank0 or profiling.all_ranks()) else None),
+            trace_out=trace_out,
+            trace_max=int(os.environ.get("EPLB_TRACE_MAX") or 0),
+            trace_every=int(os.environ.get("EPLB_TRACE_EVERY") or 25),
         )
+        if trace_out:
+            print(f"[run_real_moe] dumping routing trace to {trace_out}")
         _KEEPALIVE.append((hook, handles))
     elif mode == "apply":
         ep_group = mpu.get_expert_model_parallel_group()

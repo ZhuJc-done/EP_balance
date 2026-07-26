@@ -11,7 +11,32 @@ from .loads import Loads
 from .plan import Plan
 from .problem import ProblemSpec
 from .topology import Topology
-from .triton_solve import HAS_TRITON
+
+# Cached availability of the compiled CUDA backend so ``auto`` probes the
+# one-time extension build exactly once before degrading to the CPU reference.
+_CUDA_BACKEND_OK: bool | None = None
+
+
+def _cuda_plan_or_none(
+    loads: Loads, topo: Topology, spec: ProblemSpec, cfg: EPLBConfig
+) -> Plan | None:
+    """Solve with the compiled CUDA kernel, or return ``None`` when it is unavailable.
+
+    A missing CUDA toolchain (extension build failure) is cached so ``auto``
+    falls back to the portable CPU reference without retrying the build.
+    """
+    global _CUDA_BACKEND_OK
+    if _CUDA_BACKEND_OK is False:
+        return None
+    try:
+        from .cuda_solve import solve_cuda
+
+        plan = solve_cuda(loads, topo, spec, cfg)
+        _CUDA_BACKEND_OK = True
+        return plan
+    except Exception:
+        _CUDA_BACKEND_OK = False
+        return None
 
 
 def _lexsort_keys(*keys: torch.Tensor) -> torch.Tensor:
@@ -228,32 +253,31 @@ def solve(
                     "u_min is infeasible: every positive Lambda[r,e] must be >= u_min"
                 )
 
-    backend = os.environ.get("EPLB_SOLVER_BACKEND", "auto")
+    backend = os.environ.get("EPLB_SOLVER_BACKEND", "auto").lower()
+    cuda_inputs = R > 0 and E > 0 and loads.lam.is_cuda
 
     # bisect backend: tau-bisection heuristic (separate plan, not bit-identical to the greedy)
     if backend == "bisect":
         return solve_bisect(loads, topo, spec, cfg)
 
-    # Parallel CUDA backend: deterministic and constraint-preserving, but it
-    # intentionally does not preserve the serial LPT solver's bitwise plan.
-    if backend in ("fast", "cuda"):
-        if not (R > 0 and E > 0 and loads.lam.is_cuda):
-            raise RuntimeError("EPLB_SOLVER_BACKEND=fast requires non-empty CUDA inputs")
+    # Default solver: the parallel CUDA kernel (csrc/fast_solver.cu), deterministic
+    # and constraint-preserving.  An explicit request must run it; ``auto`` falls
+    # back to the portable CPU reference below when inputs are on CPU or the CUDA
+    # extension cannot be built (e.g. no CUDA toolchain).  ``fast`` is a legacy alias.
+    if backend in ("cuda", "fast"):
+        if not cuda_inputs:
+            raise RuntimeError(
+                "EPLB_SOLVER_BACKEND=cuda requires non-empty CUDA inputs"
+            )
         from .cuda_solve import solve_cuda
 
         return solve_cuda(loads, topo, spec, cfg)
 
-    # Exact GPU path: one Triton launch, zero host sync, and bit-identical to the reference.
-    if (
-        R > 0
-        and E > 0
-        and loads.lam.is_cuda
-        and HAS_TRITON
-        and backend in ("auto", "fused")
-    ):
-        from .triton_solve import solve_fused
-
-        return solve_fused(loads, topo, spec, cfg)
+    if backend == "auto" and cuda_inputs:
+        plan = _cuda_plan_or_none(loads, topo, spec, cfg)
+        if plan is not None:
+            return plan
+        # fall through to the CPU reference implementation
 
     lam = loads.lam
     dom = topo.domain_of_rank

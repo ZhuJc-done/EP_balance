@@ -152,7 +152,7 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
         gated=cfg["gated"], act=cfg["act"], transpose_w=True,
     )
     if profiling.enabled():
-        profiling.maybe_summary(print if ep_rank == 0 else None)
+        profiling.maybe_summary(print if (ep_rank == 0 or profiling.all_ranks()) else None)
     return out.reshape(in_shape), None
 
 

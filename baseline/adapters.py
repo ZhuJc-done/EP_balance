@@ -14,6 +14,8 @@ from eplb import EPLBConfig, ProblemSpec, Topology, solve
 from eplb.loads import Loads
 
 from .deepseek_eplb import rebalance_experts
+from .fastermoe import ShadowCostModel, select_shadow_experts
+from .flexmoe import FlexMoECostModel, flexmoe_schedule
 
 
 @dataclass
@@ -116,6 +118,81 @@ def run_deepseek_eplb(
             "placement_kind": "physical replica count",
             "replicas": num_physical,
             "num_groups": num_groups,
+        },
+    )
+
+
+def run_fastermoe(
+    loads: Loads,
+    spec: ProblemSpec,
+    *,
+    num_ranks: int,
+    cost: ShadowCostModel | None = None,
+) -> BaselineResult:
+    """Run FasterMoE dynamic shadowing and report its realized per-rank load.
+
+    FasterMoE re-selects the shadowed (globally replicated) experts every
+    micro-batch from the current load, so the reported load is the token load
+    after the chosen hot experts have been spread back onto their source ranks.
+    """
+    shadow_mask, rank_load = select_shadow_experts(
+        loads.lam,
+        spec.main_rank,
+        spec.weight_bytes,
+        spec.s_tok,
+        num_ranks,
+        cost,
+    )
+    placement = torch.zeros(
+        (spec.num_experts, num_ranks), dtype=torch.int64
+    )
+    experts = torch.arange(spec.num_experts, dtype=torch.int64)
+    placement[experts, spec.main_rank.cpu()] = 1
+    # A shadowed expert is transiently replicated onto every rank.
+    placement[shadow_mask] = 1
+    return BaselineResult(
+        name="fastermoe",
+        rank_load=rank_load,
+        placement=placement,
+        metadata={
+            "load_kind": "shadow-redistributed token load",
+            "placement_kind": "binary expert presence (shadow=all ranks)",
+            "replicas": int(placement.sum().item()),
+            "shadowed_experts": int(shadow_mask.sum().item()),
+        },
+    )
+
+
+def run_flexmoe(
+    loads: Loads,
+    spec: ProblemSpec,
+    *,
+    num_ranks: int,
+    cost: FlexMoECostModel | None = None,
+) -> BaselineResult:
+    """Run FlexMoE dynamic device placement and report its realized per-rank load.
+
+    FlexMoE replicates hot experts across more vExpert slots (never changing token
+    routing) until the balance ratio falls under its trigger threshold, then packs
+    the vExperts onto ranks. The reported load is the even-split load per Eq. 6.
+    """
+    counts, rank_load, placement = flexmoe_schedule(
+        loads.lam,
+        spec.weight_bytes,
+        num_ranks,
+        spec.n_slot,
+        cost,
+    )
+    mean = rank_load.mean().item() if rank_load.numel() else 0.0
+    return BaselineResult(
+        name="flexmoe",
+        rank_load=rank_load,
+        placement=placement,
+        metadata={
+            "load_kind": "even-split vExpert load (balance ratio)",
+            "placement_kind": "binary expert presence (vExpert replicas)",
+            "replicas": int(sum(counts)),
+            "balance_ratio": (rank_load.max().item() / mean) if mean > 0 else 1.0,
         },
     )
 
@@ -231,9 +308,13 @@ class LPLBBaseline:
 
 __all__ = [
     "BaselineResult",
+    "FlexMoECostModel",
     "LPLBBaseline",
     "LPLBUnavailableError",
+    "ShadowCostModel",
     "cube8_topology",
     "run_deepseek_eplb",
+    "run_fastermoe",
+    "run_flexmoe",
     "run_scale_eplb",
 ]

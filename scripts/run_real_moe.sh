@@ -4,8 +4,8 @@ set -euo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-# TE's transformer_engine_torch links libnccl.so from the nvidia-nccl wheel; put it on the runtime
-# linker path so `import transformer_engine` works. No-op if TE/NCCL aren't installed.
+# DeepEP's extension links libnccl.so from the nvidia-nccl wheel (install_deepep.sh); put it on the
+# runtime linker path so `import deep_ep` resolves. No-op if the wheel isn't installed.
 _nccl_lib="$(python -c 'import nvidia.nccl as n,os;print(os.path.join(n.__path__[0],"lib"))' 2>/dev/null || true)"
 if [ -n "${_nccl_lib}" ] && [ -d "${_nccl_lib}" ]; then
   export LD_LIBRARY_PATH="${_nccl_lib}:${LD_LIBRARY_PATH:-}"
@@ -47,6 +47,28 @@ EPLB_MODE="${EPLB_MODE:-observe}"           # off (pure Megatron) | observe (Pha
 export EPLB_MODE GPUS_PER_NODE
 export PYTHONPATH="${MEGATRON_DIR}:${EPLB_DIR}:${PYTHONPATH:-}"
 
+# --- optional routing-trace capture (observe mode) ---------------------------
+# EPLB_TRACE_OUT=<path> makes rank 0 dump the real gathered Lambda[R,E] per
+# (layer, micro-batch); EPLB_TRACE_MAX caps sample count (0=all), EPLB_TRACE_EVERY
+# is the flush cadence. Replay it through every load balancer with:
+#   python -m baseline.benchmark --trace <path> --strategies scale,eplb,fastermoe,flexmoe,lplb
+if [[ -n "${EPLB_TRACE_OUT:-}" ]]; then
+  export EPLB_TRACE_OUT EPLB_TRACE_MAX EPLB_TRACE_EVERY
+  echo "[run_real_moe] EPLB_TRACE_OUT=${EPLB_TRACE_OUT} (routing trace -> baseline replay)"
+fi
+
+# --- optional sweep / instrumentation knobs ----------------------------------
+# EPLB_N_SLOT=<int>         per-rank physical slot budget N_slot (default 2x mains-per-rank). Each slot
+#                           above the mains floor carries one expert replica -> the balance-vs-memory knob.
+# EPLB_PROFILE=1            periodic per-region latency + peak-memory summary. CUDA events are queued and
+#                           resolved in one batch, so this adds no per-region host sync.
+# EPLB_PROFILE_ALL_RANKS=1  every rank prints its own summary (required for max-vs-mean straggler analysis).
+# EPLB_PROFILE_EVERY=<n>    summary cadence; EPLB_PROFILE_RESET_AT=<n> resets peak memory after warmup.
+for _knob in EPLB_N_SLOT EPLB_PROFILE EPLB_PROFILE_ALL_RANKS EPLB_PROFILE_EVERY EPLB_PROFILE_RESET_AT; do
+  if [[ -n "${!_knob:-}" ]]; then export "${_knob}"; fi
+done
+if [[ -n "${EPLB_N_SLOT:-}" ]]; then echo "[run_real_moe] EPLB_N_SLOT=${EPLB_N_SLOT} (slot budget override)"; fi
+
 # --- per-model architecture args (must match the checkpoint config) -----------
 if [[ "${MODEL}" == "mixtral8x7b" ]]; then
   MODEL_ARGS=(
@@ -86,25 +108,13 @@ else
   exit 1
 fi
 
-# Fast native path (TE + grouped GEMM) needs Transformer Engine; apply mode needs SequentialMLP.
-# Auto-detect TE unless HAS_TE is set explicitly (HAS_TE=0 forces the PyTorch-only 'local' path).
-if [[ -n "${HAS_TE:-}" ]]; then
-  :  # honor caller override (HAS_TE=0 to disable TE, HAS_TE=1 to force it)
-elif python -c "import transformer_engine" >/dev/null 2>&1; then HAS_TE=1; else HAS_TE=0; fi
-if [[ "${EPLB_MODE}" == "apply" || "${HAS_TE}" == "0" ]]; then
-  MODEL_ARGS+=(
-    --transformer-impl local
-    --no-rope-fusion --no-masked-softmax-fusion --no-bias-swiglu-fusion
-    --no-gradient-accumulation-fusion --no-persist-layer-norm
-  )
-  if [[ "${EPLB_MODE}" == "apply" ]]; then
-    echo "[run_real_moe] EPLB_MODE=apply -> SequentialMLP (local impl, no grouped GEMM): reference path, slower"
-  else
-    echo "[run_real_moe] Transformer Engine not found -> local impl + fusions off (baseline runs, but slower & no grouped GEMM; install TE for the fast path)"
-  fi
-else
-  MODEL_ARGS+=(--transformer-impl transformer_engine --moe-grouped-gemm --no-gradient-accumulation-fusion)
-fi
+# SequentialMLP for every mode: the apply-mode binding needs clean per-expert weights, and one shared
+# kernel path keeps off/observe/apply step times comparable.
+MODEL_ARGS+=(
+  --transformer-impl local
+  --no-rope-fusion --no-masked-softmax-fusion --no-bias-swiglu-fusion
+  --no-gradient-accumulation-fusion --no-persist-layer-norm
+)
 
 # DEEPEP=1 (off/observe only): route Megatron's own MoE dispatch through DeepEP (flex backend, uses deep_ep.Buffer).
 # In apply mode EPLB replaces the dispatcher, so this is ignored there (DeepEPAdapter is not wired yet).
