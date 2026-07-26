@@ -5,8 +5,8 @@
 # to forward to scripts/run_real_moe.sh with the same multi-node + GB200 env.
 set -euo pipefail
 
-# TE's transformer_engine_torch links libnccl.so from the nvidia-nccl wheel; put it on the runtime
-# linker path so `import transformer_engine` works. No-op if TE/NCCL aren't installed.
+# DeepEP's extension links libnccl.so from the nvidia-nccl wheel (install_deepep.sh); put it on the
+# runtime linker path so `import deep_ep` resolves. No-op if the wheel isn't installed.
 _nccl_lib="$(python -c 'import nvidia.nccl as n,os;print(os.path.join(n.__path__[0],"lib"))' 2>/dev/null || true)"
 if [ -n "${_nccl_lib}" ] && [ -d "${_nccl_lib}" ]; then
   export LD_LIBRARY_PATH="${_nccl_lib}:${LD_LIBRARY_PATH:-}"
@@ -112,8 +112,8 @@ MODEL_ARGS=(
   --position-embedding-type rope
   --swiglu
   --disable-bias-linear
-  --transformer-impl local                               # SequentialMLP: works without TE and for apply mode
-  # disable fusions that require TE/apex so the smoke test runs on pure PyTorch
+  --transformer-impl local                               # SequentialMLP: required by the apply-mode binding
+  # pure PyTorch kernels: no fused-kernel extension required
   --no-rope-fusion
   --no-masked-softmax-fusion
   --no-bias-swiglu-fusion

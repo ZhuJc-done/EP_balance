@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
+from . import profiling
 from ..plan import Plan
 from ..problem import ProblemSpec
 from .comm import all_to_all_single, broadcast_from_main
@@ -346,15 +347,18 @@ def _make_materialize_and_compute(
         # replicate: materialise each replicated expert's weight from its (static) main owner.
         # every rank enters these collectives in the same ascending-id order -> grads reduce to main.
         We: Dict[int, Tuple[torch.Tensor, ...]] = {}
-        for e, main_local in zip(replicated, replicated_main):
-            local_w = weights_local.get(e)
-            We[e] = tuple(
-                broadcast_from_main(
-                    local_w[j] if local_w is not None else None,
-                    weight_shapes[j], dtype, device, main_local, group,
+        # Under Level A (checkpoint) this closure also runs in backward, so the recorded count is
+        # forward + recompute -- that double cost is exactly what re-materialisation trades away.
+        with profiling.record("apply/weight_move", time_it=True, device=device):
+            for e, main_local in zip(replicated, replicated_main):
+                local_w = weights_local.get(e)
+                We[e] = tuple(
+                    broadcast_from_main(
+                        local_w[j] if local_w is not None else None,
+                        weight_shapes[j], dtype, device, main_local, group,
+                    )
+                    for j in range(len(weight_shapes))
                 )
-                for j in range(len(weight_shapes))
-            )
         # stack per-slot weights via device scatter into a [n_slot + 1, *w] buffer; row n_slot is the
         # overflow bucket for weights not hosted on this rank (dropped by the trailing [:n_slot] slice).
         overflow = torch.full((1,), n_slot, dtype=torch.int64, device=device)
@@ -675,16 +679,17 @@ def sync_free_moe_forward(
     num_chunks = int(os.environ.get("EPLB_CHUNKS", "1") or "1")
     if num_chunks >= 2 and not overlap:
         _, slot_of_e, hosted = _slot_tables(plan.x, my_rank, n_slot)
-        if gin_enabled():  # device-initiated replication; its backward reduces to main on its own stream
-            replicator = _get_gin_replicator(group, spec, weight_shapes, dtype, device)
-            w_stacked = replicator.materialize(plan.x, weights_local)
-            keepalive = None
-        else:
-            w_stacked, keepalive = _materialize_w_stacked(
-                replicated=replicated, replicated_main=replicated_main, weights_local=weights_local,
-                weight_shapes=weight_shapes, slot_of_e=slot_of_e, hosted=hosted,
-                n_slot=n_slot, dtype=dtype, device=device, group=group,
-            )
+        with profiling.record("apply/weight_move", time_it=True, device=device):
+            if gin_enabled():  # device-initiated replication; its backward reduces to main on its own stream
+                replicator = _get_gin_replicator(group, spec, weight_shapes, dtype, device)
+                w_stacked = replicator.materialize(plan.x, weights_local)
+                keepalive = None
+            else:
+                w_stacked, keepalive = _materialize_w_stacked(
+                    replicated=replicated, replicated_main=replicated_main, weights_local=weights_local,
+                    weight_shapes=weight_shapes, slot_of_e=slot_of_e, hosted=hosted,
+                    n_slot=n_slot, dtype=dtype, device=device, group=group,
+                )
         if cap is None:  # per-slot upper bound: no slot can hold more than this rank's total units
             env_cap = os.environ.get("EPLB_CAP")
             cap = int(env_cap) if env_cap else max(int(unit_token_idx.shape[0]), 1)
@@ -708,7 +713,8 @@ def sync_free_moe_forward(
     meta = send_tokens.new_zeros((send_tokens.shape[0], pad_cols))
     meta[:, 0] = send_phys.to(dtype)                             # phys carried (rounded) through the token dtype
     send_payload = torch.cat([send_tokens, meta], dim=1)
-    recv_payload = adapter.all_to_all(send_payload, recv_per_src, sent_per_dst, group)
+    with profiling.record("apply/dispatch", time_it=True, device=device):
+        recv_payload = adapter.all_to_all(send_payload, recv_per_src, sent_per_dst, group)
     recv_tokens = recv_payload[:, :H].contiguous()
     recv_phys = recv_payload[:, H].round().to(torch.int64)
     if cap is None:  # host-static upper bound: all received tokens could land in one slot
@@ -720,39 +726,44 @@ def sync_free_moe_forward(
     group_sizes = _group_sizes_by_slot(slot_to_e, recv_per_expert, n_slot, device)
 
     # --- STAGE 4: COMPUTE (replicate weights + batched expert MLP) ---------------------------
-    if overlap:  # Level B: async re-materialisation overlapped with Wgrad, grads reduce to main
-        # GIN backend: re-pull replica weights device-side in backward (get_batched) instead of
-        # re-broadcasting; forward holds no replica clone (rematerialise). Broadcast path: transport=None.
-        transport = None
-        if gin_enabled():
+    # This region's per-rank latency is the straggler signal: a synchronous EP step is paced by the
+    # max over ranks, so compare max-vs-mean across ranks (EPLB_PROFILE_ALL_RANKS=1).
+    with profiling.record("apply/expert_compute", time_it=True, device=device):
+        if overlap:  # Level B: async re-materialisation overlapped with Wgrad, grads reduce to main
+            # GIN backend: re-pull replica weights device-side in backward (get_batched) instead of
+            # re-broadcasting; forward holds no replica clone (rematerialise). Broadcast path: transport=None.
+            transport = None
+            if gin_enabled():
+                replicator = _get_gin_replicator(group, spec, weight_shapes, dtype, device)
+                transport = GinReplicaTransport(replicator, plan.x)
+            out_units_recv = overlapped_grouped_expert_mlp(
+                recv_tokens, recv_slot, group_sizes, weights_local, slot_to_e,
+                spec.main_rank, replicated, weight_shapes, cap,
+                gated=gated, act=act, transpose_w=transpose_w,
+                my_rank=my_rank, n_slot=n_slot, group=group, transport=transport,
+            )
+        elif gin_enabled():  # device-initiated replication over NCCL GIN (no dist.broadcast / host weight bytes)
             replicator = _get_gin_replicator(group, spec, weight_shapes, dtype, device)
-            transport = GinReplicaTransport(replicator, plan.x)
-        out_units_recv = overlapped_grouped_expert_mlp(
-            recv_tokens, recv_slot, group_sizes, weights_local, slot_to_e,
-            spec.main_rank, replicated, weight_shapes, cap,
-            gated=gated, act=act, transpose_w=transpose_w,
-            my_rank=my_rank, n_slot=n_slot, group=group, transport=transport,
-        )
-    elif gin_enabled():  # device-initiated replication over NCCL GIN (no dist.broadcast / host weight bytes)
-        replicator = _get_gin_replicator(group, spec, weight_shapes, dtype, device)
-        w_stacked = replicator.materialize(plan.x, weights_local)  # (W_j[n_slot, *shape_j], ...)
-        out_units_recv = grouped_expert_mlp(
-            recv_tokens, recv_slot, group_sizes, w_stacked, batched_mlp_fn, cap
-        )
-    else:
-        compute = _make_materialize_and_compute(
-            replicated=replicated, replicated_main=replicated_main, weights_local=weights_local,
-            weight_shapes=weight_shapes, slot_of_e=slot_of_e, hosted=hosted, recv_slot=recv_slot,
-            group_sizes=group_sizes, batched_mlp_fn=batched_mlp_fn, cap=cap,
-            n_slot=n_slot, dtype=dtype, device=device, group=group,
-        )
-        if rematerialize:  # Level A: recompute the broadcasts in backward instead of holding them
-            out_units_recv = checkpoint(compute, recv_tokens, use_reentrant=False, preserve_rng_state=False)
+            with profiling.record("apply/weight_move", time_it=True, device=device):
+                w_stacked = replicator.materialize(plan.x, weights_local)  # (W_j[n_slot, *shape_j], ...)
+            out_units_recv = grouped_expert_mlp(
+                recv_tokens, recv_slot, group_sizes, w_stacked, batched_mlp_fn, cap
+            )
         else:
-            out_units_recv = compute(recv_tokens)
+            compute = _make_materialize_and_compute(
+                replicated=replicated, replicated_main=replicated_main, weights_local=weights_local,
+                weight_shapes=weight_shapes, slot_of_e=slot_of_e, hosted=hosted, recv_slot=recv_slot,
+                group_sizes=group_sizes, batched_mlp_fn=batched_mlp_fn, cap=cap,
+                n_slot=n_slot, dtype=dtype, device=device, group=group,
+            )
+            if rematerialize:  # Level A: recompute the broadcasts in backward instead of holding them
+                out_units_recv = checkpoint(compute, recv_tokens, use_reentrant=False, preserve_rng_state=False)
+            else:
+                out_units_recv = compute(recv_tokens)
 
     # --- STAGE 5: COMBINE outputs back, invert the permutation, gate-weight, scatter ---------
-    combined_back = adapter.all_to_all(out_units_recv, sent_per_dst, recv_per_src, group)
+    with profiling.record("apply/combine", time_it=True, device=device):
+        combined_back = adapter.all_to_all(out_units_recv, sent_per_dst, recv_per_src, group)
     out_per_unit = combined_back[torch.argsort(perm)]
     result = torch.zeros((tokens.shape[0], H), dtype=out_per_unit.dtype, device=device)
     result = result.index_add(0, unit_token_idx, unit_prob.unsqueeze(1) * out_per_unit)

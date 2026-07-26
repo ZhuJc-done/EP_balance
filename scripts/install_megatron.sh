@@ -19,8 +19,8 @@ fi
 git -C "$MEGATRON_DIR" fetch origin "$MEGATRON_COMMIT" || git -C "$MEGATRON_DIR" fetch origin
 git -C "$MEGATRON_DIR" checkout "$MEGATRON_COMMIT"
 
-# Editable install + the deps the GPT/MoE path needs. Transformer-Engine / Apex are OPTIONAL:
-# the launchers use `--transformer-impl local` + `--no-*-fusion`, so we don't require them here.
+# Editable install + the deps the GPT/MoE path needs (the launchers pin `--transformer-impl local`
+# + `--no-*-fusion`, so no fused-kernel extensions are required).
 pip install -e "$MEGATRON_DIR"
 pip install transformers einops sentencepiece tiktoken regex
 
