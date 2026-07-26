@@ -40,9 +40,12 @@ Expected per-forward log on rank 0:
 [EPLB] layer=0 mb=0 tau=12458 imbalance=1.014 replicas=75 phi_token=86075
 ```
 
-`imbalance` is the would-be makespan ratio under the EPLB plan vs. the current
-placement; with `--mock-data` (near-uniform routing) it stays close to 1.0 — use a
-real checkpoint (`convert_hf_to_mcore.sh`) to see meaningful skew.
+`imbalance` is `tau / mean_load`: the makespan the solved plan achieves, over the ideal
+perfectly-even load. It is the **residual** imbalance *after* rebalancing, so `1.0` means the
+plan is perfect and low values are the solver working, **not** evidence that the input was
+uniform. It says nothing on its own about how skewed the routing was — for that, compare
+against the input skew (see [`ROUTER_SKEW`](#dialing-the-skew-router_skew)) or replay the
+captured trace through the baselines below.
 
 ### Capture a routing trace for the baseline comparison
 
@@ -107,6 +110,27 @@ the launcher fails fast with an explicit error. Under Level A (`EPLB_REMATERIALI
 the `apply/weight_move` count includes the backward recompute — that doubling is exactly
 what re-materialisation trades for memory.
 
+### Reading the trace in Perfetto
+
+`PROFILE_TRACE=1` turns on Megatron's PyTorch profiler; the region labels above are emitted as
+`record_function` ranges **unconditionally** (no `EPLB_PROFILE` needed), so they show up inline
+against the real CPU and CUDA rows:
+
+```bash
+PROFILE_TRACE=1 PROFILE_STEP_START=8 PROFILE_STEP_END=10 \
+EPLB_MODE=apply ... bash scripts/run_real_moe.sh
+# -> <PROFILE_DIR>/../torch_profile/rank-<N>.json.gz   (default PROFILE_DIR=logs/tb_<mode>)
+```
+
+Open the `.json.gz` directly at [ui.perfetto.dev](https://ui.perfetto.dev) (gzipped Chrome
+traces are handled natively) and search for `eplb/`. Knobs: `PROFILE_RANKS="0 8"` (space
+separated, default rank 0), `PROFILE_STACK=1` for Python/CPU call stacks, `PROFILE_SHAPES=1`
+for tensor shapes.
+
+Keep the window short (2–3 steps) and start it past step ~5: the first iterations pay CUDA-solver
+JIT and cuBLAS autotuning, and `PROFILE_STACK=1` inflates the trace enough to distort the step
+time read off the same run — take step time from an unprofiled run.
+
 `off` / `observe` / `apply` all run `--transformer-impl local` (SequentialMLP, fusions off),
 so a step-time delta between them comes from the EP part:
 
@@ -114,6 +138,64 @@ so a step-time delta between them comes from the EP part:
 EPLB_MODE=off   ... bash scripts/run_real_moe.sh   # baseline
 EPLB_MODE=apply ... bash scripts/run_real_moe.sh   # Scale-EPLB
 ```
+
+### Keeping the routing skew (turn the aux loss off)
+
+Megatron's default `aux_loss` router regulariser actively flattens expert load — the exact
+imbalance a load balancer exists to exploit. Measuring balancers with it on understates all of
+them, so set `ROUTER_BALANCING=none` (also forces `--moe-aux-loss-coeff 0.0`):
+
+```bash
+ROUTER_BALANCING=none EPLB_MODE=observe ... bash scripts/run_real_moe.sh
+```
+
+Watch `load_balancing_loss` in the training log: under `aux_loss` it decays as the router is
+pushed toward uniform. Note that turning it off does **not** create skew on its own — a
+randomly initialised router over `--mock-data` still routes near-uniformly (only multinomial
+noise, `max/mean` ≈ 1.0 at 128 experts), which is why a mock run reports `imbalance` ≈ 1.01
+no matter which balancer is used.
+
+### Dialing the skew: `ROUTER_SKEW`
+
+`ROUTER_SKEW=<std>` sets `--moe-router-force-biased`, which adds a per-expert bias
+`b_e ~ N(0, |std|)` to the router logits. The bias is drawn from the *data-parallel* RNG seed,
+which Megatron leaves rank-independent (`data_parallel_seed = seed`), so **every rank gets the
+same `b_e`** — expert `e` is hot everywhere, which is the globally-coherent hot-expert case a
+balancer has to fix. A negative `std` draws the bias once per layer and reuses it, giving a
+*stationary* skew (use this; positive redraws every step). Measured at `E=128, top-k=8, EP=32`:
+
+| `ROUTER_SKEW` | max/mean per expert | max/mean per rank |
+|---|---|---|
+| unset / `0` | 1.03 | 1.02 |
+| `-0.25` | 2.9 | 1.6 |
+| `-0.5` | 5.0 | 2.5 |
+| `-0.75` | 8.2 | 3.4 |
+| `-1.5` | 13.6 | 4.6 |
+| `-2.0` | 15.1 | 7.2 |
+
+Per-expert skew saturates at `E/top-k = 16` (one expert can absorb at most every token). The
+per-rank column is the load the solver actually sees, and it is noisy in `std`: it depends on
+*which* hot experts happen to share a rank under the contiguous `e -> e//(E/EP)` split, so fix
+the seed and average a few draws before quoting a number.
+
+```bash
+for S in 0 -0.25 -0.5 -0.75 -1.5; do
+  for M in off apply; do
+    ROUTER_BALANCING=none ROUTER_SKEW=$S EPLB_MODE=$M EPLB_PROFILE=1 \
+      LOG_FILE=logs/skew${S}_${M}.log bash scripts/run_real_moe.sh
+  done
+done
+```
+
+Two caveats. Megatron randomises the logits themselves on this path, so the **loss is
+meaningless** under `ROUTER_SKEW` — never use it for the loss-curve comparison, only for step
+time and imbalance. And the skew is synthetic: pair the sweep with one real-checkpoint run
+(`convert_hf_to_mcore.sh`) to show the operating point a trained router actually lands on.
+
+Token dropping is off by design: the launcher never passes `--moe-expert-capacity-factor`, and
+unset means every routed token reaches its expert (`transformer_config.py`: "None means no token
+dropping"). Adding it would silently drop the tail of the hot experts — exactly the load the
+balancer is supposed to move — so don't.
 
 ## Phase C — apply (end-to-end training)
 

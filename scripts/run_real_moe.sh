@@ -69,6 +69,28 @@ for _knob in EPLB_N_SLOT EPLB_PROFILE EPLB_PROFILE_ALL_RANKS EPLB_PROFILE_EVERY 
 done
 if [[ -n "${EPLB_N_SLOT:-}" ]]; then echo "[run_real_moe] EPLB_N_SLOT=${EPLB_N_SLOT} (slot budget override)"; fi
 
+# PROFILE_TRACE=1 -> Megatron's native PyTorch profiler writes a chrome/perfetto trace to
+# ${PROFILE_DIR}/../torch_profile/rank-<N>.json.gz. The eplb/* record_function labels (solve,
+# all_gather_lambda, apply/dispatch, apply/expert_compute, apply/combine, apply/weight_move) appear
+# inline, so the trace resolves where EP time actually goes. Start past step ~5: the first iterations
+# pay CUDA-solver JIT and cuBLAS autotuning and are not representative.
+PROFILE_ARGS=()
+if [[ "${PROFILE_TRACE:-0}" == "1" ]]; then
+  PROFILE_ARGS=(
+    --profile
+    --use-pytorch-profiler
+    --profile-step-start "${PROFILE_STEP_START:-8}"
+    --profile-step-end "${PROFILE_STEP_END:-10}"
+    --profile-ranks ${PROFILE_RANKS:-0}                   # unquoted on purpose: PROFILE_RANKS="0 8" must word-split into nargs
+    --tensorboard-dir "${PROFILE_DIR:-${EPLB_DIR}/logs/tb_${EPLB_MODE}}"
+  )
+  # CPU/Python call stacks; off by default because with_stack inflates the trace and slows the
+  # profiled steps enough to distort the step time read off the same run.
+  [[ "${PROFILE_STACK:-0}" == "1" ]] && PROFILE_ARGS+=(--pytorch-profiler-collect-callstack)
+  [[ "${PROFILE_SHAPES:-0}" == "1" ]] && PROFILE_ARGS+=(--pytorch-profiler-collect-shapes)
+  echo "[run_real_moe] PROFILE_TRACE=1 -> steps ${PROFILE_STEP_START:-8}..${PROFILE_STEP_END:-10}, ranks ${PROFILE_RANKS:-0}"
+fi
+
 # --- per-model architecture args (must match the checkpoint config) -----------
 if [[ "${MODEL}" == "mixtral8x7b" ]]; then
   MODEL_ARGS=(
@@ -106,6 +128,31 @@ elif [[ "${MODEL}" == "qwen3_30b_a3b" ]]; then
 else
   echo "unknown MODEL=${MODEL} (expected qwen3_30b_a3b | mixtral8x7b)" >&2
   exit 1
+fi
+
+# Router load balancing. ROUTER_BALANCING=none turns the aux loss off so the routing skew survives to
+# the dispatcher: aux_loss actively flattens the very imbalance an expert load balancer exists to
+# exploit, so leaving it on understates every balancer in the comparison. Appended after the per-model
+# recipe because argparse keeps the last value for a repeated flag.
+ROUTER_BALANCING="${ROUTER_BALANCING:-aux_loss}"
+MOE_ARGS+=(--moe-router-load-balancing-type "${ROUTER_BALANCING}")
+if [[ "${ROUTER_BALANCING}" == "none" ]]; then
+  MOE_ARGS+=(--moe-aux-loss-coeff 0.0)
+  echo "[run_real_moe] ROUTER_BALANCING=none -> aux loss off, routing skew left intact"
+fi
+# --moe-expert-capacity-factor is deliberately never set: unset means no token is dropped and every
+# routed token reaches its expert, which the load-balancing comparison depends on. Do not add it.
+
+# ROUTER_SKEW=<std> injects a shared per-expert bias ~ N(0, |std|) into the router logits, which is how
+# a controlled routing skew is produced without a trained checkpoint: |std| sets the magnitude, so
+# sweeping it sweeps the imbalance a balancer has to absorb. std<0 draws the bias once per layer and
+# reuses it (stationary skew -- the measurable case); std>0 redraws every forward pass. Megatron also
+# randomises the logits themselves here, so the loss is meaningless under this flag: use it for step
+# time / imbalance, never for the loss-curve comparison.
+if [[ -n "${ROUTER_SKEW:-}" ]]; then
+  MOE_ARGS+=(--moe-router-force-biased "${ROUTER_SKEW}")
+  [[ "${ROUTER_SKEW}" == -* ]] && _skew_kind="fixed per layer" || _skew_kind="redrawn per step"
+  echo "[run_real_moe] ROUTER_SKEW=${ROUTER_SKEW} -> synthetic expert bias (${_skew_kind}); loss is not meaningful"
 fi
 
 # SequentialMLP for every mode: the apply-mode binding needs clean per-expert weights, and one shared
@@ -182,11 +229,16 @@ LOG="${LOG:-1}"
 LOG_FILE="${LOG_FILE:-${EPLB_DIR}/logs/real_${MODEL}_${EPLB_MODE}_node${NODE_RANK}.log}"
 echo "[run_real_moe] model=${MODEL} mode=${EPLB_MODE} world=${WORLD_SIZE} TP=${TP} PP=${PP} EP=${EP}"
 [[ "${LOG}" != "0" ]] && { mkdir -p "$(dirname "${LOG_FILE}")"; echo "[run_real_moe] logging to ${LOG_FILE}"; }
+# Extra Megatron flags passed to this script go last, so argparse lets them override the recipe above
+# (e.g. `--recompute-granularity full --recompute-method uniform`). Captured at top level because `$@`
+# inside a function would resolve to the function's own arguments.
+EXTRA_ARGS=("$@")
+[[ ${#EXTRA_ARGS[@]} -gt 0 ]] && echo "[run_real_moe] extra Megatron args: ${EXTRA_ARGS[*]}"
 run_torchrun() {
   torchrun "${DISTRIBUTED_ARGS[@]}" \
     "${EPLB_DIR}/scripts/pretrain_eplb_moe.py" \
     "${MODEL_ARGS[@]}" "${MOE_ARGS[@]}" "${DEEPEP_ARGS[@]}" "${PARALLEL_ARGS[@]}" \
-    "${DATA_ARGS[@]}" "${TRAIN_ARGS[@]}" "${LOAD_ARGS[@]}"
+    "${DATA_ARGS[@]}" "${TRAIN_ARGS[@]}" "${LOAD_ARGS[@]}" "${PROFILE_ARGS[@]}" "${EXTRA_ARGS[@]}"
 }
 if [[ "${LOG}" != "0" ]]; then
   run_torchrun 2>&1 | tee "${LOG_FILE}"
