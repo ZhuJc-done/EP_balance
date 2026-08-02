@@ -76,7 +76,7 @@ def _row(name: str, result, **timings: float | None) -> dict[str, Any]:
     return {
         "strategy": name,
         **timings,
-        "quality_tau": result.tau,
+        "quality_theta": result.theta,
         "quality_mean_load": result.mean_load,
         "quality_imbalance": result.imbalance,
         **result.metadata,
@@ -200,7 +200,12 @@ def benchmark(args: argparse.Namespace) -> list[dict[str, Any]]:
         def fastermoe_selection():
             # Include the GPU->CPU transfer of the load matrix when the input is CUDA.
             return select_shadow_experts(
-                loads.lam, spec.main_rank, spec.weight_bytes, spec.s_tok, ranks, fm_cost
+                loads.omega,
+                spec.main_rank,
+                spec.weight_bytes,
+                spec.s_tok,
+                ranks,
+                fm_cost,
             )
 
         selection_ms = (
@@ -226,7 +231,7 @@ def benchmark(args: argparse.Namespace) -> list[dict[str, Any]]:
         def flexmoe_scheduling():
             # Include the GPU->CPU transfer of the load matrix when the input is CUDA.
             return flexmoe_schedule(
-                loads.lam, spec.weight_bytes, ranks, args.n_slot, fm_cost
+                loads.omega, spec.weight_bytes, ranks, args.n_slot, fm_cost
             )
 
         schedule_ms = (
@@ -354,7 +359,7 @@ def _agg(values: list[float]) -> dict[str, float]:
 def benchmark_trace(args: argparse.Namespace) -> list[dict[str, Any]]:
     """Replay a real routing trace through every selected baseline and aggregate quality/latency.
 
-    Each sample's own ``Lambda`` is fed to every strategy (i.e. every baseline replans
+    Each sample's own ``Ω`` is fed to every strategy (i.e. every baseline replans
     per micro-batch from that batch's load), so the reported numbers are apples-to-apples
     load-balance quality on the real routing distribution.
     """
@@ -392,15 +397,17 @@ def benchmark_trace(args: argparse.Namespace) -> list[dict[str, Any]]:
     acc: dict[str, dict[str, Any]] = {}
 
     def record(key: str, result, ms: float) -> None:
-        bucket = acc.setdefault(key, {"tau": [], "imb": [], "ms": [], "name": key, "meta": {}})
-        bucket["tau"].append(result.tau)
+        bucket = acc.setdefault(
+            key, {"theta": [], "imb": [], "ms": [], "name": key, "meta": {}}
+        )
+        bucket["theta"].append(result.theta)
         bucket["imb"].append(result.imbalance)
         bucket["ms"].append(ms)
         bucket["name"] = result.name
         bucket["meta"] = result.metadata
 
     for sample in samples:
-        loads = Loads(sample["lam"].to(device))
+        loads = Loads(sample["omega"].to(device))
         if "scale" in strategies:
             res, ms = _run_timed(lambda ld=loads: run_scale_eplb(ld, topo, spec, cfg), device)
             record("scale", res, ms)
@@ -445,13 +452,17 @@ def benchmark_trace(args: argparse.Namespace) -> list[dict[str, Any]]:
             rows.append({"strategy": "lplb", "skipped": lplb_skip})
             continue
         bucket = acc[key]
-        tau, imb, ms = _agg(bucket["tau"]), _agg(bucket["imb"]), _agg(bucket["ms"])
+        theta, imb, ms = (
+            _agg(bucket["theta"]),
+            _agg(bucket["imb"]),
+            _agg(bucket["ms"]),
+        )
         rows.append(
             {
                 "strategy": bucket["name"],
-                "samples": len(bucket["tau"]),
+                "samples": len(bucket["theta"]),
                 "solve_ms_mean": ms["mean"],
-                "quality_tau_mean": tau["mean"],
+                "quality_theta_mean": theta["mean"],
                 "quality_imbalance_mean": imb["mean"],
                 "quality_imbalance_p90": imb["p90"],
                 "load_kind": bucket["meta"].get("load_kind", ""),
@@ -513,7 +524,7 @@ def _print_trace_rows(rows: list[dict[str, Any]]) -> None:
             continue
         print(
             f"{row['strategy']:<16} solve_ms(mean)={row['solve_ms_mean']:.3f}, "
-            f"tau(mean)={row['quality_tau_mean']:.1f}, "
+            f"theta(mean)={row['quality_theta_mean']:.1f}, "
             f"imbalance(mean)={row['quality_imbalance_mean']:.4f}, "
             f"imbalance(p90)={row['quality_imbalance_p90']:.4f}, "
             f"quality={row['load_kind']}"
@@ -546,7 +557,7 @@ def main() -> None:
         )
         print(
             f"{row['strategy']:<16} {timings}, "
-            f"quality_tau={row['quality_tau']:.1f}, "
+            f"quality_theta={row['quality_theta']:.1f}, "
             f"quality_imbalance={row['quality_imbalance']:.4f}, "
             f"quality={row['load_kind']}"
         )

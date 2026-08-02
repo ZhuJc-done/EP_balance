@@ -28,7 +28,7 @@ class BaselineResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def tau(self) -> float:
+    def theta(self) -> float:
         return float(self.rank_load.max().item()) if self.rank_load.numel() else 0.0
 
     @property
@@ -38,7 +38,7 @@ class BaselineResult:
     @property
     def imbalance(self) -> float:
         mean = self.mean_load
-        return self.tau / mean if mean > 0 else 1.0
+        return self.theta / mean if mean > 0 else 1.0
 
 
 class LPLBUnavailableError(RuntimeError):
@@ -136,7 +136,7 @@ def run_fastermoe(
     after the chosen hot experts have been spread back onto their source ranks.
     """
     shadow_mask, rank_load = select_shadow_experts(
-        loads.lam,
+        loads.omega,
         spec.main_rank,
         spec.weight_bytes,
         spec.s_tok,
@@ -177,7 +177,7 @@ def run_flexmoe(
     the vExperts onto ranks. The reported load is the even-split load per Eq. 6.
     """
     counts, rank_load, placement = flexmoe_schedule(
-        loads.lam,
+        loads.omega,
         spec.weight_bytes,
         num_ranks,
         spec.n_slot,

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 
 from .config import EPLBConfig
@@ -11,32 +9,6 @@ from .loads import Loads
 from .plan import Plan
 from .problem import ProblemSpec
 from .topology import Topology
-
-# Cached availability of the compiled CUDA backend so ``auto`` probes the
-# one-time extension build exactly once before degrading to the CPU reference.
-_CUDA_BACKEND_OK: bool | None = None
-
-
-def _cuda_plan_or_none(
-    loads: Loads, topo: Topology, spec: ProblemSpec, cfg: EPLBConfig
-) -> Plan | None:
-    """Solve with the compiled CUDA kernel, or return ``None`` when it is unavailable.
-
-    A missing CUDA toolchain (extension build failure) is cached so ``auto``
-    falls back to the portable CPU reference without retrying the build.
-    """
-    global _CUDA_BACKEND_OK
-    if _CUDA_BACKEND_OK is False:
-        return None
-    try:
-        from .cuda_solve import solve_cuda
-
-        plan = solve_cuda(loads, topo, spec, cfg)
-        _CUDA_BACKEND_OK = True
-        return plan
-    except Exception:
-        _CUDA_BACKEND_OK = False
-        return None
 
 
 def _lexsort_keys(*keys: torch.Tensor) -> torch.Tensor:
@@ -119,7 +91,7 @@ def _waterfill(
 
 
 def _assign_quota(
-    lam: torch.Tensor,
+    omega: torch.Tensor,
     x: torch.Tensor,
     cost: torch.Tensor,
     dom: torch.Tensor,
@@ -128,7 +100,7 @@ def _assign_quota(
     """Route tokens under strict domain-local serving (cross-domain only when no in-domain instance).
 
     Args:
-        lam: int64 ``[R, E]`` load matrix.
+        omega: int64 ``[R, E]`` load matrix.
         x: int8 ``[E, R]`` placement.
         cost: int64 ``[R, R]`` per-token comm cost.
         dom: int64 ``[R]`` domain id per rank.
@@ -137,9 +109,9 @@ def _assign_quota(
         ``(q, load)`` where ``q`` is int64 ``[R, E, R]`` and ``load`` is
         int64 ``[R]`` per-destination token counts.
     """
-    R = lam.shape[0]
-    E = lam.shape[1]
-    device = lam.device
+    R = omega.shape[0]
+    E = omega.shape[1]
+    device = omega.device
     q = torch.zeros((R, E, R), dtype=torch.int64, device=device)
     load = torch.zeros(R, dtype=torch.int64, device=device)
 
@@ -151,12 +123,12 @@ def _assign_quota(
     )
     flat_r = rr.reshape(-1)
     flat_e = ee.reshape(-1)
-    flat_lam = lam.reshape(-1)
-    neg_lam = -flat_lam
-    order = _lexsort_keys(neg_lam, flat_e, flat_r)
+    flat_omega = omega.reshape(-1)
+    neg_omega = -flat_omega
+    order = _lexsort_keys(neg_omega, flat_e, flat_r)
 
     for idx in order.tolist():
-        need = int(flat_lam[idx].item())
+        need = int(flat_omega[idx].item())
         if need == 0:
             continue
         r = int(flat_r[idx].item())
@@ -227,15 +199,15 @@ def solve(
     """Compute a deterministic Scale-EPLB plan for one (layer, micro-batch).
 
     Args:
-        loads: Dynamic load matrix ``Lambda`` (already all-gathered).
+        loads: Dynamic load matrix ``Ω`` (already all-gathered).
         topo: Cluster topology.
         spec: Static problem spec (main placement, weights, slot budget).
         cfg: Solver configuration (defaults to :class:`EPLBConfig`).
         validate: Run input validation first (disable in hot loops once trusted).
 
     Returns:
-        A :class:`~eplb.plan.Plan` with placement ``x``, routing quota ``q`` and
-        makespan ``tau``.
+        A :class:`~eplb.plan.Plan` with placement ``x``, routing quota ``q``,
+        and maximum rank load ``θ``.
     """
     cfg = cfg or EPLBConfig()
     R = topo.num_ranks
@@ -247,39 +219,25 @@ def solve(
         spec.validate(R)
         loads.validate(R, E)
         if cfg.u_min > 1:
-            infeasible = (loads.lam > 0) & (loads.lam < cfg.u_min)
+            infeasible = (loads.omega > 0) & (loads.omega < cfg.u_min)
             if torch.any(infeasible):
                 raise ValueError(
-                    "u_min is infeasible: every positive Lambda[r,e] must be >= u_min"
+                    "u_min is infeasible: every positive Ω[r,e] must be >= u_min"
                 )
 
-    backend = os.environ.get("EPLB_SOLVER_BACKEND", "auto").lower()
-    cuda_inputs = R > 0 and E > 0 and loads.lam.is_cuda
+    cuda_inputs = R > 0 and E > 0 and loads.omega.is_cuda
 
-    # bisect backend: tau-bisection heuristic (separate plan, not bit-identical to the greedy)
-    if backend == "bisect":
-        return solve_bisect(loads, topo, spec, cfg)
-
-    # Default solver: the parallel CUDA kernel (csrc/fast_solver.cu), deterministic
-    # and constraint-preserving.  An explicit request must run it; ``auto`` falls
-    # back to the portable CPU reference below when inputs are on CPU or the CUDA
-    # extension cannot be built (e.g. no CUDA toolchain).  ``fast`` is a legacy alias.
-    if backend in ("cuda", "fast"):
-        if not cuda_inputs:
-            raise RuntimeError(
-                "EPLB_SOLVER_BACKEND=cuda requires non-empty CUDA inputs"
-            )
+    # The only GPU solver is the compiled CUDA implementation in
+    # ``csrc/fast_solver.cu``. Build/load failures propagate to the caller; there
+    # is no alternate GPU backend or silent CPU fallback for CUDA inputs.
+    if cuda_inputs:
         from .cuda_solve import solve_cuda
 
         return solve_cuda(loads, topo, spec, cfg)
 
-    if backend == "auto" and cuda_inputs:
-        plan = _cuda_plan_or_none(loads, topo, spec, cfg)
-        if plan is not None:
-            return plan
-        # fall through to the CPU reference implementation
-
-    lam = loads.lam
+    # Portable reference retained for CPU-only tests and simulations. It is not
+    # a selectable production backend.
+    omega = loads.omega
     dom = topo.domain_of_rank
     cost = topo.cost
     main_rank = spec.main_rank
@@ -336,7 +294,7 @@ def solve(
     # Stage 2: monotonic incremental relief inside each domain.  The initial
     # route above is the only full route; every accepted action moves one
     # expert's existing quotas between two same-domain ranks.
-    q, load = _assign_quota(lam, x, cost, dom, int(cfg.u_min))
+    q, load = _assign_quota(omega, x, cost, dom, int(cfg.u_min))
     contrib = q.sum(dim=0).to(torch.int64)  # [E, R]
     stuck = torch.zeros(R, dtype=torch.bool, device=device)
 
@@ -425,15 +383,15 @@ def solve(
         # valid and need not be reconsidered.
         stuck[dom == d_star] = False
 
-    tau = int(load.max().item()) if R > 0 else 0
-    return Plan(x=x, q=q, tau=tau)
+    theta = int(load.max().item()) if R > 0 else 0
+    return Plan(x=x, q=q, theta=theta)
 
 
 def _stage01_placement(loads: Loads, topo: Topology, spec: ProblemSpec, cfg: EPLBConfig):
     """Stage 0 (per-domain demand) + Stage 1 (C6-gated cross-domain admission), shared placement init.
 
     Args:
-        loads: Dynamic load matrix ``Lambda``.
+        loads: Dynamic load matrix ``Ω``.
         topo: Cluster topology.
         spec: Static problem spec.
         cfg: Solver configuration.
@@ -501,16 +459,19 @@ def solve_bisect(
     spec: ProblemSpec,
     cfg: EPLBConfig | None = None,
 ) -> Plan:
-    """tau-bisection solver (CPU reference): Stage 0/1 then a makespan-bisection descent (a different heuristic, not bit-identical to :func:`solve`).
+    """``θ``-bisection CPU reference after Stage 0/1.
+
+    This is a different heuristic and is not bit-identical to :func:`solve`.
 
     Args:
-        loads: Dynamic load matrix ``Lambda`` (already all-gathered).
+        loads: Dynamic load matrix ``Ω`` (already all-gathered).
         topo: Cluster topology.
         spec: Static problem spec.
-        cfg: Solver configuration (uses ``cfg.tau_bisect_iters`` probe budget).
+        cfg: Solver configuration (uses ``cfg.theta_bisect_iters`` probe budget).
 
     Returns:
-        A :class:`~eplb.plan.Plan` with placement ``x``, routing quota ``q`` and makespan ``tau``.
+        A :class:`~eplb.plan.Plan` with placement ``x``, routing quota ``q``,
+        and maximum rank load ``θ``.
     """
     cfg = cfg or EPLBConfig()
     R = topo.num_ranks
@@ -522,9 +483,13 @@ def solve_bisect(
 
     if R == 0 or E == 0:
         q = torch.zeros((R, E, R), dtype=torch.int64, device=device)
-        return Plan(x=torch.zeros((E, R), dtype=torch.int8, device=device), q=q, tau=0)
+        return Plan(
+            x=torch.zeros((E, R), dtype=torch.int8, device=device),
+            q=q,
+            theta=0,
+        )
 
-    lam = loads.lam
+    omega = loads.omega
     dom_list = dom.tolist()
     x_cur, su = _stage01_placement(loads, topo, spec, cfg)
     su = su.tolist()
@@ -588,19 +553,19 @@ def solve_bisect(
             added.append((e_star, t))
             stuck = set()  # loads changed; re-evaluate every rank
 
-    # makespan-bisection descent: each step halves the gap to the even-split lower bound (O(log L) routes)
-    lo = (int(lam.sum().item()) + R - 1) // R
+    # θ-bisection descent: halve the gap to the even-split lower bound.
+    lo = (int(omega.sum().item()) + R - 1) // R
     best_x = x_cur.clone()
-    best_q, best_load = _assign_quota(lam, best_x, cost, dom, int(cfg.u_min))
-    best_tau = int(best_load.max().item())
-    for _ in range(int(cfg.tau_bisect_iters)):
-        q, load = _assign_quota(lam, x_cur, cost, dom, int(cfg.u_min))
-        tau = int(load.max().item())
-        if tau < best_tau:
-            best_tau, best_x, best_q = tau, x_cur.clone(), q
-        if tau <= lo:
+    best_q, best_load = _assign_quota(omega, best_x, cost, dom, int(cfg.u_min))
+    best_theta = int(best_load.max().item())
+    for _ in range(int(cfg.theta_bisect_iters)):
+        q, load = _assign_quota(omega, x_cur, cost, dom, int(cfg.u_min))
+        theta = int(load.max().item())
+        if theta < best_theta:
+            best_theta, best_x, best_q = theta, x_cur.clone(), q
+        if theta <= lo:
             break
-        target = (lo + tau) // 2
+        target = (lo + theta) // 2
         added = _propose(load.tolist(), q.sum(dim=0).to(torch.int64), x_cur, target)
         if not added:
             break
@@ -608,4 +573,4 @@ def solve_bisect(
             x_cur[e, t] = 1
             su[t] += 1
 
-    return Plan(x=best_x, q=best_q, tau=best_tau)
+    return Plan(x=best_x, q=best_q, theta=best_theta)

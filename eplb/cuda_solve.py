@@ -75,7 +75,7 @@ def solve_cuda(loads, topo, spec, cfg) -> Plan:
     device = loads.device
     ranks = topo.num_ranks
     experts = spec.num_experts
-    lam = loads.lam.to(torch.int64).contiguous()
+    omega = loads.omega.to(torch.int64).contiguous()
     dom = topo.domain_of_rank.to(torch.int64).contiguous()
     cost = topo.cost.to(torch.int64).contiguous()
     main_rank = spec.main_rank.to(torch.int64)
@@ -95,7 +95,7 @@ def solve_cuda(loads, topo, spec, cfg) -> Plan:
     stuck = torch.zeros(ranks, dtype=torch.uint8, device=device)
 
     backend.fast_solve(
-        lam,
+        omega,
         x,
         cost,
         dom,
@@ -112,4 +112,4 @@ def solve_cuda(loads, topo, spec, cfg) -> Plan:
         int(cfg.u_min),
         bool(cfg.allow_cross_domain),
     )
-    return Plan(x=x, q=q, tau=rank_load.max())
+    return Plan(x=x, q=q, theta=rank_load.max())

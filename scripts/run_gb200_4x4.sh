@@ -80,7 +80,7 @@ TRAIN_ITERS="${TRAIN_ITERS:-20}"
 export GPUS_PER_NODE EPLB_MODE
 
 # --- debug / profiling toggles (optional) ------------------------------------
-# EPLB_PROFILE=1 -> time the eplb/solve, eplb/all_gather_lambda and apply/* regions with
+# EPLB_PROFILE=1 -> time the eplb/solve, eplb/all_gather_omega and apply/* regions with
 # CUDA events and print a min/mean/max summary every EPLB_PROFILE_EVERY calls (default 20).
 export EPLB_PROFILE="${EPLB_PROFILE:-0}"
 export EPLB_PROFILE_EVERY="${EPLB_PROFILE_EVERY:-20}"

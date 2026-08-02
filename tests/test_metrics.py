@@ -49,14 +49,14 @@ def test_metrics_phi_token_zero_when_no_movement():
         s_tok=1, n_slot=4,
     )
     # balanced: each rank r routes only expert r's tokens to itself (its main)
-    lam = torch.zeros((R, 4), dtype=torch.int64)
+    omega = torch.zeros((R, 4), dtype=torch.int64)
     for r in range(R):
-        lam[r, r] = 100
-    loads = Loads(lam)
+        omega[r, r] = 100
+    loads = Loads(omega)
     plan = solve(loads, topo, spec, EPLBConfig())
     metrics = compute_metrics(plan, loads, topo, spec)
     assert metrics.phi_token == 0
-    assert metrics.tau == 100
+    assert metrics.theta == 100
     assert metrics.imbalance == 1.0
 
 
@@ -77,13 +77,13 @@ def test_rebalancer_single_process():
     loads = make_loads(R, 32, tokens_per_rank=2048, top_k=6, skew=1.5,
                        hotspot_ranks=0.5, seed=9)
 
-    # single-process: emulate the all-gathered Lambda directly
-    plan = reb.plan_from_lambda(loads)
+    # Single-process: emulate the all-gathered Ω directly.
+    plan = reb.plan_from_omega(loads)
     assert plan.num_replicas().sum().item() >= 32
 
-    # forward via the already-gathered Lambda path, then check backward recompute
-    res = reb.rebalance_from_lambda(loads, layer_id=3, micro_batch_id=7)
-    assert res.plan.tau >= 0
+    # Forward via the already-gathered Ω path, then check backward recompute.
+    res = reb.rebalance_from_omega(loads, layer_id=3, micro_batch_id=7)
+    assert res.plan.theta >= 0
     bwd_plan = reb.backward(layer_id=3, micro_batch_id=7)
-    assert bwd_plan.tau == res.plan.tau
+    assert bwd_plan.theta == res.plan.theta
     assert bwd_plan.equals(res.plan)

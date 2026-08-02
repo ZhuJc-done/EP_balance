@@ -1,4 +1,4 @@
-"""Determinism: the plan is a bit-identical function of Lambda (enables CPU-sync-free E3)."""
+"""The plan is a bit-identical function of Ω."""
 
 import torch
 
@@ -23,21 +23,21 @@ def test_resolve_bit_identical():
     loads = make_loads(R, 64, tokens_per_rank=4096, top_k=6, skew=1.5,
                        hotspot_ranks=0.25, seed=42)
     p1 = solve(loads, topo, spec, cfg)
-    p2 = solve(Loads(loads.lam.clone()), topo, spec, cfg)
+    p2 = solve(Loads(loads.omega.clone()), topo, spec, cfg)
     assert p1.equals(p2)
 
 
 def test_invariant_to_input_memory_layout():
-    """A value-identical but non-contiguous Lambda must yield a bit-identical plan."""
+    """A value-identical non-contiguous Ω must yield the same plan."""
     topo, spec, cfg, R = _setup()
     loads = make_loads(R, 64, tokens_per_rank=4096, top_k=6, skew=1.5,
                        hotspot_ranks=0.25, seed=123)
     base_plan = solve(loads, topo, spec, cfg)
 
     # build a value-identical but non-contiguous tensor via a transpose round-trip
-    noncontig = loads.lam.t().contiguous().t()
+    noncontig = loads.omega.t().contiguous().t()
     assert not noncontig.is_contiguous()
-    assert torch.equal(noncontig, loads.lam)
+    assert torch.equal(noncontig, loads.omega)
     alt_plan = solve(Loads(noncontig), topo, spec, cfg)
 
     assert alt_plan.equals(base_plan)
@@ -51,5 +51,5 @@ def test_repeated_solves_stable_over_many_workloads():
             loads = make_loads(R, 64, tokens_per_rank=3072, top_k=6, skew=skew,
                                hotspot_ranks=0.25, seed=seed)
             p1 = solve(loads, topo, spec, cfg)
-            p2 = solve(Loads(loads.lam.clone()), topo, spec, cfg)
+            p2 = solve(Loads(loads.omega.clone()), topo, spec, cfg)
             assert p1.equals(p2), f"non-deterministic at seed={seed} skew={skew}"

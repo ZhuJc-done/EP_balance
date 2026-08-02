@@ -46,6 +46,22 @@ def all_to_all_single(
     return _AllToAllSingle.apply(inp, out_splits, in_splits, group)
 
 
+def a2a_raw(
+    inp: torch.Tensor,
+    out_splits: List[int],
+    in_splits: List[int],
+    group=None,
+) -> torch.Tensor:
+    """Non-differentiable all-to-all, for callers that schedule the transpose leg themselves.
+
+    Same collective as :func:`all_to_all_single` without the autograd node, so a hand-written backward
+    can place it on a stream of its choosing instead of inheriting the one autograd replays on.
+    """
+    out = inp.new_empty([int(sum(out_splits)), *inp.shape[1:]])
+    dist.all_to_all_single(out, inp.contiguous(), out_splits, in_splits, group=group)
+    return out
+
+
 class _BroadcastFromRoot(torch.autograd.Function):
     """Broadcast a tensor from ``root``; backward sum-reduces grads from all ranks back to ``root``."""
 

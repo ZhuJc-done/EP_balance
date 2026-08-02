@@ -19,7 +19,7 @@ touching model quality** (no balance-loss / capacity caps), via three ideas:
    A cross-domain replica is created only when its one-time weight move (counted
    ×2 for the gradient return in training) beats repeatedly shipping that
    domain's tokens.
-3. **No CPU sync.** One all-gather of the integer load matrix `Λ`, then every
+3. **No CPU sync.** One all-gather of the integer load matrix `Ω`, then every
    rank solves locally and **bit-identically** on-device. No broadcast, no CPU
    decision.
 
@@ -80,19 +80,13 @@ pytest -q
 ```bash
 # Benchmark the CUDA solver (defaults to 32 nodes x 8 GPUs, 640 experts)
 python tests/test_gpu_solver.py --nodes 4 --gpus-per-node 8 --experts 640
-
-# Force the CUDA backend explicitly (raises if the inputs are not on CUDA)
-export EPLB_SOLVER_BACKEND=cuda
 ```
-
-The CUDA extension is compiled and cached on first use; JIT build time is
-reported separately and is not part of steady-state solver latency.
 
 Example `run_sim` output (imbalance 8.9× → 2.2×):
 
 ```
-Baseline (no replication):  tau=  218957  imbalance= 8.909
-Scale-EPLB plan          :  tau=   53988  imbalance= 2.197
-Makespan reduction       :   4.056x
+Baseline (no replication):  theta=  218957  imbalance= 8.909
+Scale-EPLB plan          :  theta=   53988  imbalance= 2.197
+Theta reduction          :   4.056x
 Constraints C1-C7: OK
 ```

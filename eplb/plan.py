@@ -9,11 +9,11 @@ import torch
 
 @dataclass
 class Plan:
-    """Solver output (placement, routing quota, makespan)."""
+    """Solver output: placement ``X``, routing quota ``Q``, and max load ``θ``."""
 
     x: torch.Tensor  # int8 [E, R] placement table (1 = instance present)
     q: torch.Tensor  # int64 [R, E, R] routing quota q[src, e, dst]
-    tau: int | torch.Tensor  # per-rank makespan (kept as a 0-dim device tensor on the sync-free GPU path)
+    theta: int | torch.Tensor  # max rank load; 0-dim device tensor on the sync-free GPU path
 
     @property
     def num_experts(self) -> int:
@@ -56,9 +56,9 @@ class Plan:
         return out
 
     def equals(self, other: "Plan") -> bool:
-        """Bit-identical comparison (used by determinism tests); coerces tau to int (lazy host sync)."""
+        """Bit-identical comparison; coercing ``θ`` to int causes a lazy host sync."""
         return (
-            int(self.tau) == int(other.tau)
+            int(self.theta) == int(other.theta)
             and torch.equal(self.x, other.x)
             and torch.equal(self.q, other.q)
         )

@@ -428,7 +428,52 @@ __global__ void GinGetKernelMultiBlock(ncclWindow_t remoteWin, size_t remoteOffs
 // descriptor's payload across nblk blocks (matching the single-transfer multiblock path).
 // Descriptors with peer < 0 are skipped on device, so empty / local slots need no host
 // branch. Offsets are window-relative bytes; *Base folds in any view/data_ptr delta.
+//
+// Transport is chosen per descriptor. GIN is the network path (InfiniBand / RoCE); peers
+// inside this rank's LSA team are reachable by plain load/store over NVLink through the same
+// window registration, which is one collective registration covering both -- ncclGinRegister
+// for the RDMA side, cuMemMap + cuMemSetAccess for the LSA side. Routing an intra-node peer
+// through gin.put() would send it out to the NIC and back, so those descriptors take the
+// load/store path instead, the same split NCCL's own hybrid all-to-all example makes.
 // ---------------------------------------------------------------------------
+
+// True when `peer` (a world rank of the GIN communicator) sits in this rank's LSA team, i.e. its
+// memory is mapped into our address space. Asks NCCL's team arithmetic rather than testing the
+// window [rank - lsaRank, ...): `ncclTeam` carries a stride, and under a rank ordering that
+// interleaves nodes a contiguity test would call a genuinely remote peer load/store reachable and
+// hand the copy a pointer into nothing.
+__device__ __forceinline__ bool peer_is_lsa(const ncclDevComm& devComm, int peer) {
+  return devComm.lsaSize > 1 &&
+         ncclTeamRankIsMember(ncclTeamLsa(devComm), ncclTeamWorld(devComm), peer);
+}
+
+// Block-cooperative copy between two locally addressable pointers (one of which is a peer's
+// mapped window). 16B vector path when both ends and the length allow it, bytes otherwise.
+__device__ __forceinline__ void lsa_copy_bytes(char* __restrict__ dst,
+                                               const char* __restrict__ src,
+                                               size_t numBytes) {
+  const uintptr_t mask = (reinterpret_cast<uintptr_t>(dst) |
+                          reinterpret_cast<uintptr_t>(src) | (uintptr_t)numBytes);
+  const unsigned tid = threadIdx.x, nthr = blockDim.x;
+  if ((mask & 0xF) == 0) {
+    int4* d4 = reinterpret_cast<int4*>(dst);
+    const int4* s4 = reinterpret_cast<const int4*>(src);
+    for (size_t i = tid; i < (numBytes >> 4); i += nthr) d4[i] = s4[i];
+  } else {
+    for (size_t i = tid; i < numBytes; i += nthr) dst[i] = src[i];
+  }
+}
+
+// 16B-aligned variant of block_subrange, so the LSA sub-ranges keep the vector path.
+// Any trailing bytes below one unit are handed to the last sub-block.
+__device__ __forceinline__ void block_subrange_16b(size_t numBytes, size_t* off, size_t* size) {
+  const size_t nsub = gridDim.y, sub = blockIdx.y;
+  const size_t units = numBytes >> 4;
+  const size_t chunk = units / nsub, rem = units % nsub;
+  *off = (chunk * sub + min(sub, rem)) << 4;
+  *size = (chunk + (sub < rem ? 1 : 0)) << 4;
+  if (sub == nsub - 1) *size += numBytes & 0xF;
+}
 __device__ __forceinline__ void gin_get_range(const ncclDevComm& devComm, int peer,
                                                ncclWindow_t rWin, size_t rOff,
                                                ncclWindow_t lWin, size_t lOff,
@@ -497,16 +542,28 @@ __global__ void GinGetBatchedKernel(ncclWindow_t remoteWin, size_t remoteBase,
                                     ncclWindow_t localWin, size_t localBase,
                                     const int64_t* remoteOff, const int64_t* localOff,
                                     const int64_t* nbytes, const int* peers,
-                                    int K, struct ncclDevComm devComm) {
+                                    int K, int useLsa, struct ncclDevComm devComm) {
   const int k = blockIdx.x;
   if (k >= K) return;
   const int peer = peers[k];
   if (peer < 0) return;                       // empty / local slot: nothing to fetch
   const size_t total = (size_t)nbytes[k];
   if (total == 0) return;
+  const bool lsa = useLsa && peer_is_lsa(devComm, peer);
   size_t bOff, bSize;
-  block_subrange(total, &bOff, &bSize);
+  if (lsa) block_subrange_16b(total, &bOff, &bSize);
+  else block_subrange(total, &bOff, &bSize);
   if (bSize == 0) return;
+  if (lsa) {
+    // peer's window is mapped here: read it over NVLink instead of pulling it through the NIC.
+    // `peer` is a world rank, so name the team -- the two-argument overload's rank space is not
+    // visible in the headers, and on a single-node run the spaces coincide and hide a mix-up.
+    const char* src = (const char*)ncclGetPeerPointer(
+        remoteWin, remoteBase + (size_t)remoteOff[k] + bOff, ncclTeamWorld(devComm), peer);
+    char* dst = (char*)ncclGetLocalPointer(localWin, localBase + (size_t)localOff[k] + bOff);
+    lsa_copy_bytes(dst, src, bSize);
+    return;
+  }
   gin_get_range(devComm, peer,
                 remoteWin, remoteBase + (size_t)remoteOff[k] + bOff,
                 localWin, localBase + (size_t)localOff[k] + bOff,
@@ -517,20 +574,50 @@ __global__ void GinPutBatchedKernel(ncclWindow_t srcWin, size_t srcBase,
                                     ncclWindow_t dstWin, size_t dstBase,
                                     const int64_t* srcOff, const int64_t* dstOff,
                                     const int64_t* nbytes, const int* peers,
-                                    int K, struct ncclDevComm devComm) {
+                                    int K, int useLsa, struct ncclDevComm devComm) {
   const int k = blockIdx.x;
   if (k >= K) return;
   const int peer = peers[k];
   if (peer < 0) return;                       // empty / local slot: no remote push
   const size_t total = (size_t)nbytes[k];
   if (total == 0) return;
+  const bool lsa = useLsa && peer_is_lsa(devComm, peer);
   size_t bOff, bSize;
-  block_subrange(total, &bOff, &bSize);
+  if (lsa) block_subrange_16b(total, &bOff, &bSize);
+  else block_subrange(total, &bOff, &bSize);
   if (bSize == 0) return;
+  if (lsa) {
+    char* dst = (char*)ncclGetPeerPointer(
+        dstWin, dstBase + (size_t)dstOff[k] + bOff, ncclTeamWorld(devComm), peer);
+    const char* src = (const char*)ncclGetLocalPointer(
+        srcWin, srcBase + (size_t)srcOff[k] + bOff);
+    lsa_copy_bytes(dst, src, bSize);
+    // These stores land in another device's memory over the fabric, where completing the
+    // kernel is not by itself enough to make them visible. The caller's fence orders the
+    // ranks; this makes sure there is nothing left in flight when it runs.
+    __threadfence_system();
+    return;
+  }
   gin_put_range(devComm, peer,
                 srcWin, srcBase + (size_t)srcOff[k] + bOff,
                 dstWin, dstBase + (size_t)dstOff[k] + bOff,
                 bSize);
+}
+
+// ---------------------------------------------------------------------------
+// World fence
+//
+// ncclSignal posts to a GIN connection, and connections only exist for peers this rank reaches
+// over the network -- signalling a same-node peer fails outright, so a signal/wait mesh cannot
+// order an EP group that lives inside one node. The barrier session splits the same way the
+// transfers above do: an LSA barrier across the node, a GIN rail barrier across nodes, composed
+// with release/acquire so it orders every peer whatever the topology. Both halves are provisioned
+// by `barrierCount` at devComm creation.
+// ---------------------------------------------------------------------------
+__global__ void WorldFenceKernel(uint32_t index, struct ncclDevComm devComm) {
+  ncclGin gin{devComm, 0};
+  ncclBarrierSession<ncclCoopCta> bar{ncclCoopCta(), ncclTeamTagWorld{}, gin, index};
+  bar.sync(ncclCoopCta(), cuda::memory_order_seq_cst, ncclGinFenceLevel::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -626,6 +713,10 @@ py::dict get_comm_properties() {
   py::dict out;
   out["rank"] = props.rank;
   out["nRanks"] = props.nRanks;
+  // LSA team = the peers whose windows are mapped here (NVLink / P2P). Size 1 means no peer is
+  // load/store reachable, so every transfer takes the network path.
+  out["lsaRank"] = g_state.hasDevComm ? g_state.devComm.lsaRank : 0;
+  out["lsaSize"] = g_state.hasDevComm ? g_state.devComm.lsaSize : 1;
   out["cudaDev"] = props.cudaDev;
   out["nvmlDev"] = props.nvmlDev;
   out["deviceApiSupport"] = props.deviceApiSupport;
@@ -860,7 +951,7 @@ static void check_desc(const torch::Tensor& t, torch::ScalarType st, int64_t K,
 void get_batched(torch::Tensor remote_buffer, torch::Tensor local_buffer,
                  torch::Tensor remote_off, torch::Tensor local_off,
                  torch::Tensor nbytes, torch::Tensor peers, int64_t K,
-                 int64_t blocks_per_desc,
+                 int64_t blocks_per_desc, bool use_lsa,
                  c10::optional<c10::cuda::CUDAStream> stream_opt) {
   if (!g_state.initialized)
     throw std::runtime_error("nccl_gin not initialized");
@@ -887,13 +978,13 @@ void get_batched(torch::Tensor remote_buffer, torch::Tensor local_buffer,
       remoteWin, remoteBase, localWin, localBase,
       remote_off.data_ptr<int64_t>(), local_off.data_ptr<int64_t>(),
       nbytes.data_ptr<int64_t>(), peers.data_ptr<int>(),
-      (int)K, g_state.devComm);
+      (int)K, use_lsa ? 1 : 0, g_state.devComm);
 }
 
 void put_batched(torch::Tensor src_buffer, torch::Tensor dst_buffer,
                  torch::Tensor src_off, torch::Tensor dst_off,
                  torch::Tensor nbytes, torch::Tensor peers, int64_t K,
-                 int64_t blocks_per_desc,
+                 int64_t blocks_per_desc, bool use_lsa,
                  c10::optional<c10::cuda::CUDAStream> stream_opt) {
   if (!g_state.initialized)
     throw std::runtime_error("nccl_gin not initialized");
@@ -920,7 +1011,7 @@ void put_batched(torch::Tensor src_buffer, torch::Tensor dst_buffer,
       srcWin, srcBase, dstWin, dstBase,
       src_off.data_ptr<int64_t>(), dst_off.data_ptr<int64_t>(),
       nbytes.data_ptr<int64_t>(), peers.data_ptr<int>(),
-      (int)K, g_state.devComm);
+      (int)K, use_lsa ? 1 : 0, g_state.devComm);
 }
 
 void put_signal(torch::Tensor src_buffer, torch::Tensor dst_buffer,
@@ -958,6 +1049,21 @@ void signal(int peer, int sig_idx, int ctx,
                                  : at::cuda::getCurrentCUDAStream().stream();
 
   NCCL_CHECK(ncclSignal(peer, sig_idx, ctx, 0, g_state.comm, cuda_stream));
+}
+
+void world_fence(int64_t index, c10::optional<c10::cuda::CUDAStream> stream_opt) {
+  if (!g_state.initialized)
+    throw std::runtime_error("nccl_gin not initialized");
+  if (!g_state.hasDevComm)
+    throw std::runtime_error("nccl_gin has no devComm");
+
+  cudaStream_t cuda_stream = stream_opt.has_value()
+                                 ? stream_opt->stream()
+                                 : at::cuda::getCurrentCUDAStream().stream();
+
+  WorldFenceKernel<<<1, 128, 0, cuda_stream>>>(
+      (uint32_t)(index % BARRIER_COUNT), g_state.devComm);
+  CUDA_CHECK(cudaGetLastError());
 }
 
 void wait_signal(int peer, int sig_idx, int op_cnt, int ctx,
@@ -1063,18 +1169,22 @@ PYBIND11_MODULE(_nccl_gin_C, m) {
         py::arg("grid_size") = 1,
         py::arg("stream") = py::none());
   m.def("get_batched", &get_batched,
-        "Batched P2P get: K (peer, offset, size) descriptors resident on device",
+        "Batched P2P get: K (peer, offset, size) descriptors resident on device; "
+        "LSA-team peers are read over NVLink, the rest over GIN",
         py::arg("remote_buffer"), py::arg("local_buffer"),
         py::arg("remote_off"), py::arg("local_off"),
         py::arg("nbytes"), py::arg("peers"), py::arg("k"),
         py::arg("blocks_per_desc") = 1,
+        py::arg("use_lsa") = true,
         py::arg("stream") = py::none());
   m.def("put_batched", &put_batched,
-        "Batched P2P put: K (peer, offset, size) descriptors resident on device",
+        "Batched P2P put: K (peer, offset, size) descriptors resident on device; "
+        "LSA-team peers are written over NVLink, the rest over GIN",
         py::arg("src_buffer"), py::arg("dst_buffer"),
         py::arg("src_off"), py::arg("dst_off"),
         py::arg("nbytes"), py::arg("peers"), py::arg("k"),
         py::arg("blocks_per_desc") = 1,
+        py::arg("use_lsa") = true,
         py::arg("stream") = py::none());
   m.def("put_signal", &put_signal,
         "P2P put via host-side ncclPutSignal",
@@ -1088,6 +1198,10 @@ PYBIND11_MODULE(_nccl_gin_C, m) {
         "Send a host-side ncclSignal without payload",
         py::arg("peer"), py::arg("sig_idx") = 0,
         py::arg("ctx") = 0,
+        py::arg("stream") = py::none());
+  m.def("world_fence", &world_fence,
+        "Stream-ordered barrier over all ranks (LSA barrier inside the node, GIN rail across)",
+        py::arg("index") = 0,
         py::arg("stream") = py::none());
   m.def("wait_signal", &wait_signal,
         "Wait for signal from peer",

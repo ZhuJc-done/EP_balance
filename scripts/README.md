@@ -37,10 +37,10 @@ MEGATRON_DIR=/path/to/Megatron-LM EPLB_DIR=/path/to/EP_balance \
 Expected per-forward log on rank 0:
 
 ```
-[EPLB] layer=0 mb=0 tau=12458 imbalance=1.014 replicas=75 phi_token=86075
+[EPLB] layer=0 mb=0 theta=12458 imbalance=1.014 replicas=75 phi_token=86075
 ```
 
-`imbalance` is `tau / mean_load`: the makespan the solved plan achieves, over the ideal
+`imbalance` is `theta / mean_load`: the maximum rank load over the ideal
 perfectly-even load. It is the **residual** imbalance *after* rebalancing, so `1.0` means the
 plan is perfect and low values are the solver working, **not** evidence that the input was
 uniform. It says nothing on its own about how skewed the routing was — for that, compare
@@ -49,7 +49,7 @@ captured trace through the baselines below.
 
 ### Capture a routing trace for the baseline comparison
 
-Set `EPLB_TRACE_OUT` in observe mode to dump the real gathered `Lambda[R, E]`
+Set `EPLB_TRACE_OUT` in observe mode to dump the real gathered `Ω[R, E]`
 per (layer, micro-batch); rank 0 writes a self-describing file (topology, `main(e)`
 placement, weight bytes, `s_tok`, `n_slot`). Replay it through **every** load
 balancer (Scale-EPLB, DeepSeek EPLB, FasterMoE, FlexMoE, LPLB) offline:
@@ -78,7 +78,7 @@ and an undisturbed end-to-end step time can come from the same job.
 | Region | Covers |
 |---|---|
 | `solve` | the placement + quota solver (CUDA kernel) |
-| `all_gather_lambda` | the single `Lambda[R,E]` all-gather |
+| `all_gather_omega` | the single `Ω[R,E]` all-gather |
 | `apply/route` | router, plus flattening top-k selections into routing units |
 | `apply/dispatch` | Stage 2 token all-to-all |
 | `apply/expert_compute` | Stage 4 replica materialisation + batched expert MLP |
@@ -110,6 +110,49 @@ the launcher fails fast with an explicit error. Under Level A (`EPLB_REMATERIALI
 the `apply/weight_move` count includes the backward recompute — that doubling is exactly
 what re-materialisation trades for memory.
 
+### Apply-mode memory: what actually allocates
+
+Two per-layer buffers, both live across forward→backward, and the small one is not the problem:
+
+| Buffer | Size | Qwen3-30B-A3B, EP=8, seq 4096 |
+|---|---|---|
+| `w_stacked` (per-slot expert weights) | `n_slot x \|W_e\|` | 297 MB |
+| `x_pad` + its activations (dense grouped-GEMM batch) | `n_slot x cap x H` | **~12.7 GB** |
+
+There is **no persistent or symmetric buffer**: `w_stacked` is a fresh
+`[n_slot+1, *weight_shape]` allocated on every layer's forward, and *all* slots are copied into
+it — the rank's own mains as well as the replicas — because the grouped GEMM needs one contiguous
+stack. So even `EPLB_N_SLOT = num_experts/EP` (no replication headroom at all) still costs one
+full duplicate of the layer's expert weights.
+
+The dominant term is `cap`, the per-slot capacity that `grouped_expert_mlp` pads its dense
+`[n_slot, cap, H]` batch to. `cap` is derived from `group_sizes.max()` — the exact per-slot token
+count under the solved plan — which keeps the padded batch close to the real token count. Because
+it is derived from the plan, **a better-balanced plan is also a cheaper one**. `EPLB_CAP=<int>`
+overrides it (and is required under `EPLB_DEEPEP_STATIC`, which needs `cap` before dispatch);
+setting it *below* the true per-slot max silently drops tokens, so only raise it.
+
+If apply mode still OOMs, in order of effect:
+
+```bash
+EPLB_REMATERIALIZE=1   # dist.broadcast path only: checkpoints the replication + expert GEMM so
+                       # backward re-broadcasts instead of holding the stack. The GIN path never
+                       # holds it, so this knob does not apply there.
+EPLB_N_SLOT=16         # = num_experts/EP: no replica headroom, halves both buffers. Also removes
+                       # the balancing freedom, so use it to isolate memory, not to benchmark.
+SEQ_LEN=2048           # cap scales with tokens per rank, so this halves the padded batch too.
+```
+
+The GIN path keeps no replica weights across forward→backward: backward re-acquires them with a
+second `get_batched` off the schedule cached at plan time, so the routing is never re-derived and
+the resident cost is one layer's slots rather than `n_layers x n_slot x |W_e|` (~14 GB for a
+48-layer Qwen3-30B-A3B at EP=8). Carrying them instead is not an option the window supports: it is
+a single buffer that every layer recycles and the backward's gradient staging overwrites, so its
+contents would have to be copied into ordinary memory and pinned there by autograd.
+
+`--recompute-granularity selective --recompute-modules core_attn` only touches attention and does
+nothing for the MoE path — it will not fix an apply-mode OOM.
+
 ### Reading the trace in Perfetto
 
 `PROFILE_TRACE=1` turns on Megatron's PyTorch profiler; the region labels above are emitted as
@@ -131,7 +174,7 @@ named only by rank, so two runs sharing a `PROFILE_DIR` overwrite each other.
 
 Only the `apply` trace shows the EP path Scale-EPLB replaces (`apply/dispatch`,
 `apply/expert_compute`, `apply/combine`, `apply/weight_move`). An `observe` trace has just
-`eplb/solve` and `eplb/all_gather_lambda` laid over Megatron's own dispatcher, which is the
+`eplb/solve` and `eplb/all_gather_omega` laid over Megatron's own dispatcher, which is the
 right picture for costing the solver but not for the end-to-end breakdown.
 
 Keep the window short (2–3 steps) and start it past step ~5: the first iterations pay CUDA-solver
@@ -214,6 +257,142 @@ MEGATRON_DIR=/path/to/Megatron-LM EPLB_DIR=/path/to/EP_balance \
 Trains normally (loss should decrease) with EPLB rebalancing each micro-batch.
 Full cluster (4 nodes x 4 GPUs): set `NNODES=4` and per-node `NODE_RANK`,
 `MASTER_ADDR`, `MASTER_PORT`; `EP_SIZE` defaults to the world size.
+
+### Apply-mode backends: DeepEP tokens + GIN weights
+
+Apply mode moves two independent things across ranks, and they use different backends:
+
+* **Tokens** — dispatch and combine, i.e. the routing traffic. `EPLB_ADAPTER=deepep` puts this on
+  DeepEP. (`DEEPEP=1` is a different knob: it configures *Megatron's* flex dispatcher, which apply
+  mode replaces outright, so it does nothing here.)
+* **Expert weights and their gradients** — forward pulls each replica slot from `main(e)`
+  (`nccl_gin.get_batched`), backward pushes replica grads back to `main(e)`'s scratch column
+  (`nccl_gin.put_batched`) where the owner sums them. Both directions are the in-tree
+  `nccl_gin/` backend over NCCL symmetric memory, selected by `EPLB_WEIGHT_COMM=gin`. DeepEP is
+  not involved in either.
+
+| Knob | Default | Device-initiated setting |
+|---|---|---|
+| `EPLB_ADAPTER` | `alltoall` | `deepep` — token dispatch/combine |
+| `EPLB_WEIGHT_COMM` | host-driven `dist.broadcast` | `gin` — replica weight pull + grad reduce-to-main |
+| `EPLB_GIN_FENCE` | `barrier` (host, not stream-ordered) | `signal` — device-stream, capture-safe |
+| `EPLB_GIN_LSA` | `1` — intra-node peers over NVLink | `0` forces everything onto the network (A/B only) |
+| `EPLB_CAP` | derived from the plan (one scalar D2H) | pin it to remove that read |
+| `EPLB_DEEPEP_STATIC` | `0` | `1` statically sizes the DeepEP recv buffer; **requires** `EPLB_CAP` |
+
+```bash
+EPLB_MODE=apply EPLB_ADAPTER=deepep EPLB_WEIGHT_COMM=gin \
+EPLB_GIN_FENCE=signal EPLB_CAP=<int> \
+  ... bash scripts/run_real_moe.sh
+```
+
+Selecting `gin` is enough — it always takes the re-pull path, so `EPLB_OVERLAP` is only meaningful
+for the `dist.broadcast` transport.
+
+### Which wire each replica transfer takes
+
+One `ncclCommWindowRegister` maps the symmetric buffers for both transports at once: `ncclGinRegister`
+for the network side, `cuMemMap` + `cuMemSetAccess` for peers whose memory is load/store reachable
+(the LSA team, i.e. NVLink or PCIe P2P inside the node). The batched kernels pick per descriptor —
+LSA-team peers are read and written with vector load/store, everyone else through GIN's RDMA — so
+with the expert-parallel group inside one node the weight channel never reaches the NIC. Rank 0
+prints the split at startup:
+
+```
+[eplb-gin] world=8 lsa_team=8 lsa_path=on -> up to 7 of 7 peers over NVLink, the rest over GIN
+```
+
+`lsa_team=1` means no peer is mapped and everything is going over the network; check P2P
+availability before reading any weight-channel timing.
+
+**Set `EPLB_GIN_FENCE=signal` for real runs.** The backward re-pull is started by a pre-hook on the
+MoE block's output, so it is in flight across the scatter backward, the reverse combine all-to-all
+and the Wgrad of GEMM-2 before Dgrad needs it. The default `dist.barrier` fence throws that away:
+it is host-blocking, so hoisting the pull earlier only moves the CPU stall earlier. The signal fence
+is enqueued on the weight stream and leaves the window intact. It is a barrier session rather than a
+mesh of `ncclSignal`s, for the same reason the transfers split: a signal needs a GIN connection and
+there is none to a peer inside the node, so the mesh form fails outright on a single-node EP group.
+
+### NCCL build
+
+GIN needs NCCL >= 2.29 with `ginType != NONE`, which is not what PyTorch bundles (2.27 at the time of
+writing). The extension compiles against `$NCCL_HOME` but at runtime resolves `libnccl.so.2` to
+whichever copy was loaded first, so without a preload it silently calls into PyTorch's older library
+and `ncclCommQueryProperties` fails with `invalid argument`:
+
+```bash
+export LD_PRELOAD=$NCCL_HOME/lib/libnccl.so.2
+```
+
+DeepEP additionally compares the loaded `libnccl.so` byte-for-byte against the one under its NCCL
+root, and by default that root is the `nvidia-nccl` wheel -- whose build usually reports
+`ginType=NONE`. Point it at the GIN-capable copy instead and both backends share one library:
+
+```bash
+export EP_NCCL_ROOT_DIR=$NCCL_HOME          # what DeepEP compares against
+export LD_PRELOAD=$NCCL_HOME/lib/libnccl.so.2
+```
+
+Without the first line `EPLB_ADAPTER=deepep EPLB_WEIGHT_COMM=gin` aborts at import with
+`Invalid NCCL versions`; without the second, GIN init reports `ginType=NONE`.
+
+`EPLB_CHUNKS=2` composes with all of the above. It splits this rank's routing units in two and
+pipelines them across a compute and a comm stream, so `dispatch(c2)` hides behind `compute(c1)` and
+`combine(c1)` behind `compute(c2)`, leaving only the first dispatch and last combine exposed. It is
+a purely token-side split: the replica weights are acquired once per layer and shared by every
+chunk, in both directions, so the chunk count does not appear in the weight traffic or in the
+weight channel's collective schedule.
+
+The chunked pipeline is one autograd node whose backward is written out by hand
+(`eplb/integration/manual_block.py`); `EPLB_MANUAL_BWD=0` hands the ordering back to autograd. The two
+are numerically identical and both are covered by the same reference tests — what the hand-written
+schedule buys is two placements autograd cannot express:
+
+| | autograd | hand-scheduled |
+|---|---|---|
+| forward weight pull | exposed before the first dispatch | on the weight stream, hidden behind `dispatch(c1)` |
+| Dgrad vs Wgrad in a chunk | fused in one node, Wgrad first (it needs no weight) | Dgrad first, `dispatch⁻¹(k)` issued between the two, Wgrad under that transfer |
+| backward reduce-to-main | last in the layer because autograd puts it there — it is the node nearest the parameters, so every chunk's Wgrad must reach it first | last in the layer because it is the one transfer nothing in the layer waits on |
+
+Only Dgrad is on anyone's critical path: it produces `grad_x`, which the token channel carries back to
+the token owners. The Wgrads feed the parameter reduction alone, so issuing `dispatch⁻¹(k)` between the
+two halves gets the transfer out a Wgrad earlier and gives the Wgrads something to hide under. What
+this gives up is the cushion for a late weight pull — Wgrad-first needs no weight and could absorb one
+— which is why the pull is prefetched from the block output rather than from the expert backward.
+
+The reduce overlap is real only when the weight channel has its own transport: `dist.reduce` shares
+the token all-to-alls' NCCL communicator, and NCCL serialises same-communicator work whatever stream
+it was enqueued on, so under the broadcast transport the reordering is host-side only. Under `gin` the
+reduction is device-initiated on a separate channel and genuinely runs concurrently.
+
+Ordering is invisible in gradients — every schedule produces the same numbers — so it is pinned
+directly by `test_sync_free_two_chunk_backward_issue_order`, which asserts the sequence
+`combine⁻¹(c1), combine⁻¹(c2), dispatch⁻¹(c1), dispatch⁻¹(c2), reduce`.
+
+Pin `EPLB_CAP` when `EPLB_WEIGHT_COMM=gin`. The cap is a *token/compute-side* quantity — it sizes
+`grouped_expert_mlp`'s padded `[n_slot, cap, H]` batch and DeepEP's static recv buffer — and has
+nothing to do with the weight channel. It only becomes visible here because the broadcast path
+already pays a control-plane D2H (`dist.broadcast` needs a host-side `src`) that the cap rides
+along in for free, whereas GIN's schedule is fully device-resident, so deriving the cap becomes
+the one standalone host read left in that block. The launcher prints a note when it is unset.
+Size it from a run's per-slot max and only ever raise it: pinning it *below* the true max
+silently drops tokens.
+
+**Validate the combination before spending cluster hours on it.** The CPU suite pins
+`AllToAllAdapter` over gloo, so neither backend is exercised there. On the target cluster:
+
+```bash
+EPLB_WEIGHT_COMM=gin RUN_GIN_TESTS=1 pytest -s tests/test_gin_weights.py
+```
+
+This checks outputs and `main(e)` gradients against a single-device reference for GIN alone, for
+the GIN rematerialise/overlap path, and for DeepEP tokens combined with GIN weights. The two
+backends never talk to each other, but they agree on slot *ordering* — tokens arrive grouped by
+physical slot and the weight stack is indexed by that same slot — so a disagreement between them
+produces silently wrong numbers rather than a crash, which is why the combination is worth its own
+case. The DeepEP case runs in bf16 on purpose: DeepEP's kernels only move 16B-aligned bf16/fp16
+rows and fall back to `all_to_all_single` for anything else, so an fp32 run would pass without
+entering DeepEP at all.
 
 ## Multi-node 4 x GB200 (4 nodes x 4 GPUs = 16 ranks)
 

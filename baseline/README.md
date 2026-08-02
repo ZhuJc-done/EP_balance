@@ -45,7 +45,7 @@ which is compatible with LPLB's 8-rank/two-edge cube topology.
 Instead of the synthetic Zipf workload, every baseline can be scored on the
 *real* per-(layer, micro-batch) routing captured during Megatron training. Run
 observe mode (Phase B) with `EPLB_TRACE_OUT` set to dump the gathered
-`Lambda[R, E]` matrices, then replay that file through the harness:
+`Ω[R, E]` matrices, then replay that file through the harness:
 
 ```bash
 # 1) capture the real trace during training (rank 0 writes the file)
@@ -70,7 +70,7 @@ re-pass `--nodes`, `--experts`, `--n-slot`, etc. Extra knobs:
 
 In `--trace` mode each strategy replans per sample from **that** sample's load
 (so DeepSeek/LPLB use the current batch as their own placement history), and the
-CLI prints per-strategy `solve_ms(mean)`, `tau(mean)`, and `imbalance(mean/p90)`
+CLI prints per-strategy `solve_ms(mean)`, `theta(mean)`, and `imbalance(mean/p90)`
 aggregated over all replayed samples. The same `quality=` caveats below apply.
 
 ## Interpreting timings
@@ -117,7 +117,7 @@ The algorithms do not expose identical outputs:
   is reconstructed from those ratios.
 
 Quality values must be read together with the printed `quality=` label. Do not
-treat the three `quality_tau` values as identical end-to-end dispatch
+treat the three `quality_theta` values as identical end-to-end dispatch
 measurements. Scale-EPLB may also use fewer than all available slots, while
 DeepSeek EPLB and the configured LPLB topology consume the fixed physical
 replica budget.

@@ -56,16 +56,16 @@ def test_gpu_solver_matches_reference_quality(skew, nodes, gpus, experts, n_slot
     # valid, route-conserving plan within a generous makespan tolerance.
     report = check_constraints(plan_gpu, loads_gpu, topo_gpu, spec_gpu, cfg)
     assert report.ok, report.violations
-    assert int(plan_gpu.q.sum()) == int(loads_gpu.lam.sum())
-    tau_cpu, tau_gpu = int(plan_cpu.tau), int(plan_gpu.tau)
-    assert tau_gpu <= tau_cpu * 1.25 + 1, (
-        f"CUDA makespan {tau_gpu} exceeds reference {tau_cpu} beyond tolerance"
+    assert int(plan_gpu.q.sum()) == int(loads_gpu.omega.sum())
+    theta_cpu, theta_gpu = int(plan_cpu.theta), int(plan_gpu.theta)
+    assert theta_gpu <= theta_cpu * 1.25 + 1, (
+        f"CUDA theta {theta_gpu} exceeds reference {theta_cpu} beyond tolerance"
     )
 
 
 @pytest.mark.parametrize("u_min", [1, 2, 4])
 def test_gpu_incremental_transfer_respects_quota_floor(u_min):
-    lam = torch.tensor([[16, 8], [8, 16], [12, 12]], dtype=torch.int64)
+    omega = torch.tensor([[16, 8], [8, 16], [12, 12]], dtype=torch.int64)
     cfg = EPLBConfig(u_min=u_min, max_stage2_iters=8)
 
     topo_gpu = Topology.from_nvlink_rdma(1, 3, device="cuda")
@@ -76,7 +76,7 @@ def test_gpu_incremental_transfer_respects_quota_floor(u_min):
         1,
         2,
     )
-    loads_gpu = Loads(lam.cuda())
+    loads_gpu = Loads(omega.cuda())
     plan_gpu = solve(loads_gpu, topo_gpu, spec_gpu, cfg)
 
     nonzero = plan_gpu.q[plan_gpu.q > 0]
@@ -87,7 +87,7 @@ def test_gpu_incremental_transfer_respects_quota_floor(u_min):
 
 def test_default_gpu_solver_has_no_host_sync_after_warmup():
     dev = torch.device("cuda")
-    lam = torch.tensor([[11], [0]], dtype=torch.int64, device=dev)
+    omega = torch.tensor([[11], [0]], dtype=torch.int64, device=dev)
     topo = Topology.from_nvlink_rdma(1, 2, device=dev)
     spec = ProblemSpec(
         1,
@@ -99,19 +99,19 @@ def test_default_gpu_solver_has_no_host_sync_after_warmup():
     cfg = EPLBConfig(max_stage2_iters=8)
 
     # Compile first; sync-debug then guards the steady-state solve path.
-    solve(Loads(lam), topo, spec, cfg, validate=False)
+    solve(Loads(omega), topo, spec, cfg, validate=False)
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        plan = solve(Loads(lam), topo, spec, cfg, validate=False)
+        plan = solve(Loads(omega), topo, spec, cfg, validate=False)
     finally:
         torch.cuda.set_sync_debug_mode("default")
 
-    assert plan.tau.is_cuda
+    assert plan.theta.is_cuda
 
 
 def test_gpu_floor_aware_cross_domain_fallback():
-    lam = torch.tensor([[20], [10], [6]], dtype=torch.int64)
+    omega = torch.tensor([[20], [10], [6]], dtype=torch.int64)
     dom = torch.tensor([0, 1, 2], dtype=torch.int64)
     cost = torch.ones((3, 3), dtype=torch.int64)
     cost.fill_diagonal_(0)
@@ -125,7 +125,7 @@ def test_gpu_floor_aware_cross_domain_fallback():
         s_tok=1,
         n_slot=1,
     )
-    loads_gpu = Loads(lam.cuda())
+    loads_gpu = Loads(omega.cuda())
     plan_gpu = solve(loads_gpu, topo_gpu, spec_gpu, cfg)
 
     assert int(plan_gpu.q[plan_gpu.q > 0].min()) >= cfg.u_min
@@ -133,7 +133,7 @@ def test_gpu_floor_aware_cross_domain_fallback():
     assert report.ok, report.violations
 
 
-def test_cuda_fast_solver_is_deterministic_and_constraint_safe(monkeypatch):
+def test_cuda_solver_is_deterministic_and_constraint_safe():
     ranks, experts = 8, 32
     loads = Loads(
         make_loads(
@@ -144,7 +144,7 @@ def test_cuda_fast_solver_is_deterministic_and_constraint_safe(monkeypatch):
             skew=1.5,
             seed=17,
             device="cuda",
-        ).lam
+        ).omega
         * 2
     )
     topo = Topology.from_nvlink_rdma(2, 4, device="cuda")
@@ -152,26 +152,22 @@ def test_cuda_fast_solver_is_deterministic_and_constraint_safe(monkeypatch):
         experts, ranks, 1_000_000, 4096, 6, device="cuda"
     )
     cfg = EPLBConfig(u_min=2, max_stage2_iters=64)
-    monkeypatch.setenv("EPLB_SOLVER_BACKEND", "fast")
-
     first = solve(loads, topo, spec, cfg, validate=False)
     second = solve(loads, topo, spec, cfg, validate=False)
     torch.cuda.synchronize()
 
     assert torch.equal(first.x, second.x)
     assert torch.equal(first.q, second.q)
-    assert torch.equal(first.tau, second.tau)
+    assert torch.equal(first.theta, second.theta)
     report = check_constraints(first, loads, topo, spec, cfg)
     assert report.ok, report.violations
 
 
-def test_cuda_fast_solver_has_no_host_sync_after_warmup(monkeypatch):
+def test_cuda_solver_has_no_host_sync_after_warmup():
     loads = Loads(torch.tensor([[16, 8], [8, 16]], device="cuda"))
     topo = Topology.from_nvlink_rdma(1, 2, device="cuda")
     spec = ProblemSpec.uniform_main_placement(2, 2, 1, 1, 2, device="cuda")
     cfg = EPLBConfig(max_stage2_iters=8)
-    monkeypatch.setenv("EPLB_SOLVER_BACKEND", "fast")
-
     solve(loads, topo, spec, cfg, validate=False)
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
@@ -180,7 +176,7 @@ def test_cuda_fast_solver_has_no_host_sync_after_warmup(monkeypatch):
     finally:
         torch.cuda.set_sync_debug_mode("default")
 
-    assert plan.tau.is_cuda
+    assert plan.theta.is_cuda
 
 
 # ---------------------------------------------------------------------------
@@ -189,10 +185,9 @@ def test_cuda_fast_solver_has_no_host_sync_after_warmup(monkeypatch):
 
 @dataclass
 class _PreparedKernel:
-    lam: torch.Tensor
+    omega: torch.Tensor
     cost: torch.Tensor
     dom: torch.Tensor
-    order: torch.Tensor
     cand_e: torch.Tensor
     cand_d: torch.Tensor
     cand_valid: torch.Tensor
@@ -206,8 +201,6 @@ class _PreparedKernel:
     stuck: torch.Tensor
     num_ranks: int
     num_experts: int
-    num_domains_upper_bound: int
-    num_candidates: int
     n_slot: int
 
     def reset_outputs(self) -> None:
@@ -229,13 +222,11 @@ def _prepare_kernel_inputs(
     device = loads.device
     num_ranks = topology.num_ranks
     num_experts = spec.num_experts
-    num_domains = topology.sync_free_num_domains
 
-    lam = loads.lam.to(torch.int64).contiguous()
+    omega = loads.omega.to(torch.int64).contiguous()
     dom = topology.domain_of_rank.to(torch.int64).contiguous()
     cost = topology.cost.to(torch.int64).contiguous()
     main_rank = spec.main_rank.to(torch.int64)
-    weight_bytes = spec.weight_bytes.to(torch.int64)
 
     x_initial = torch.zeros(
         (num_experts, num_ranks), dtype=torch.int8, device=device
@@ -243,54 +234,17 @@ def _prepare_kernel_inputs(
     x_initial.scatter_(1, main_rank.view(num_experts, 1), 1)
     slot_initial = x_initial.sum(0).to(torch.int64)
 
-    flat_lam = lam.reshape(-1).contiguous()
-    index = torch.arange(
-        num_ranks * num_experts, device=device, dtype=torch.int64
+    candidate_expert, candidate_domain, candidate_valid = (
+        cuda_solver._stage1_candidates(loads, topology, spec)
     )
-    expert = index % num_experts
-    source_rank = index // num_experts
-    order = index.clone()
-    for key in (source_rank, expert, -flat_lam):
-        order = order[torch.argsort(key[order], stable=True)]
-    order = order.contiguous()
-
-    domain_demand = loads.domain_demand(dom, num_domains)
-    candidate_expert = torch.arange(
-        num_experts, device=device, dtype=torch.int64
-    ).repeat_interleave(num_domains)
-    candidate_domain = torch.arange(
-        num_domains, device=device, dtype=torch.int64
-    ).repeat(num_experts)
-    demand = domain_demand[candidate_domain, candidate_expert]
-    candidate_weight = weight_bytes[candidate_expert]
-    benefit = 2 * demand * int(spec.s_tok) - candidate_weight
-    main_domain = dom[main_rank]
-    valid = (
-        (candidate_domain != main_domain[candidate_expert])
-        & (demand > 0)
-        & (candidate_weight < 2 * demand * int(spec.s_tok))
-    )
-    candidate_order = torch.arange(
-        num_experts * num_domains, device=device, dtype=torch.int64
-    )
-    for key in (
-        candidate_domain,
-        candidate_expert,
-        -benefit,
-        (~valid).to(torch.int64),
-    ):
-        candidate_order = candidate_order[
-            torch.argsort(key[candidate_order], stable=True)
-        ]
 
     return _PreparedKernel(
-        lam=flat_lam,
+        omega=omega,
         cost=cost,
         dom=dom,
-        order=order,
-        cand_e=candidate_expert[candidate_order].contiguous(),
-        cand_d=candidate_domain[candidate_order].contiguous(),
-        cand_valid=valid[candidate_order].to(torch.int64).contiguous(),
+        cand_e=candidate_expert,
+        cand_d=candidate_domain,
+        cand_valid=candidate_valid,
         x_initial=x_initial,
         slot_initial=slot_initial,
         x=x_initial.clone(),
@@ -307,8 +261,6 @@ def _prepare_kernel_inputs(
         stuck=torch.zeros(num_ranks, dtype=torch.uint8, device=device),
         num_ranks=num_ranks,
         num_experts=num_experts,
-        num_domains_upper_bound=num_domains,
-        num_candidates=num_experts * num_domains,
         n_slot=int(spec.n_slot),
     )
 
@@ -319,7 +271,7 @@ def _launch_prepared_cuda(
 ) -> None:
     """Launch the fine-grained CUDA admission, routing, and repair kernels."""
     cuda_solver._get_backend().fast_solve(
-        prepared.lam.view(prepared.num_ranks, prepared.num_experts),
+        prepared.omega,
         prepared.x,
         prepared.cost,
         prepared.dom,
@@ -428,7 +380,7 @@ def _validate_benchmark_args(args: argparse.Namespace) -> None:
 
 
 def run_gpu_solver_benchmark(args: argparse.Namespace) -> dict[str, object]:
-    """Construct a realistic synthetic Lambda and benchmark the CUDA solver."""
+    """Construct a realistic synthetic Ω and benchmark the CUDA solver."""
     _validate_benchmark_args(args)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -471,8 +423,8 @@ def run_gpu_solver_benchmark(args: argparse.Namespace) -> dict[str, object]:
     baseline_rank_load.index_add_(
         0, spec.main_rank, loads.expert_load()
     )
-    baseline_tau = int(baseline_rank_load.max().item())
-    mean_load = float(loads.lam.sum().item()) / num_ranks
+    baseline_theta = int(baseline_rank_load.max().item())
+    mean_load = float(loads.omega.sum().item()) / num_ranks
     prepared = _prepare_kernel_inputs(loads, topology, spec)
 
     launch = _launch_prepared_cuda
@@ -520,27 +472,29 @@ def run_gpu_solver_benchmark(args: argparse.Namespace) -> dict[str, object]:
         raise AssertionError(
             f"kernel lost routes: expected {expected_routes}, got {actual_routes}"
         )
-    solved_tau = int(prepared.load_out.max().item())
+    solved_theta = int(prepared.load_out.max().item())
     report["result"] = {
-        "tau": solved_tau,
+        "theta": solved_theta,
         "replicas": int(prepared.x.sum().item()),
         "routes": actual_routes,
     }
 
-    baseline_imbalance = baseline_tau / mean_load if mean_load else 1.0
-    solved_imbalance = solved_tau / mean_load if mean_load else 1.0
+    baseline_imbalance = baseline_theta / mean_load if mean_load else 1.0
+    solved_imbalance = solved_theta / mean_load if mean_load else 1.0
     report["quality"] = {
         "mean_load": mean_load,
-        "baseline_tau": baseline_tau,
+        "baseline_theta": baseline_theta,
         "baseline_imbalance": baseline_imbalance,
-        "solved_tau": solved_tau,
+        "solved_theta": solved_theta,
         "solved_imbalance": solved_imbalance,
-        "tau_reduction_percent": (
-            100.0 * (baseline_tau - solved_tau) / baseline_tau
-            if baseline_tau
+        "theta_reduction_percent": (
+            100.0 * (baseline_theta - solved_theta) / baseline_theta
+            if baseline_theta
             else 0.0
         ),
-        "balance_speedup": baseline_tau / solved_tau if solved_tau else float("inf"),
+        "balance_speedup": (
+            baseline_theta / solved_theta if solved_theta else float("inf")
+        ),
     }
     return report
 
@@ -567,17 +521,17 @@ def _print_benchmark_report(report: dict[str, object]) -> None:
     result = report["result"]
     assert isinstance(result, dict)
     print(
-        f"result       tau={result['tau']}  replicas={result['replicas']}  "
+        f"result       theta={result['theta']}  replicas={result['replicas']}  "
         f"routes={result['routes']}"
     )
     quality = report["quality"]
     assert isinstance(quality, dict)
     print(
         "balance      "
-        f"tau {quality['baseline_tau']} -> {quality['solved_tau']}  "
+        f"theta {quality['baseline_theta']} -> {quality['solved_theta']}  "
         f"imbalance {quality['baseline_imbalance']:.4f} -> "
         f"{quality['solved_imbalance']:.4f}  "
-        f"reduction={quality['tau_reduction_percent']:.2f}%  "
+        f"reduction={quality['theta_reduction_percent']:.2f}%  "
         f"speedup={quality['balance_speedup']:.3f}x"
     )
 

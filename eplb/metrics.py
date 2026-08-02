@@ -18,12 +18,12 @@ from .topology import Topology
 class Metrics:
     """Quantitative quality of a plan."""
 
-    tau: int  # makespan (max per-rank token load)
+    theta: int  # max per-rank token load
     mean_load: float  # mean per-rank load
-    imbalance: float  # tau / mean_load (1.0 is perfect)
+    imbalance: float  # theta / mean_load (1.0 is perfect)
     phi_token: int  # token comm cost sum c[r,r'] q[r,e,r']
     phi_weight: int  # weight movement cost sum_{e,r!=main} 2 c[main,r] |W_e| x
-    objective: int  # alpha tau + beta phi_token + gamma phi_weight
+    objective: int  # alpha theta + beta phi_token + gamma phi_weight
     total_replicas: int  # total physical instances across all experts
     max_slots_used: int  # max instances hosted on any single rank
 
@@ -40,10 +40,10 @@ def compute_metrics(
     R = topo.num_ranks
 
     load = plan.rank_load()  # [R]
-    tau = int(load.max().item()) if R > 0 else 0
-    total_tokens = int(loads.lam.sum().item())
+    theta = int(load.max().item()) if R > 0 else 0
+    total_tokens = int(loads.omega.sum().item())
     mean_load = total_tokens / R if R > 0 else 0.0
-    imbalance = (tau / mean_load) if mean_load > 0 else 1.0
+    imbalance = (theta / mean_load) if mean_load > 0 else 1.0
 
     # Phi_token = sum_{r,e,r'} c[r,r'] q[r,e,r']; elementwise reduce (not einsum) for int64-on-CUDA support
     cost_i64 = cost.to(torch.int64)  # [R, R] over (src, dst)
@@ -60,10 +60,10 @@ def compute_metrics(
         (2 * c_main * spec.weight_bytes.unsqueeze(1) * x * not_main).sum().item()
     )
 
-    objective = cfg.alpha * tau + cfg.beta * phi_token + cfg.gamma * phi_weight
+    objective = cfg.alpha * theta + cfg.beta * phi_token + cfg.gamma * phi_weight
 
     return Metrics(
-        tau=tau,
+        theta=theta,
         mean_load=mean_load,
         imbalance=imbalance,
         phi_token=phi_token,
@@ -95,7 +95,7 @@ def check_constraints(
     """Verify the plan satisfies constraints C1-C7 from the problem definition."""
     cfg = cfg or EPLBConfig()
     v: List[str] = []
-    lam = loads.lam
+    omega = loads.omega
     x = plan.x
     q = plan.q
     R, E = topo.num_ranks, spec.num_experts
@@ -105,10 +105,10 @@ def check_constraints(
     n_slot = int(spec.n_slot)
     s_tok = int(spec.s_tok)
 
-    # C1 conservation: sum_{r'} q[r,e,r'] == lam[r,e]
+    # C1 conservation: sum_{r'} q[r,e,r'] == omega[r,e]
     served = q.sum(dim=2)  # [R, E]
-    if not torch.equal(served, lam):
-        bad = int((served != lam).sum().item())
+    if not torch.equal(served, omega):
+        bad = int((served != omega).sum().item())
         v.append(f"C1 conservation violated for {bad} (r,e) pairs")
 
     # C2 reachability: q[r,e,r'] > 0 only where x[e,r']==1 (forbidden marks ranks without an instance)
@@ -116,11 +116,12 @@ def check_constraints(
     if torch.any((q * forbidden.unsqueeze(0).to(q.dtype)) != 0):
         v.append("C2 reachability violated: quota routed to a rank without an instance")
 
-    # C3 makespan: check plan.tau matches the realised max rank load
+    # C3 maximum load: check plan.theta matches the realised max rank load
     load = q.sum(dim=(0, 1))
-    if int(load.max().item()) != int(plan.tau):
+    if int(load.max().item()) != int(plan.theta):
         v.append(
-            f"C3/tau mismatch: plan.tau={plan.tau} but max rank load={int(load.max().item())}"
+            f"C3/theta mismatch: plan.theta={plan.theta} "
+            f"but max rank load={int(load.max().item())}"
         )
 
     # C4 slot budget: sum_e x[e,r] <= N_slot

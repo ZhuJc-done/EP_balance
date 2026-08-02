@@ -1,4 +1,4 @@
-"""tau-bisection backend: a valid, deterministic optional heuristic."""
+"""Theta-bisection backend: a valid, deterministic optional heuristic."""
 
 import torch
 
@@ -16,7 +16,7 @@ CASES = [
 ]
 
 
-def _baseline_tau(loads, spec, R):
+def _baseline_theta(loads, spec, R):
     load = torch.zeros(R, dtype=torch.int64)
     load.index_add_(0, spec.main_rank, loads.expert_load())
     return int(load.max().item())
@@ -51,10 +51,10 @@ def test_bisect_deterministic(nodes, gpus, experts, n_slot):
 
 
 def test_bisect_helps_on_skew():
-    """On a hot-spotted load the bisection plan should cut the makespan substantially."""
+    """The bisection plan should substantially reduce theta on skewed load."""
     loads, topo, spec, cfg = _build(4, 4, 32, 8, skew=2.0)
     R = 16
-    base_tau = _baseline_tau(loads, spec, R)
+    base_theta = _baseline_theta(loads, spec, R)
     plan = solve_bisect(loads, topo, spec, cfg)
     m = compute_metrics(plan, loads, topo, spec, cfg)
-    assert int(m.tau) < base_tau
+    assert int(m.theta) < base_theta

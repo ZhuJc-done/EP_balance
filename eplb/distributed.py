@@ -1,4 +1,4 @@
-"""Collect the global load matrix ``Lambda`` with a single all-gather (the solver's only communication)."""
+"""Collect the global load matrix ``Ω`` with one all-gather."""
 
 from __future__ import annotations
 
@@ -14,11 +14,11 @@ def is_distributed() -> bool:
     return dist.is_available() and dist.is_initialized()
 
 
-def all_gather_lambda(
+def all_gather_omega(
     local_row: torch.Tensor,
     group: Optional["dist.ProcessGroup"] = None,
 ) -> Loads:
-    """All-gather each rank's expert-count row into the full ``Lambda`` matrix.
+    """All-gather each rank's expert-count row into the full ``Ω`` matrix.
 
     Args:
         local_row: int64 tensor ``[E]`` -- this rank's token counts per expert.
@@ -38,15 +38,15 @@ def all_gather_lambda(
     world_size = dist.get_world_size(group)
     gathered = [torch.empty_like(local_row) for _ in range(world_size)]
     dist.all_gather(gathered, local_row, group=group)
-    lam = torch.stack(gathered, dim=0)  # [R, E], ordered by global rank
-    return Loads(lam)
+    omega = torch.stack(gathered, dim=0)  # [R, E], ordered by global rank
+    return Loads(omega)
 
 
 def local_counts_from_routing(
     expert_ids: torch.Tensor,
     num_experts: int,
 ) -> torch.Tensor:
-    """Build this rank's ``Lambda`` row from a flat list of routed expert ids.
+    """Build this rank's ``Ω`` row from a flat list of routed expert ids.
 
     Args:
         expert_ids: int tensor of the expert id chosen for each (token, top-k)
