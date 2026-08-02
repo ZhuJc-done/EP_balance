@@ -1,4 +1,4 @@
-"""Synthetic, controllably-skewed load-matrix (``Lambda``) generators for experiments and tests."""
+"""Synthetic, controllably skewed load-matrix (``Ω``) generators."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ def make_loads(
     seed: int = 0,
     device: torch.device | str = "cpu",
 ) -> Loads:
-    """Generate a synthetic ``Lambda``.
+    """Generate a synthetic ``Ω``.
 
     Args:
         num_ranks: ``R``.
@@ -39,7 +39,7 @@ def make_loads(
     base = 1.0 / torch.pow(ranks_e + 1.0, float(skew))
     base = base / base.sum()
 
-    lam = torch.zeros((num_ranks, num_experts), dtype=torch.int64)
+    omega = torch.zeros((num_ranks, num_experts), dtype=torch.int64)
     total_per_rank = int(tokens_per_rank * top_k)
     n_hot = max(1, int(round(num_ranks * float(hotspot_ranks))))
 
@@ -52,6 +52,6 @@ def make_loads(
         counts = torch.multinomial(
             probs, total_per_rank, replacement=True, generator=g
         )
-        lam[r] = torch.bincount(counts, minlength=num_experts).to(torch.int64)
+        omega[r] = torch.bincount(counts, minlength=num_experts).to(torch.int64)
 
-    return Loads(lam.to(device))
+    return Loads(omega.to(device))

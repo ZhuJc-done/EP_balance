@@ -11,6 +11,14 @@ if [ -n "${_nccl_lib}" ] && [ -d "${_nccl_lib}" ]; then
   export LD_LIBRARY_PATH="${_nccl_lib}:${LD_LIBRARY_PATH:-}"
 fi
 
+# GIN needs an NCCL built with ginType != NONE, which the wheel above generally is not. Preload the
+# GIN-capable copy and point DeepEP's byte-for-byte library check at the same file, so the two
+# backends share one NCCL instead of one of them refusing to start.
+if [ -n "${NCCL_HOME:-}" ] && [ -f "${NCCL_HOME}/lib/libnccl.so.2" ]; then
+  export EP_NCCL_ROOT_DIR="${EP_NCCL_ROOT_DIR:-${NCCL_HOME}}"
+  export LD_PRELOAD="${NCCL_HOME}/lib/libnccl.so.2:${LD_PRELOAD:-}"
+fi
+
 # --- required paths / artifacts ----------------------------------------------
 MEGATRON_DIR="${MEGATRON_DIR:?set MEGATRON_DIR to the Megatron-LM repo root}"
 EPLB_DIR="${EPLB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -48,7 +56,7 @@ export EPLB_MODE GPUS_PER_NODE
 export PYTHONPATH="${MEGATRON_DIR}:${EPLB_DIR}:${PYTHONPATH:-}"
 
 # --- optional routing-trace capture (observe mode) ---------------------------
-# EPLB_TRACE_OUT=<path> makes rank 0 dump the real gathered Lambda[R,E] per
+# EPLB_TRACE_OUT=<path> makes rank 0 dump the real gathered Ω[R,E] per
 # (layer, micro-batch); EPLB_TRACE_MAX caps sample count (0=all), EPLB_TRACE_EVERY
 # is the flush cadence. Replay it through every load balancer with:
 #   python -m baseline.benchmark --trace <path> --strategies scale,eplb,fastermoe,flexmoe,lplb
@@ -64,10 +72,96 @@ fi
 #                           resolved in one batch, so this adds no per-region host sync.
 # EPLB_PROFILE_ALL_RANKS=1  every rank prints its own summary (required for max-vs-mean straggler analysis).
 # EPLB_PROFILE_EVERY=<n>    summary cadence; EPLB_PROFILE_RESET_AT=<n> resets peak memory after warmup.
-for _knob in EPLB_N_SLOT EPLB_PROFILE EPLB_PROFILE_ALL_RANKS EPLB_PROFILE_EVERY EPLB_PROFILE_RESET_AT; do
+#
+# apply-mode backends (ignored in off/observe, which use Megatron's own dispatcher):
+# EPLB_ADAPTER=deepep       token dispatch/combine through DeepEP (default `alltoall`).
+# EPLB_WEIGHT_COMM=gin      replica expert weights AND their grad reduce-to-main over the in-tree
+#                           nccl_gin backend, both directions device-initiated (default:
+#                           host-driven dist.broadcast). Independent of the token transport.
+#                           Replica weights are never kept across forward->backward: backward
+#                           re-pulls them off the schedule cached at plan time, so EPLB_OVERLAP and
+#                           EPLB_REMATERIALIZE do not apply -- this path is always the re-pull one.
+# EPLB_GIN_FENCE=signal     device-stream barrier (LSA inside the node, GIN rail across) instead of
+#                           the default host dist.barrier. Set this for real runs: a host barrier is
+#                           not stream-ordered, so the backward re-pull cannot overlap Wgrad.
+# EPLB_GIN_LSA=0            force every replica transfer onto GIN's network path even for peers whose
+#                           memory is mapped here. Default is to move those over NVLink with
+#                           load/store; with the EP group inside a node that is the whole weight
+#                           channel, so this is for A/B measurement only.
+# EPLB_DEEPEP_STATIC=1      statically size the DeepEP recv buffer; requires EPLB_CAP.
+# EPLB_CAP=<int>            pin the per-slot capacity (sizes the padded expert-GEMM batch and the
+#                           static DeepEP recv buffer -- a token/compute-side quantity, unrelated
+#                           to the weight channel). Unset derives it from the plan's exact per-slot
+#                           counts at the cost of one scalar D2H, which the broadcast path absorbs
+#                           into a control-plane read it makes anyway but GIN does not.
+#                           Pinning BELOW the true per-slot max silently drops tokens.
+# EPLB_CHUNKS=2             split this rank's routing units in two and pipeline dispatch/compute/
+#                           combine across a compute and a comm stream, so dispatch(c2) hides behind
+#                           compute(c1) and combine(c1) behind compute(c2); only the first dispatch
+#                           and last combine stay exposed. Token-side only: the replica weights are
+#                           acquired once per layer and shared by the chunks, in both directions.
+#                           Composes with gin and with EPLB_OVERLAP=1.
+# EPLB_MANUAL_BWD=0         hand back the ordering of the chunked pipeline to autograd (default 1 =
+#                           one node for dispatch/GEMM/combine, both directions scheduled by hand).
+#                           Numerically identical; under autograd the forward weight pull cannot hide
+#                           behind dispatch(c1) and the backward reduce-to-main is forced to run last
+#                           in the layer with nothing left to overlap. Keep it at 1 except when
+#                           A/B-ing the schedule.
+# EPLB_REMATERIALIZE=1      dist.broadcast transport only: free replica weights after forward and
+#                           re-broadcast them in backward.
+for _knob in EPLB_N_SLOT EPLB_PROFILE EPLB_PROFILE_ALL_RANKS EPLB_PROFILE_EVERY EPLB_PROFILE_RESET_AT \
+             EPLB_ADAPTER EPLB_WEIGHT_COMM EPLB_GIN_FENCE EPLB_GIN_LSA EPLB_DEEPEP_STATIC EPLB_CAP \
+             EPLB_CHUNKS EPLB_MANUAL_BWD EPLB_OVERLAP EPLB_REMATERIALIZE; do
   if [[ -n "${!_knob:-}" ]]; then export "${_knob}"; fi
 done
 if [[ -n "${EPLB_N_SLOT:-}" ]]; then echo "[run_real_moe] EPLB_N_SLOT=${EPLB_N_SLOT} (slot budget override)"; fi
+if [[ "${EPLB_MODE}" == "apply" ]]; then
+  echo "[run_real_moe] apply backends: adapter=${EPLB_ADAPTER:-alltoall} weight_comm=${EPLB_WEIGHT_COMM:-broadcast}" \
+       "cap=${EPLB_CAP:-<from plan>} chunks=${EPLB_CHUNKS:-1} manual_bwd=${EPLB_MANUAL_BWD:-1}" \
+       "overlap=${EPLB_OVERLAP:-0} remat=${EPLB_REMATERIALIZE:-0}"
+  if [[ "${EPLB_WEIGHT_COMM:-}" == "gin" && "${EPLB_GIN_FENCE:-barrier}" != "signal" ]]; then
+    echo "[run_real_moe] WARNING: EPLB_GIN_FENCE=${EPLB_GIN_FENCE:-barrier} is a host dist.barrier," \
+         "so the backward replica re-pull cannot overlap Wgrad. Set EPLB_GIN_FENCE=signal."
+  fi
+  if [[ "${EPLB_WEIGHT_COMM:-}" == "gin" && "${EPLB_GIN_LSA:-1}" == "0" ]]; then
+    echo "[run_real_moe] WARNING: EPLB_GIN_LSA=0 sends intra-node replica traffic to the NIC" \
+         "instead of over NVLink. Only do this to measure the difference."
+  fi
+  # GIN's replica schedule is fully device-resident, so it does not make the control-plane host read
+  # the broadcast path folds the cap derivation into -- pin EPLB_CAP to keep this block sync-free.
+  if [[ -n "${EPLB_WEIGHT_COMM:-}" && -z "${EPLB_CAP:-}" ]]; then
+    echo "[run_real_moe] note: EPLB_WEIGHT_COMM set without EPLB_CAP -> one scalar D2H per layer to derive the cap"
+  fi
+fi
+
+# PROFILE_TRACE=1 -> Megatron's native PyTorch profiler writes a chrome/perfetto trace per profiled
+# rank. The eplb/* record_function labels (solve, all_gather_omega, apply/route, apply/dispatch,
+# apply/expert_compute, apply/combine, apply/weight_move) appear inline, so the trace resolves where
+# EP time actually goes. Start past step ~5: the first iterations pay CUDA-solver JIT and cuBLAS
+# autotuning and are not representative.
+#
+# PROFILE_DIR is one output dir per run, holding tb/ and torch_profile/. Megatron derives the trace
+# path as `<tensorboard-dir>/../torch_profile`, so tb/ is nested one level down to keep the trace
+# inside PROFILE_DIR -- otherwise every run resolves to the same logs/torch_profile and each
+# overwrites the previous rank-<N>.json.gz. Set PROFILE_DIR per run when comparing modes or sweeps.
+PROFILE_ARGS=()
+if [[ "${PROFILE_TRACE:-0}" == "1" ]]; then
+  PROFILE_RUN_DIR="${PROFILE_DIR:-${EPLB_DIR}/logs/prof_${EPLB_MODE}}"
+  PROFILE_ARGS=(
+    --profile
+    --use-pytorch-profiler
+    --profile-step-start "${PROFILE_STEP_START:-8}"
+    --profile-step-end "${PROFILE_STEP_END:-10}"
+    --profile-ranks ${PROFILE_RANKS:-0}                   # unquoted on purpose: PROFILE_RANKS="0 8" must word-split into nargs
+    --tensorboard-dir "${PROFILE_RUN_DIR}/tb"
+  )
+  # CPU/Python call stacks; off by default because with_stack inflates the trace and slows the
+  # profiled steps enough to distort the step time read off the same run.
+  [[ "${PROFILE_STACK:-0}" == "1" ]] && PROFILE_ARGS+=(--pytorch-profiler-collect-callstack)
+  [[ "${PROFILE_SHAPES:-0}" == "1" ]] && PROFILE_ARGS+=(--pytorch-profiler-collect-shapes)
+  echo "[run_real_moe] PROFILE_TRACE=1 -> steps ${PROFILE_STEP_START:-8}..${PROFILE_STEP_END:-10}, ranks ${PROFILE_RANKS:-0}"
+  echo "[run_real_moe] trace -> ${PROFILE_RUN_DIR}/torch_profile/rank-<N>.json.gz"
+fi
 
 # --- per-model architecture args (must match the checkpoint config) -----------
 if [[ "${MODEL}" == "mixtral8x7b" ]]; then
@@ -108,6 +202,31 @@ else
   exit 1
 fi
 
+# Router load balancing. ROUTER_BALANCING=none turns the aux loss off so the routing skew survives to
+# the dispatcher: aux_loss actively flattens the very imbalance an expert load balancer exists to
+# exploit, so leaving it on understates every balancer in the comparison. Appended after the per-model
+# recipe because argparse keeps the last value for a repeated flag.
+ROUTER_BALANCING="${ROUTER_BALANCING:-aux_loss}"
+MOE_ARGS+=(--moe-router-load-balancing-type "${ROUTER_BALANCING}")
+if [[ "${ROUTER_BALANCING}" == "none" ]]; then
+  MOE_ARGS+=(--moe-aux-loss-coeff 0.0)
+  echo "[run_real_moe] ROUTER_BALANCING=none -> aux loss off, routing skew left intact"
+fi
+# --moe-expert-capacity-factor is deliberately never set: unset means no token is dropped and every
+# routed token reaches its expert, which the load-balancing comparison depends on. Do not add it.
+
+# ROUTER_SKEW=<std> injects a shared per-expert bias ~ N(0, |std|) into the router logits, which is how
+# a controlled routing skew is produced without a trained checkpoint: |std| sets the magnitude, so
+# sweeping it sweeps the imbalance a balancer has to absorb. std<0 draws the bias once per layer and
+# reuses it (stationary skew -- the measurable case); std>0 redraws every forward pass. Megatron also
+# randomises the logits themselves here, so the loss is meaningless under this flag: use it for step
+# time / imbalance, never for the loss-curve comparison.
+if [[ -n "${ROUTER_SKEW:-}" ]]; then
+  MOE_ARGS+=(--moe-router-force-biased "${ROUTER_SKEW}")
+  [[ "${ROUTER_SKEW}" == -* ]] && _skew_kind="fixed per layer" || _skew_kind="redrawn per step"
+  echo "[run_real_moe] ROUTER_SKEW=${ROUTER_SKEW} -> synthetic expert bias (${_skew_kind}); loss is not meaningful"
+fi
+
 # SequentialMLP for every mode: the apply-mode binding needs clean per-expert weights, and one shared
 # kernel path keeps off/observe/apply step times comparable.
 MODEL_ARGS+=(
@@ -117,11 +236,12 @@ MODEL_ARGS+=(
 )
 
 # DEEPEP=1 (off/observe only): route Megatron's own MoE dispatch through DeepEP (flex backend, uses deep_ep.Buffer).
-# In apply mode EPLB replaces the dispatcher, so this is ignored there (DeepEPAdapter is not wired yet).
+# apply mode replaces Megatron's dispatcher outright, so this flag does nothing there -- its DeepEP
+# transport is selected with EPLB_ADAPTER=deepep instead.
 DEEPEP_ARGS=()
 if [[ "${DEEPEP:-0}" == "1" ]]; then
   if [[ "${EPLB_MODE}" == "apply" ]]; then
-    echo "[run_real_moe] DEEPEP=1 ignored in apply mode (EPLB owns the dispatcher; DeepEPAdapter not wired yet)"
+    echo "[run_real_moe] DEEPEP=1 ignored in apply mode (EPLB owns the dispatcher; use EPLB_ADAPTER=deepep)"
   else
     DEEPEP_ARGS=(--moe-token-dispatcher-type flex --moe-enable-deepep --moe-router-dtype fp32)   # overrides the alltoall set in MOE_ARGS (argparse: last wins); DeepEP requires fp32 probs
     echo "[run_real_moe] DEEPEP=1 -> Megatron native DeepEP dispatch (flex)"
@@ -182,11 +302,16 @@ LOG="${LOG:-1}"
 LOG_FILE="${LOG_FILE:-${EPLB_DIR}/logs/real_${MODEL}_${EPLB_MODE}_node${NODE_RANK}.log}"
 echo "[run_real_moe] model=${MODEL} mode=${EPLB_MODE} world=${WORLD_SIZE} TP=${TP} PP=${PP} EP=${EP}"
 [[ "${LOG}" != "0" ]] && { mkdir -p "$(dirname "${LOG_FILE}")"; echo "[run_real_moe] logging to ${LOG_FILE}"; }
+# Extra Megatron flags passed to this script go last, so argparse lets them override the recipe above
+# (e.g. `--recompute-granularity full --recompute-method uniform`). Captured at top level because `$@`
+# inside a function would resolve to the function's own arguments.
+EXTRA_ARGS=("$@")
+[[ ${#EXTRA_ARGS[@]} -gt 0 ]] && echo "[run_real_moe] extra Megatron args: ${EXTRA_ARGS[*]}"
 run_torchrun() {
   torchrun "${DISTRIBUTED_ARGS[@]}" \
     "${EPLB_DIR}/scripts/pretrain_eplb_moe.py" \
     "${MODEL_ARGS[@]}" "${MOE_ARGS[@]}" "${DEEPEP_ARGS[@]}" "${PARALLEL_ARGS[@]}" \
-    "${DATA_ARGS[@]}" "${TRAIN_ARGS[@]}" "${LOAD_ARGS[@]}"
+    "${DATA_ARGS[@]}" "${TRAIN_ARGS[@]}" "${LOAD_ARGS[@]}" "${PROFILE_ARGS[@]}" "${EXTRA_ARGS[@]}"
 }
 if [[ "${LOG}" != "0" ]]; then
   run_torchrun 2>&1 | tee "${LOG_FILE}"

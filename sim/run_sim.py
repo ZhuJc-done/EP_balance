@@ -20,8 +20,8 @@ from sim.workload import make_loads
 def _baseline_load(loads, spec, num_ranks):
     """Per-rank load with no replication: every token goes to ``main(e)``."""
     load = torch.zeros(num_ranks, dtype=torch.int64)
-    lam_e = loads.expert_load()
-    load.index_add_(0, spec.main_rank, lam_e)
+    omega_e = loads.expert_load()
+    load.index_add_(0, spec.main_rank, omega_e)
     return load
 
 
@@ -69,10 +69,10 @@ def main() -> None:
     report = check_constraints(plan, loads, topo, spec, cfg)
     metrics = compute_metrics(plan, loads, topo, spec, cfg)
 
-    total = int(loads.lam.sum().item())
+    total = int(loads.omega.sum().item())
     mean = total / R
     base_load = _baseline_load(loads, spec, R)
-    base_tau = int(base_load.max().item())
+    base_theta = int(base_load.max().item())
 
     print("=" * 64)
     print(f"Topology : {args.nodes} nodes x {args.gpus} gpus = {R} ranks, "
@@ -81,12 +81,12 @@ def main() -> None:
           f"cross-domain={'off' if args.no_cross_domain else 'on'}")
     print(f"Tokens   : {total} total, mean/rank={mean:.1f}")
     print("-" * 64)
-    print(f"Baseline (no replication):  tau={base_tau:>8}  "
-          f"imbalance={base_tau / mean:6.3f}")
-    print(f"Scale-EPLB plan          :  tau={metrics.tau:>8}  "
+    print(f"Baseline (no replication):  theta={base_theta:>8}  "
+          f"imbalance={base_theta / mean:6.3f}")
+    print(f"Scale-EPLB plan          :  theta={metrics.theta:>8}  "
           f"imbalance={metrics.imbalance:6.3f}")
-    speedup = base_tau / metrics.tau if metrics.tau else float("inf")
-    print(f"Makespan reduction       :  {speedup:6.3f}x")
+    speedup = base_theta / metrics.theta if metrics.theta else float("inf")
+    print(f"Theta reduction          :  {speedup:6.3f}x")
     print("-" * 64)
     print(f"Total replicas : {metrics.total_replicas} "
           f"(experts={args.experts}, extra={metrics.total_replicas - args.experts})")

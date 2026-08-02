@@ -77,7 +77,7 @@ __global__ void stage1_admit_kernel(
 }
 
 __global__ void parallel_route_kernel(
-    const int64_t* lam,
+    const int64_t* omega,
     const int8_t* x,
     const int64_t* cost,
     const int64_t* dom,
@@ -132,7 +132,8 @@ __global__ void parallel_route_kernel(
     return;
   }
 
-  const int64_t need = lam[static_cast<int64_t>(src) * num_experts + expert];
+  const int64_t need =
+      omega[static_cast<int64_t>(src) * num_experts + expert];
   int64_t assigned = 0;
   if (active && need > 0 && active_count > 0) {
     // Rank active destinations by id using a block scan.
@@ -413,7 +414,7 @@ void check_cuda_contiguous(const torch::Tensor& tensor, const char* name) {
 }  // namespace
 
 void fast_solve_cuda(
-    torch::Tensor lam,
+    torch::Tensor omega,
     torch::Tensor x,
     torch::Tensor cost,
     torch::Tensor dom,
@@ -429,7 +430,7 @@ void fast_solve_cuda(
     int64_t max_stage2_iterations,
     int64_t quota_floor,
     bool allow_cross_domain) {
-  check_cuda_contiguous(lam, "lam");
+  check_cuda_contiguous(omega, "omega");
   check_cuda_contiguous(x, "x");
   check_cuda_contiguous(cost, "cost");
   check_cuda_contiguous(dom, "dom");
@@ -442,14 +443,14 @@ void fast_solve_cuda(
   check_cuda_contiguous(rank_load, "rank_load");
   check_cuda_contiguous(stuck, "stuck");
 
-  TORCH_CHECK(lam.scalar_type() == torch::kInt64, "lam must be int64");
+  TORCH_CHECK(omega.scalar_type() == torch::kInt64, "omega must be int64");
   TORCH_CHECK(x.scalar_type() == torch::kInt8, "x must be int8");
   TORCH_CHECK(q.scalar_type() == torch::kInt64, "q must be int64");
   TORCH_CHECK(stuck.scalar_type() == torch::kUInt8, "stuck must be uint8");
-  TORCH_CHECK(lam.dim() == 2, "lam must have shape [R, E]");
+  TORCH_CHECK(omega.dim() == 2, "omega must have shape [R, E]");
 
-  const int num_ranks = static_cast<int>(lam.size(0));
-  const int num_experts = static_cast<int>(lam.size(1));
+  const int num_ranks = static_cast<int>(omega.size(0));
+  const int num_experts = static_cast<int>(omega.size(1));
   TORCH_CHECK(num_ranks > 0 && num_ranks <= 1024, "fast CUDA solver requires 1 <= R <= 1024");
   TORCH_CHECK(num_experts > 0, "fast CUDA solver requires E > 0");
   TORCH_CHECK(x.sizes() == torch::IntArrayRef({num_experts, num_ranks}), "x shape mismatch");
@@ -460,8 +461,8 @@ void fast_solve_cuda(
   TORCH_CHECK(max_stage2_iterations > 0, "max_stage2_iterations must be positive");
   TORCH_CHECK(quota_floor > 0, "quota_floor must be positive");
 
-  const c10::cuda::CUDAGuard device_guard(lam.device());
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(lam.get_device());
+  const c10::cuda::CUDAGuard device_guard(omega.device());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(omega.get_device());
 
   if (allow_cross_domain && candidate_expert.numel() > 0) {
     stage1_admit_kernel<<<1, 1, 0, stream>>>(
@@ -481,7 +482,7 @@ void fast_solve_cuda(
     route_threads <<= 1;
   }
   parallel_route_kernel<<<num_ranks * num_experts, route_threads, 0, stream>>>(
-      lam.data_ptr<int64_t>(),
+      omega.data_ptr<int64_t>(),
       x.data_ptr<int8_t>(),
       cost.data_ptr<int64_t>(),
       dom.data_ptr<int64_t>(),

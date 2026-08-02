@@ -105,7 +105,9 @@ def model_provider(
             spec = build_spec_for_megatron(
                 p["num_experts"], ep_size, p["weight_bytes_each"], p["s_tok"], p["n_slot"], device
             )
-            reb = EPLBRebalancer(topo, spec, EPLBConfig())
+            # ring_size=0: this path's backward is pure autograd, so a retained Ω ring
+            # would be device memory (R*E int64 per layer per micro-batch) nothing ever reads.
+            reb = EPLBRebalancer(topo, spec, EPLBConfig(), ring_size=0)
             bind_eplb_to_moe_layer(moe, reb, ep_group, layer_id)
             _KEEPALIVE.append(reb)
     else:

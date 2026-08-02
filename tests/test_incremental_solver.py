@@ -82,7 +82,7 @@ def test_floor_fragment_fallback_still_makes_progress():
 
     plan = solve(loads, topo, spec, cfg)
 
-    assert int(plan.tau) < 10
+    assert int(plan.theta) < 10
     assert check_constraints(plan, loads, topo, spec, cfg).ok
 
 

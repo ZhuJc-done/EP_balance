@@ -1,4 +1,4 @@
-"""Multi-process verification (E3) that every rank all-gathers Lambda and solves a bit-identical plan."""
+"""Verify that every rank all-gathers Ω and solves a bit-identical plan."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from eplb import EPLBConfig, ProblemSpec, Topology, check_constraints, solve
-from eplb.distributed import all_gather_lambda
+from eplb.distributed import all_gather_omega
 from sim.workload import make_loads
 
 
@@ -19,11 +19,11 @@ def _plan_hash(plan) -> str:
     h = hashlib.sha256()
     h.update(plan.x.cpu().numpy().tobytes())
     h.update(plan.q.cpu().numpy().tobytes())
-    h.update(str(int(plan.tau)).encode())
+    h.update(str(int(plan.theta)).encode())
     return h.hexdigest()[:16]
 
 
-def _worker(rank: int, args, full_lam_bytes: bytes, lam_shape):
+def _worker(rank: int, args, full_omega_bytes: bytes, omega_shape):
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", str(args.port))
     dist.init_process_group(
@@ -33,9 +33,11 @@ def _worker(rank: int, args, full_lam_bytes: bytes, lam_shape):
     if args.backend == "nccl":
         torch.cuda.set_device(rank)
 
-    # reconstruct the full reference Lambda (same on every rank) and take our row
-    full_lam = torch.frombuffer(bytearray(full_lam_bytes), dtype=torch.int64).reshape(lam_shape)
-    local_row = full_lam[rank].to(device)
+    # Reconstruct the full reference Ω and take this rank's row.
+    full_omega = torch.frombuffer(
+        bytearray(full_omega_bytes), dtype=torch.int64
+    ).reshape(omega_shape)
+    local_row = full_omega[rank].to(device)
 
     topo = Topology.from_nvlink_rdma(
         args.nodes, args.gpus, intra_cost=1, inter_cost=8, device=device
@@ -48,7 +50,7 @@ def _worker(rank: int, args, full_lam_bytes: bytes, lam_shape):
     cfg = EPLBConfig()
 
     # the ONLY communication: all-gather the integer load rows
-    loads = all_gather_lambda(local_row)
+    loads = all_gather_omega(local_row)
     plan = solve(loads, topo, spec, cfg)
 
     report = check_constraints(plan, loads, topo, spec, cfg)
@@ -56,14 +58,17 @@ def _worker(rank: int, args, full_lam_bytes: bytes, lam_shape):
 
     # gather digests to rank 0 to confirm bit-identical plans
     obj = [None] * args.world_size
-    dist.all_gather_object(obj, (rank, digest, plan.tau, report.ok))
+    dist.all_gather_object(obj, (rank, digest, plan.theta, report.ok))
     if rank == 0:
         digests = {d for (_, d, _, _) in obj}
         all_ok = all(ok for (_, _, _, ok) in obj)
         print(f"world_size={args.world_size} backend={args.backend} "
               f"experts={args.experts}")
-        for (rk, d, tau, ok) in sorted(obj):
-            print(f"  rank {rk:>2}: plan_hash={d} tau={tau} constraints={'OK' if ok else 'BAD'}")
+        for (rk, d, theta, ok) in sorted(obj):
+            print(
+                f"  rank {rk:>2}: plan_hash={d} theta={theta} "
+                f"constraints={'OK' if ok else 'BAD'}"
+            )
         print("-" * 50)
         print(f"  bit-identical across ranks: {len(digests) == 1}")
         print(f"  all constraints satisfied : {all_ok}")
@@ -92,16 +97,21 @@ def main() -> None:
 
     ref = make_loads(args.world_size, args.experts, tokens_per_rank=4096,
                      top_k=6, skew=args.skew, hotspot_ranks=0.25, seed=0)
-    full_lam = ref.lam.to(torch.int64).contiguous()
+    full_omega = ref.omega.to(torch.int64).contiguous()
 
     if "RANK" in os.environ:  # launched by torchrun
         rank = int(os.environ["RANK"])
         args.world_size = int(os.environ["WORLD_SIZE"])
-        _worker(rank, args, full_lam.numpy().tobytes(), tuple(full_lam.shape))
+        _worker(
+            rank,
+            args,
+            full_omega.numpy().tobytes(),
+            tuple(full_omega.shape),
+        )
     else:  # spawn locally (gloo)
         mp.spawn(
             _worker,
-            args=(args, full_lam.numpy().tobytes(), tuple(full_lam.shape)),
+            args=(args, full_omega.numpy().tobytes(), tuple(full_omega.shape)),
             nprocs=args.world_size,
             join=True,
         )

@@ -58,11 +58,11 @@ def test_improves_imbalance(skew):
 
     base_load = torch.zeros(R, dtype=torch.int64)
     base_load.index_add_(0, spec.main_rank, loads.expert_load())
-    base_tau = int(base_load.max().item())
+    base_theta = int(base_load.max().item())
 
-    assert metrics.tau <= base_tau
+    assert metrics.theta <= base_theta
     # with meaningful skew, replication should give a real win
-    assert metrics.tau < base_tau
+    assert metrics.theta < base_theta
 
 
 def test_no_cross_domain_keeps_replicas_in_domain():

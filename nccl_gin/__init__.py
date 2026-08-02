@@ -5,6 +5,12 @@ Drop-in replacement for nvshmem-based P2P communication using NCCL symmetric
 memory (ncclMemAlloc + ncclCommWindowRegister) and peer device pointers.
 Works on NVLink P2P without requiring NCCL_P2P_DISABLE or NCCL_SHM_DISABLE.
 
+The batched entry points pick their transport per descriptor: peers inside the
+local LSA team (NVLink / P2P mapped) are moved with load/store, everyone else
+over GIN's network RDMA. One window registration covers both. Set
+``EPLB_GIN_LSA=0`` to force the network path for every peer, which is only
+useful for A/B measurement -- it sends intra-node traffic out to the NIC.
+
 Usage:
     import nccl_gin
     nccl_gin.init(process_group)
@@ -45,6 +51,11 @@ def _ensure_loaded():
         _log_init(f"backend load start file={__file__}")
         _C = _get_backend()
         _log_init("backend load done")
+
+
+def _lsa_default() -> bool:
+    """Whether the batched paths may serve LSA-team peers over NVLink (``EPLB_GIN_LSA``)."""
+    return os.environ.get("EPLB_GIN_LSA", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _run_with_stream(stream: Optional[torch.cuda.Stream], fn):
@@ -250,6 +261,7 @@ def get_batched(
     peers: torch.Tensor,
     k: Optional[int] = None,
     blocks_per_desc: int = 1,
+    use_lsa: Optional[bool] = None,
     stream: Optional[torch.cuda.Stream] = None,
 ):
     """Batched P2P get from a device-resident schedule (no host peer loop, no D2H).
@@ -259,15 +271,20 @@ def get_batched(
     ``int32`` CUDA tensor of source ranks. Descriptors with ``peers[i] < 0`` are skipped on
     device, so empty / local entries need no host branch. Both buffers must be symmetric
     (:func:`create_tensor`). The transfer completes on ``stream`` (GIN kernels flush).
+
+    Descriptors whose peer is in the local LSA team are read over NVLink with load/store
+    rather than through the NIC; pass ``use_lsa=False`` (or ``EPLB_GIN_LSA=0``) to disable.
     """
     _ensure_loaded()
     if k is None:
         k = int(peers.numel())
+    if use_lsa is None:
+        use_lsa = _lsa_default()
     return _run_with_stream(
         stream,
         lambda stream_opt: _C.get_batched(
             remote_buffer, local_buffer, remote_off, local_off, nbytes, peers,
-            int(k), int(blocks_per_desc), stream_opt))
+            int(k), int(blocks_per_desc), bool(use_lsa), stream_opt))
 
 
 def put_batched(
@@ -279,21 +296,26 @@ def put_batched(
     peers: torch.Tensor,
     k: Optional[int] = None,
     blocks_per_desc: int = 1,
+    use_lsa: Optional[bool] = None,
     stream: Optional[torch.cuda.Stream] = None,
 ):
     """Batched P2P put from a device-resident schedule (no host peer loop, no D2H).
 
     Mirror of :func:`get_batched`; ``peers`` holds destination ranks and each transfer
     pushes ``src_buffer[src_off[i]:]`` into ``dst_buffer[dst_off[i]:]`` on ``peers[i]``.
+    LSA-team peers are written over NVLink with load/store; the kernel issues a system-scope
+    fence before it exits so the caller's ordering fence covers those stores too.
     """
     _ensure_loaded()
     if k is None:
         k = int(peers.numel())
+    if use_lsa is None:
+        use_lsa = _lsa_default()
     return _run_with_stream(
         stream,
         lambda stream_opt: _C.put_batched(
             src_buffer, dst_buffer, src_off, dst_off, nbytes, peers,
-            int(k), int(blocks_per_desc), stream_opt))
+            int(k), int(blocks_per_desc), bool(use_lsa), stream_opt))
 
 
 def put_signal(
@@ -347,11 +369,28 @@ def signal(
     ctx: int = 0,
     stream: Optional[torch.cuda.Stream] = None,
 ):
-    """Send signal *sig_idx* to *peer* without transferring a payload."""
+    """Send signal *sig_idx* to *peer* without transferring a payload.
+
+    Only defined for peers this rank reaches over the network: signals ride a GIN connection, and
+    there is none to a peer inside the node. Use :func:`world_fence` to order the whole group.
+    """
     _ensure_loaded()
     return _run_with_stream(
         stream,
         lambda stream_opt: _C.signal(peer, sig_idx, ctx, stream_opt))
+
+
+def world_fence(index: int = 0, stream: Optional[torch.cuda.Stream] = None):
+    """Stream-ordered barrier across every rank, over whichever transport reaches each one.
+
+    Composes an LSA barrier inside the node with a GIN rail barrier across nodes, so unlike a
+    ``signal``/``wait_signal`` mesh it works when some or all peers are intra-node. Being a kernel
+    on ``stream`` rather than a host call, it is capture-safe and orders against side streams.
+    ``index`` selects one of the provisioned barrier slots; the same index must be used by every
+    rank for a given fence, and successive fences on one index are matched by epoch.
+    """
+    _ensure_loaded()
+    return _run_with_stream(stream, lambda stream_opt: _C.world_fence(int(index), stream_opt))
 
 
 def wait_signal(

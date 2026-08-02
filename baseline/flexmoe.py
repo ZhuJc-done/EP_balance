@@ -78,7 +78,7 @@ def _balanced_pack(
 
 
 def flexmoe_schedule(
-    lam: torch.Tensor,
+    omega: torch.Tensor,
     weight_bytes: torch.Tensor,
     num_ranks: int,
     n_slot: int,
@@ -87,8 +87,8 @@ def flexmoe_schedule(
     """Run the FlexMoE Scheduler/Policy-Maker greedy on the current load.
 
     Args:
-        lam: int ``[R, E]`` load matrix, ``Lambda[r, e]`` tokens from rank ``r`` to
-            expert ``e`` (this repository's :class:`~eplb.loads.Loads.lam`).
+        omega: int ``[R, E]`` load matrix, ``Ω[r, e]`` tokens from rank ``r``
+            to expert ``e`` (this repository's :class:`~eplb.loads.Loads.omega`).
         weight_bytes: numeric ``[E]`` byte size of each expert's parameters
             (drives the ``T_Sync`` replication penalty, paper Eq. 9).
         num_ranks: number of ranks/GPUs ``|G|``.
@@ -101,7 +101,9 @@ def flexmoe_schedule(
     """
     cost = cost or FlexMoECostModel()
 
-    expert_load = lam.detach().to(device="cpu", dtype=torch.float64).sum(dim=0)  # I_e
+    expert_load = (
+        omega.detach().to(device="cpu", dtype=torch.float64).sum(dim=0)
+    )  # I_e
     w_bytes = weight_bytes.detach().to(device="cpu", dtype=torch.float64)
     num_experts = expert_load.numel()
 

@@ -80,7 +80,7 @@ TRAIN_ITERS="${TRAIN_ITERS:-20}"
 export GPUS_PER_NODE EPLB_MODE
 
 # --- debug / profiling toggles (optional) ------------------------------------
-# EPLB_PROFILE=1 -> time the eplb/solve, eplb/all_gather_lambda and apply/* regions with
+# EPLB_PROFILE=1 -> time the eplb/solve, eplb/all_gather_omega and apply/* regions with
 # CUDA events and print a min/mean/max summary every EPLB_PROFILE_EVERY calls (default 20).
 export EPLB_PROFILE="${EPLB_PROFILE:-0}"
 export EPLB_PROFILE_EVERY="${EPLB_PROFILE_EVERY:-20}"
@@ -174,11 +174,15 @@ LOG="${LOG:-1}"
 LOG_FILE="${LOG_FILE:-${EPLB_DIR}/logs/run_${EPLB_MODE}_node${NODE_RANK}.log}"
 echo "[run_gb200_4x4] mode=${EPLB_MODE} nodes=${NNODES} gpn=${GPUS_PER_NODE} world=${WORLD_SIZE} node_rank=${NODE_RANK} rdzv=${RDZV_DESC} EP=${EP_SIZE} experts=${NUM_EXPERTS} topk=${TOPK}"
 [[ "${LOG}" != "0" ]] && { mkdir -p "$(dirname "${LOG_FILE}")"; echo "[run_gb200_4x4] logging to ${LOG_FILE}"; }
+# Extra Megatron flags go last so argparse lets them override the smoke-test recipe above; captured at
+# top level because `$@` inside a function would resolve to the function's own arguments.
+EXTRA_ARGS=("$@")
+[[ ${#EXTRA_ARGS[@]} -gt 0 ]] && echo "[run_gb200_4x4] extra Megatron args: ${EXTRA_ARGS[*]}"
 run_torchrun() {
   torchrun "${DISTRIBUTED_ARGS[@]}" \
     "${EPLB_DIR}/scripts/pretrain_eplb_moe.py" \
     "${MODEL_ARGS[@]}" "${MOE_ARGS[@]}" "${PARALLEL_ARGS[@]}" \
-    "${DATA_ARGS[@]}" "${TRAIN_ARGS[@]}" "${PROFILE_ARGS[@]}"
+    "${DATA_ARGS[@]}" "${TRAIN_ARGS[@]}" "${PROFILE_ARGS[@]}" "${EXTRA_ARGS[@]}"
 }
 if [[ "${LOG}" != "0" ]]; then
   run_torchrun 2>&1 | tee "${LOG_FILE}"

@@ -1,4 +1,4 @@
-"""Per-micro-batch rebalancing orchestrator (collect Lambda -> solve -> apply, K=1 by default)."""
+"""Per-micro-batch rebalancing orchestrator (collect Ω -> solve -> apply)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import torch
 
 from ..algorithm import solve
 from ..config import EPLBConfig
-from ..distributed import all_gather_lambda
+from ..distributed import all_gather_omega
 from ..loads import Loads
 from ..plan import Plan
 from ..problem import ProblemSpec
@@ -26,8 +26,11 @@ class EPLBRebalancer:
         cfg: Solver config (defaults to :class:`EPLBConfig`).
         materializer: Backend weight materializer (defaults to no-op placeholder).
         cache_plans: If True, cache solved plans for backward; else recompute from
-            cached ``Lambda`` (less memory, relies on determinism; default for K=1).
-        ring_size: Max in-flight (layer, mb) entries to retain (FIFO eviction).
+            cached ``Ω`` (less memory, relies on determinism; default for K=1).
+        ring_size: Max in-flight (layer, mb) entries to retain (FIFO eviction). ``0`` retains
+            nothing, which is what the apply path wants: its backward is pure autograd (the
+            replica broadcast/GIN transfer carries its own grad_fn) and never calls
+            :meth:`backward`, so every retained ``Ω`` would be device memory nothing reads.
     """
 
     def __init__(
@@ -50,22 +53,22 @@ class EPLBRebalancer:
         self.ring_size = int(ring_size)
 
         # ring buffers keyed by (layer_id, micro_batch_id)
-        self._lambda_ring: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._omega_ring: Dict[Tuple[int, int], torch.Tensor] = {}
         self._plan_ring: Dict[Tuple[int, int], Plan] = {}
         self._order: list = []
 
     # -- forward ----------------------------------------------------------------
-    def plan_from_lambda(self, loads: Loads) -> Plan:
-        """Solve directly from an already-gathered ``Lambda`` (no communication)."""
+    def plan_from_omega(self, loads: Loads) -> Plan:
+        """Solve directly from an already-gathered ``Ω`` (no communication)."""
         with profiling.record("solve", time_it=True, device=loads.device):
             return solve(loads, self.topo, self.spec, self.cfg, validate=False)
 
-    def rebalance_from_lambda(
+    def rebalance_from_omega(
         self, loads: Loads, layer_id: int, micro_batch_id: int
     ) -> RebalanceResult:
-        """Like :meth:`rebalance` but for an already-gathered ``Lambda`` (single-process/sim)."""
-        plan = self.plan_from_lambda(loads)
-        self._remember(layer_id, micro_batch_id, loads.lam, plan)
+        """Rebalance an already-gathered ``Ω`` in one process."""
+        plan = self.plan_from_omega(loads)
+        self._remember(layer_id, micro_batch_id, loads.omega, plan)
         handle = self.materializer.materialize(plan, layer_id, micro_batch_id)
         return RebalanceResult(plan=plan, weight_handle=handle)
 
@@ -77,7 +80,7 @@ class EPLBRebalancer:
         *,
         group=None,
     ) -> RebalanceResult:
-        """Collect ``Lambda`` (all-gather), solve, and materialize replica weights.
+        """Collect ``Ω`` (all-gather), solve, and materialize replica weights.
 
         Args:
             local_row: int64 ``[E]`` this rank's per-expert token counts.
@@ -88,10 +91,10 @@ class EPLBRebalancer:
         Returns:
             :class:`RebalanceResult` with the plan and a weight handle.
         """
-        with profiling.record("all_gather_lambda", time_it=True, device=local_row.device):
-            loads = all_gather_lambda(local_row, group=group)
-        plan = self.plan_from_lambda(loads)
-        self._remember(layer_id, micro_batch_id, loads.lam, plan)
+        with profiling.record("all_gather_omega", time_it=True, device=local_row.device):
+            loads = all_gather_omega(local_row, group=group)
+        plan = self.plan_from_omega(loads)
+        self._remember(layer_id, micro_batch_id, loads.omega, plan)
         handle = self.materializer.materialize(plan, layer_id, micro_batch_id)
         return RebalanceResult(plan=plan, weight_handle=handle)
 
@@ -102,31 +105,33 @@ class EPLBRebalancer:
         if self.cache_plans and key in self._plan_ring:
             plan = self._plan_ring[key]
         else:
-            if key not in self._lambda_ring:
+            if key not in self._omega_ring:
                 raise KeyError(
-                    f"no cached Lambda for (layer={layer_id}, mb={micro_batch_id}); "
+                    f"no cached Ω for (layer={layer_id}, mb={micro_batch_id}); "
                     f"increase ring_size (current={self.ring_size})"
                 )
-            plan = self.plan_from_lambda(Loads(self._lambda_ring[key]))
+            plan = self.plan_from_omega(Loads(self._omega_ring[key]))
         self.materializer.aggregate_gradients(plan, layer_id, micro_batch_id)
         return plan
 
     # -- ring buffer ------------------------------------------------------------
     def _remember(
-        self, layer_id: int, micro_batch_id: int, lam: torch.Tensor, plan: Plan
+        self, layer_id: int, micro_batch_id: int, omega: torch.Tensor, plan: Plan
     ) -> None:
+        if self.ring_size <= 0:
+            return
         key = (int(layer_id), int(micro_batch_id))
-        if key not in self._lambda_ring:
+        if key not in self._omega_ring:
             self._order.append(key)
-        self._lambda_ring[key] = lam
+        self._omega_ring[key] = omega
         if self.cache_plans:
             self._plan_ring[key] = plan
         while len(self._order) > self.ring_size:
             old = self._order.pop(0)
-            self._lambda_ring.pop(old, None)
+            self._omega_ring.pop(old, None)
             self._plan_ring.pop(old, None)
 
     def clear(self) -> None:
-        self._lambda_ring.clear()
+        self._omega_ring.clear()
         self._plan_ring.clear()
         self._order.clear()
