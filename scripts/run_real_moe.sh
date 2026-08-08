@@ -23,14 +23,30 @@ fi
 MEGATRON_DIR="${MEGATRON_DIR:?set MEGATRON_DIR to the Megatron-LM repo root}"
 EPLB_DIR="${EPLB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 # MOCK=1: real model architecture, but mock-data + random init (no checkpoint/data/tokenizer needed) --
-# a pure-Megatron "does it run / throughput / memory" baseline. MOCK=0 (default) needs real artifacts.
+# a pure-Megatron "does it run / throughput / memory" baseline.
+# MOCK=0 uses real tokenized data. Set FROM_SCRATCH=1 to random-initialize the model without a
+# checkpoint; otherwise CHECKPOINT remains required for the pretrained-weight path.
 MOCK="${MOCK:-0}"
+FROM_SCRATCH="${FROM_SCRATCH:-0}"
+if [[ "${MOCK}" != "0" && "${MOCK}" != "1" ]]; then
+  echo "invalid MOCK=${MOCK} (expected 0 or 1)" >&2
+  exit 1
+fi
+if [[ "${FROM_SCRATCH}" != "0" && "${FROM_SCRATCH}" != "1" ]]; then
+  echo "invalid FROM_SCRATCH=${FROM_SCRATCH} (expected 0 or 1)" >&2
+  exit 1
+fi
 if [[ "${MOCK}" == "1" ]]; then
   CHECKPOINT="" ; DATA_PATH="" ; TOKENIZER_MODEL=""
 else
-  CHECKPOINT="${CHECKPOINT:?set CHECKPOINT to the mcore checkpoint dir (from convert_hf_to_mcore.sh / Megatron Bridge)}"
   DATA_PATH="${DATA_PATH:?set DATA_PATH to the preprocessed data prefix (from prepare_data.sh, no .bin/.idx suffix)}"
-  TOKENIZER_MODEL="${TOKENIZER_MODEL:?set TOKENIZER_MODEL to the HF repo/dir matching the checkpoint}"
+  TOKENIZER_MODEL="${TOKENIZER_MODEL:?set TOKENIZER_MODEL to the HF repo/dir used to preprocess the data}"
+  if [[ "${FROM_SCRATCH}" == "1" ]]; then
+    CHECKPOINT=""
+    echo "[run_real_moe] FROM_SCRATCH=1 -> real data + random model initialization (no checkpoint)"
+  else
+    CHECKPOINT="${CHECKPOINT:?set CHECKPOINT to the mcore checkpoint dir, or set FROM_SCRATCH=1}"
+  fi
 fi
 SAVE_DIR="${SAVE_DIR:-}"                    # optional: where to write new checkpoints
 
@@ -163,7 +179,7 @@ if [[ "${PROFILE_TRACE:-0}" == "1" ]]; then
   echo "[run_real_moe] trace -> ${PROFILE_RUN_DIR}/torch_profile/rank-<N>.json.gz"
 fi
 
-# --- per-model architecture args (must match the checkpoint config) -----------
+# --- per-model architecture args (must match the checkpoint when loading) -----
 if [[ "${MODEL}" == "mixtral8x7b" ]]; then
   MODEL_ARGS=(
     --use-mcore-models --disable-bias-linear --untie-embeddings-and-output-weights
@@ -282,7 +298,7 @@ TRAIN_ARGS=(
   --num-workers "${NUM_WORKERS:-0}"
 )
 
-if [[ "${MOCK}" == "1" ]]; then
+if [[ "${MOCK}" == "1" || "${FROM_SCRATCH}" == "1" ]]; then
   LOAD_ARGS=()                              # random init, no checkpoint
 else
   LOAD_ARGS=(--load "${CHECKPOINT}" --no-load-optim --no-load-rng --dist-ckpt-strictness log_unexpected)

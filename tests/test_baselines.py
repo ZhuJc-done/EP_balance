@@ -11,12 +11,14 @@ from baseline.adapters import (
     LPLBUnavailableError,
     ShadowCostModel,
     cube8_topology,
+    ring8_topology,
     run_deepseek_eplb,
     run_fastermoe,
     run_flexmoe,
     run_scale_eplb,
+    select_lplb_topology,
 )
-from baseline.benchmark import benchmark_trace
+from baseline.benchmark import _placement_details, _slot_counts, benchmark_trace
 from baseline.deepseek_eplb import rebalance_experts
 from baseline.fastermoe import select_shadow_experts
 from baseline.flexmoe import flexmoe_schedule
@@ -24,6 +26,11 @@ from eplb import EPLBConfig, ProblemSpec, Topology
 from eplb.integration.megatron import MegatronEPLBHook
 from eplb.integration.rebalancer import EPLBRebalancer
 from eplb.loads import Loads
+
+
+def test_common_n_slot_counts_only_additional_replicas():
+    # 640 experts / 32 ranks = 20 mains; N_slot=4 adds four replicas, not four total slots.
+    assert _slot_counts(640, 32, 4) == (20, 24)
 
 
 def test_vendored_deepseek_eplb_reference_example():
@@ -58,12 +65,13 @@ def test_deepseek_adapter_uses_all_slots_and_conserves_predicted_load():
     )
 
     result = run_deepseek_eplb(
-        loads, num_nodes=1, num_gpus=4, n_slot=2, num_groups=1
+        loads, num_nodes=1, num_gpus=4, n_slot=1, num_groups=1
     )
 
     assert result.placement is not None
-    assert result.metadata["replicas"] == 8
-    assert result.placement.sum().item() == result.metadata["replicas"]
+    assert result.metadata["replicas"] == 4
+    assert result.metadata["physical_instances"] == 8
+    assert result.placement.sum().item() == result.metadata["physical_instances"]
     assert result.placement.sum(dim=1).min().item() >= 1
     assert torch.isclose(result.rank_load.sum(), loads.omega.sum().double())
 
@@ -76,7 +84,7 @@ def test_deepseek_adapter_places_from_history_not_current_load():
         current,
         num_nodes=1,
         num_gpus=4,
-        n_slot=2,
+        n_slot=1,
         num_groups=1,
         placement_loads=history,
     )
@@ -122,13 +130,25 @@ def test_fastermoe_shadows_hot_expert_and_conserves_load():
         n_slot=4,
     )
 
-    result = run_fastermoe(loads, spec, num_ranks=4)
+    result = run_fastermoe(loads, spec, num_ranks=4, n_slot=1)
 
     baseline_theta = float(omega.sum(dim=0).max().item())
     assert result.metadata["shadowed_experts"] >= 1
     assert result.placement is not None
     # A shadowed expert is replicated onto every rank.
     assert bool(result.placement[0].all())
+    # N_slot=1 means no rank may host more than one additional copy.
+    main_presence = torch.zeros_like(result.placement)
+    main_presence[torch.arange(4), spec.main_rank] = 1
+    assert int((result.placement - main_presence).sum(dim=0).max().item()) <= 1
+    assert result.metadata["replica_slots_per_rank"] == 1
+    details = _placement_details(result, loads, spec)
+    assert details["summary"]["replica_instances"] == result.metadata["replicas"]
+    assert details["relocation_events"] == []
+    assert {
+        (event["expert"], event["source_main_rank"], event["destination_rank"])
+        for event in details["replica_transfer_events"]
+    } == {(0, 0, 1), (0, 0, 2), (0, 0, 3)}
     # Redistribution strictly lowers the peak and conserves total token work.
     assert result.theta < baseline_theta
     assert torch.isclose(result.rank_load.sum(), loads.omega.sum().double())
@@ -151,6 +171,7 @@ def test_fastermoe_leaves_balanced_load_untouched():
         spec.s_tok,
         4,
         ShadowCostModel(),
+        1,
     )
 
     # Already balanced: broadcasting weights only adds overhead, so shadow nothing.
@@ -178,11 +199,20 @@ def test_flexmoe_replicates_hot_expert_and_conserves_load():
         n_slot=2,
     )
 
-    result = run_flexmoe(loads, spec, num_ranks=4, cost=FlexMoECostModel(threshold=1.2))
+    result = run_flexmoe(
+        loads,
+        spec,
+        num_ranks=4,
+        n_slot=1,
+        cost=FlexMoECostModel(threshold=1.2),
+    )
 
     baseline_theta = float(omega.sum(dim=0).max().item())
     # The hot expert must receive multiple vExperts, cutting the peak load.
-    assert result.metadata["replicas"] > spec.num_experts
+    assert result.metadata["replicas"] > 0
+    assert result.metadata["physical_instances"] > spec.num_experts
+    assert result.metadata["physical_instances"] <= spec.num_experts + 4
+    assert result.metadata["replica_slots_per_rank"] == 1
     assert bool(result.placement[0].sum() >= 2)
     assert result.theta < baseline_theta
     assert torch.isclose(result.rank_load.sum(), loads.omega.sum().double())
@@ -194,10 +224,10 @@ def test_flexmoe_threshold_controls_replication_effort():
     weight_bytes = torch.tensor([1] * 4)
 
     tight = flexmoe_schedule(
-        omega, weight_bytes, 4, 3, FlexMoECostModel(threshold=1.05)
+        omega, weight_bytes, 4, 2, FlexMoECostModel(threshold=1.05)
     )
     loose = flexmoe_schedule(
-        omega, weight_bytes, 4, 3, FlexMoECostModel(threshold=2.0)
+        omega, weight_bytes, 4, 2, FlexMoECostModel(threshold=2.0)
     )
 
     tight_ratio = tight[1].max().item() / tight[1].mean().item()
@@ -216,11 +246,21 @@ def test_cube8_topology_matches_lplb_shape_contract():
     assert torch.all((topology >= 0) & (topology < 8))
 
 
+def test_ring8_topology_supports_one_replica_slot_per_rank():
+    topology = ring8_topology()
+
+    assert topology.shape == (8, 1)
+    assert topology[:, 0].tolist() == [1, 2, 3, 4, 5, 6, 7, 0]
+    assert select_lplb_topology("auto", 1)[0] == "ring"
+    assert select_lplb_topology("auto", 2)[0] == "cube"
+    assert select_lplb_topology("ring", 3)[1].shape[1] == 1
+
+
 def test_lplb_without_cuda_is_reported_as_unavailable(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
     with pytest.raises(LPLBUnavailableError, match="requires CUDA"):
-        LPLBBaseline(num_experts=64, ep_size=8, n_slot=10)
+        LPLBBaseline(num_experts=64, ep_size=8, n_slot=2)
 
 
 def _write_trace(path, *, ranks=4, experts=8, n_slot=4, samples=3, seed=0):

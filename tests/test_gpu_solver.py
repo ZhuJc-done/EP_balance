@@ -11,6 +11,7 @@ the benchmark measures solver kernels, not distributed communication.
 """
 
 import argparse
+import json
 import statistics
 import time
 from dataclasses import dataclass
@@ -61,6 +62,57 @@ def test_gpu_solver_matches_reference_quality(skew, nodes, gpus, experts, n_slot
     assert theta_gpu <= theta_cpu * 1.25 + 1, (
         f"CUDA theta {theta_gpu} exceeds reference {theta_cpu} beyond tolerance"
     )
+
+
+def test_stage1_single_sort_preserves_lexicographic_candidate_order():
+    ranks, experts, domains = 8, 32, 2
+    loads = make_loads(
+        ranks,
+        experts,
+        tokens_per_rank=2048,
+        top_k=6,
+        skew=1.5,
+        hotspot_ranks=0.25,
+        seed=7,
+        device="cuda",
+    )
+    topology = Topology.from_nvlink_rdma(domains, ranks // domains, 1, 8, "cuda")
+    spec = ProblemSpec.uniform_main_placement(
+        experts,
+        ranks,
+        1_000_000,
+        4096,
+        experts // ranks + 2,
+        device="cuda",
+    )
+    actual = cuda_solver._stage1_candidates(loads, topology, spec)
+
+    dom = topology.domain_of_rank
+    demand = loads.domain_demand(dom, domains)
+    expert = torch.arange(experts, device="cuda", dtype=torch.int64).repeat_interleave(
+        domains
+    )
+    domain = torch.arange(domains, device="cuda", dtype=torch.int64).repeat(experts)
+    tokens = demand[domain, expert]
+    weight = spec.weight_bytes[expert]
+    benefit = 2 * tokens * int(spec.s_tok) - weight
+    main_domain = dom[spec.main_rank]
+    valid = (
+        (domain != main_domain[expert])
+        & (tokens > 0)
+        & (benefit > 0)
+    )
+    legacy_order = torch.arange(experts * domains, device="cuda")
+    for key in (domain, expert, -benefit, (~valid).to(torch.int64)):
+        legacy_order = legacy_order[
+            torch.argsort(key[legacy_order], stable=True)
+        ]
+    valid_count = int(valid.sum().item())
+
+    assert torch.equal(actual[0][:valid_count], expert[legacy_order][:valid_count])
+    assert torch.equal(actual[1][:valid_count], domain[legacy_order][:valid_count])
+    assert torch.all(actual[2][:valid_count] == 1)
+    assert torch.all(actual[2][valid_count:] == 0)
 
 
 @pytest.mark.parametrize("u_min", [1, 2, 4])
@@ -163,6 +215,40 @@ def test_cuda_solver_is_deterministic_and_constraint_safe():
     assert report.ok, report.violations
 
 
+def test_stage2_stagnation_probe_is_bitwise_deterministic():
+    ranks, experts = 32, 128
+    loads = Loads(
+        make_loads(
+            ranks,
+            experts,
+            tokens_per_rank=4096,
+            top_k=8,
+            skew=1.5,
+            hotspot_ranks=0.25,
+            seed=0,
+            device="cuda",
+        ).omega
+    )
+    topo = Topology.from_nvlink_rdma(4, 8, device="cuda")
+    spec = ProblemSpec.uniform_main_placement(
+        experts, ranks, 44_000_000, 7168 * 2, 6, device="cuda"
+    )
+    early_cfg = EPLBConfig(stage2_stagnation_patience=8)
+    full_cfg = EPLBConfig(stage2_stagnation_patience=64)
+
+    first = solve(loads, topo, spec, early_cfg, validate=False)
+    second = solve(loads, topo, spec, early_cfg, validate=False)
+    full = solve(loads, topo, spec, full_cfg, validate=False)
+    torch.cuda.synchronize()
+
+    assert torch.equal(first.x, second.x)
+    assert torch.equal(first.q, second.q)
+    assert torch.equal(first.theta, second.theta)
+    assert torch.equal(first.theta, full.theta)
+    report = check_constraints(first, loads, topo, spec, early_cfg)
+    assert report.ok, report.violations
+
+
 def test_cuda_solver_has_no_host_sync_after_warmup():
     loads = Loads(torch.tensor([[16, 8], [8, 16]], device="cuda"))
     topo = Topology.from_nvlink_rdma(1, 2, device="cuda")
@@ -199,8 +285,10 @@ class _PreparedKernel:
     u: torch.Tensor
     load_out: torch.Tensor
     stuck: torch.Tensor
+    stage2_control: torch.Tensor
     num_ranks: int
     num_experts: int
+    num_domains: int
     n_slot: int
 
     def reset_outputs(self) -> None:
@@ -211,6 +299,7 @@ class _PreparedKernel:
         self.u.zero_()
         self.load_out.zero_()
         self.stuck.zero_()
+        self.stage2_control.zero_()
 
 
 def _prepare_kernel_inputs(
@@ -259,8 +348,10 @@ def _prepare_kernel_inputs(
         ),
         load_out=torch.zeros(num_ranks, dtype=torch.int64, device=device),
         stuck=torch.zeros(num_ranks, dtype=torch.uint8, device=device),
+        stage2_control=torch.zeros(3, dtype=torch.int64, device=device),
         num_ranks=num_ranks,
         num_experts=num_experts,
+        num_domains=topology.sync_free_num_domains,
         n_slot=int(spec.n_slot),
     )
 
@@ -283,8 +374,11 @@ def _launch_prepared_cuda(
         prepared.slot_used,
         prepared.load_out,
         prepared.stuck,
+        prepared.stage2_control,
+        prepared.num_domains,
         prepared.n_slot,
         min(cfg.max_stage2_iters, cfg.max_fast_stage2_iters),
+        cfg.stage2_stagnation_patience,
         cfg.u_min,
         cfg.allow_cross_domain,
     )
@@ -358,6 +452,11 @@ def _parse_benchmark_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--cuda-device", type=int, default=0)
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the benchmark report as machine-readable JSON",
+    )
     return parser.parse_args()
 
 
@@ -454,6 +553,9 @@ def run_gpu_solver_benchmark(args: argparse.Namespace) -> dict[str, object]:
             "hotspot_ranks": 0.25,
             "max_stage2_iters": cfg.max_stage2_iters,
             "max_fast_stage2_iters": cfg.max_fast_stage2_iters,
+            "stage2_stagnation_patience": cfg.stage2_stagnation_patience,
+            "stage2_blocks": topology.sync_free_num_domains,
+            "stage2_budget_scope": "per_domain",
         },
         "jit_compile_ms": compile_ms,
     }
@@ -539,7 +641,10 @@ def _print_benchmark_report(report: dict[str, object]) -> None:
 def main() -> None:
     args = _parse_benchmark_args()
     report = run_gpu_solver_benchmark(args)
-    _print_benchmark_report(report)
+    if args.json:
+        print(json.dumps(report, indent=2, allow_nan=False))
+    else:
+        _print_benchmark_report(report)
 
 
 if __name__ == "__main__":

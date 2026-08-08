@@ -13,6 +13,11 @@
 namespace {
 
 constexpr int kMaxStage2Threads = 1024;
+constexpr int kWarpSize = 32;
+constexpr int kMaxWarps = kMaxStage2Threads / kWarpSize;
+constexpr int kStagnationProbeMaxThreads = 128;
+constexpr int kStagnationProbeMinRanks = 32;
+constexpr unsigned kFullWarpMask = 0xffffffffu;
 
 __device__ __forceinline__ int64_t min_i64(int64_t a, int64_t b) {
   return a < b ? a : b;
@@ -38,41 +43,65 @@ __global__ void stage1_admit_kernel(
     int num_ranks,
     int64_t num_candidates,
     int64_t num_slots) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
+  if (blockIdx.x != 0 || threadIdx.x >= kWarpSize) {
     return;
   }
 
+  const int lane = static_cast<int>(threadIdx.x);
+
   // Admissions are intentionally ordered by the pre-sorted benefit list.  This
-  // loop is small (E * actual_num_domains), while routing is fully parallel.
+  // loop preserves that order, while one warp cooperatively searches the ranks
+  // for the deterministic least-used target.
   for (int64_t c = 0; c < num_candidates; ++c) {
     if (candidate_valid[c] == 0) {
-      continue;
+      // _stage1_candidates sorts all valid entries before invalid entries.
+      break;
     }
     const int expert = static_cast<int>(candidate_expert[c]);
     const int64_t domain = candidate_domain[c];
-    bool already_present = false;
-    int target = -1;
-    int64_t target_slots = std::numeric_limits<int64_t>::max();
+    bool local_present = false;
+    int local_target = -1;
+    int64_t local_slots = std::numeric_limits<int64_t>::max();
 
-    for (int rank = 0; rank < num_ranks; ++rank) {
+    for (int rank = lane; rank < num_ranks; rank += kWarpSize) {
       if (dom[rank] != domain) {
         continue;
       }
       if (x[static_cast<int64_t>(expert) * num_ranks + rank] != 0) {
-        already_present = true;
+        local_present = true;
       }
       const int64_t used = slot_used[rank];
       if (used < num_slots &&
-          (used < target_slots || (used == target_slots && rank < target))) {
-        target = rank;
-        target_slots = used;
+          (used < local_slots ||
+           (used == local_slots &&
+            (local_target < 0 || rank < local_target)))) {
+        local_target = rank;
+        local_slots = used;
       }
     }
 
-    if (!already_present && target >= 0) {
-      x[static_cast<int64_t>(expert) * num_ranks + target] = 1;
-      ++slot_used[target];
+    const unsigned present_mask =
+        __ballot_sync(kFullWarpMask, local_present);
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+      const int other_target =
+          __shfl_down_sync(kFullWarpMask, local_target, offset);
+      const auto other_slots = static_cast<int64_t>(__shfl_down_sync(
+          kFullWarpMask,
+          static_cast<unsigned long long>(local_slots),
+          offset));
+      if (lane < offset && other_target >= 0 &&
+          (local_target < 0 || other_slots < local_slots ||
+           (other_slots == local_slots && other_target < local_target))) {
+        local_target = other_target;
+        local_slots = other_slots;
+      }
     }
+
+    if (lane == 0 && present_mask == 0 && local_target >= 0) {
+      x[static_cast<int64_t>(expert) * num_ranks + local_target] = 1;
+      ++slot_used[local_target];
+    }
+    __syncwarp(kFullWarpMask);
   }
 }
 
@@ -202,6 +231,31 @@ __device__ __forceinline__ bool better_candidate(
   return lhs.target < rhs.target;
 }
 
+__device__ __forceinline__ Candidate warp_reduce_candidate(Candidate value) {
+  const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+  for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+    const Candidate other{
+        static_cast<int64_t>(__shfl_down_sync(
+            kFullWarpMask,
+            static_cast<unsigned long long>(value.delta),
+            offset)),
+        static_cast<int64_t>(__shfl_down_sync(
+            kFullWarpMask,
+            static_cast<unsigned long long>(value.load),
+            offset)),
+        static_cast<int64_t>(__shfl_down_sync(
+            kFullWarpMask,
+            static_cast<unsigned long long>(value.cost),
+            offset)),
+        __shfl_down_sync(kFullWarpMask, value.expert, offset),
+        __shfl_down_sync(kFullWarpMask, value.target, offset)};
+    if (lane < offset && better_candidate(other, value)) {
+      value = other;
+    }
+  }
+  return value;
+}
+
 __device__ __forceinline__ int64_t safe_move(
     int64_t source_quota,
     int64_t target_quota,
@@ -220,6 +274,7 @@ __device__ __forceinline__ int64_t safe_move(
   return partial_cap >= minimum_partial ? partial_cap : 0;
 }
 
+template <bool EnableGlobalStop>
 __global__ void parallel_stage2_kernel(
     int8_t* x,
     const int64_t* cost,
@@ -229,35 +284,84 @@ __global__ void parallel_stage2_kernel(
     int64_t* slot_used,
     int64_t* rank_load,
     uint8_t* stuck,
+    const int64_t* stage2_control,
     int num_ranks,
     int num_experts,
     int64_t num_slots,
     int max_iterations,
+    int stagnation_patience,
     int64_t quota_floor) {
-  __shared__ Candidate candidates[kMaxStage2Threads];
+  __shared__ Candidate warp_candidates[kMaxWarps];
+  __shared__ int domain_ranks[kMaxStage2Threads];
+  __shared__ int64_t domain_rank_load[kMaxStage2Threads];
+  __shared__ int64_t domain_slot_used[kMaxStage2Threads];
+  __shared__ uint8_t domain_stuck[kMaxStage2Threads];
+  __shared__ int domain_rank_count;
+  __shared__ int busiest_index;
   __shared__ int busiest_rank;
   __shared__ int64_t busiest_load;
+  __shared__ int64_t best_domain_theta;
+  __shared__ int stagnant_iterations;
   __shared__ int finished;
 
   const int tid = static_cast<int>(threadIdx.x);
-  if (tid < num_ranks) {
-    stuck[tid] = 0;
+  if (EnableGlobalStop && stage2_control[2] != 0) {
+    return;
+  }
+  const int64_t domain_id = static_cast<int64_t>(blockIdx.x);
+  if (tid == 0) {
+    domain_rank_count = 0;
+    for (int rank = 0; rank < num_ranks; ++rank) {
+      if (dom[rank] == domain_id) {
+        const int index = domain_rank_count++;
+        domain_ranks[index] = rank;
+        domain_rank_load[index] = rank_load[rank];
+        domain_slot_used[index] = slot_used[rank];
+        domain_stuck[index] = EnableGlobalStop ? stuck[rank] : 0;
+      }
+    }
   }
   __syncthreads();
+  if (domain_rank_count == 0) {
+    return;
+  }
 
   for (int iteration = 0; iteration < max_iterations; ++iteration) {
     if (tid == 0) {
+      busiest_index = -1;
       busiest_rank = -1;
       busiest_load = -1;
-      for (int rank = 0; rank < num_ranks; ++rank) {
-        if (stuck[rank] == 0 &&
-            (rank_load[rank] > busiest_load ||
-             (rank_load[rank] == busiest_load && rank < busiest_rank))) {
+      int64_t domain_theta = -1;
+      for (int index = 0; index < domain_rank_count; ++index) {
+        const int rank = domain_ranks[index];
+        const int64_t load = domain_rank_load[index];
+        if (EnableGlobalStop) {
+          domain_theta = max_i64(domain_theta, load);
+        }
+        if (domain_stuck[index] == 0 &&
+            (load > busiest_load ||
+             (load == busiest_load && rank < busiest_rank))) {
+          busiest_index = index;
           busiest_rank = rank;
-          busiest_load = rank_load[rank];
+          busiest_load = load;
         }
       }
-      finished = busiest_rank < 0 || busiest_load <= 0;
+      if (EnableGlobalStop) {
+        if (iteration == 0) {
+          best_domain_theta = domain_theta;
+          stagnant_iterations = 0;
+        } else if (domain_theta < best_domain_theta) {
+          best_domain_theta = domain_theta;
+          stagnant_iterations = 0;
+        } else {
+          ++stagnant_iterations;
+        }
+      }
+      finished =
+          (EnableGlobalStop &&
+           stagnant_iterations >= stagnation_patience) ||
+          busiest_rank < 0 ||
+          busiest_load <= 0;
     }
     __syncthreads();
     if (finished) {
@@ -265,35 +369,37 @@ __global__ void parallel_stage2_kernel(
     }
 
     const int source_rank = busiest_rank;
-    const int64_t source_domain = dom[source_rank];
     Candidate local_best = invalid_candidate();
 
-    // Experts are distributed over the block; each thread only scans target
-    // ranks in the overloaded rank's domain.
+    // Each block owns one domain. Experts are distributed over its threads and
+    // all mutable rank-level state stays in shared memory until the final flush.
     for (int expert = tid; expert < num_experts; expert += blockDim.x) {
       const int64_t available =
           expert_rank_load[static_cast<int64_t>(expert) * num_ranks + source_rank];
       if (available <= 0) {
         continue;
       }
-      for (int target = 0; target < num_ranks; ++target) {
-        if (target == source_rank || dom[target] != source_domain ||
-            rank_load[target] >= busiest_load) {
+      for (int target_index = 0;
+           target_index < domain_rank_count;
+           ++target_index) {
+        const int target = domain_ranks[target_index];
+        const int64_t target_load = domain_rank_load[target_index];
+        if (target == source_rank || target_load >= busiest_load) {
           continue;
         }
         const bool is_host =
             x[static_cast<int64_t>(expert) * num_ranks + target] != 0;
-        if (!is_host && slot_used[target] >= num_slots) {
+        if (!is_host && domain_slot_used[target_index] >= num_slots) {
           continue;
         }
-        const int64_t gap = busiest_load - rank_load[target];
+        const int64_t gap = busiest_load - target_load;
         const int64_t delta = min_i64(available, gap / 2);
         if (delta < quota_floor) {
           continue;
         }
         const Candidate candidate{
             delta,
-            rank_load[target],
+            target_load,
             cost[static_cast<int64_t>(source_rank) * num_ranks + target],
             expert,
             target};
@@ -303,20 +409,36 @@ __global__ void parallel_stage2_kernel(
       }
     }
 
-    candidates[tid] = local_best;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (tid < stride &&
-          better_candidate(candidates[tid + stride], candidates[tid])) {
-        candidates[tid] = candidates[tid + stride];
-      }
-      __syncthreads();
+    const int lane = tid & (kWarpSize - 1);
+    const int warp = tid / kWarpSize;
+    const int num_warps = static_cast<int>(blockDim.x) / kWarpSize;
+    const Candidate warp_best = warp_reduce_candidate(local_best);
+    if (lane == 0) {
+      warp_candidates[warp] = warp_best;
     }
+    __syncthreads();
+
+    if (warp == 0) {
+      Candidate block_best =
+          lane < num_warps ? warp_candidates[lane] : invalid_candidate();
+      block_best = warp_reduce_candidate(block_best);
+      if (lane == 0) {
+        warp_candidates[0] = block_best;
+      }
+    }
+    __syncthreads();
 
     if (tid == 0) {
-      const Candidate best = candidates[0];
+      const Candidate best = warp_candidates[0];
+      int target_index = -1;
+      for (int index = 0; index < domain_rank_count; ++index) {
+        if (domain_ranks[index] == best.target) {
+          target_index = index;
+          break;
+        }
+      }
       if (best.delta <= 0) {
-        stuck[source_rank] = 1;
+        domain_stuck[busiest_index] = 1;
       } else {
         int64_t transfer_limit = best.delta;
         int64_t remaining = transfer_limit;
@@ -357,13 +479,13 @@ __global__ void parallel_stage2_kernel(
         }
 
         if (actual < quota_floor) {
-          stuck[source_rank] = 1;
+          domain_stuck[busiest_index] = 1;
         } else {
           const int64_t placement_offset =
               static_cast<int64_t>(best.expert) * num_ranks + best.target;
           if (x[placement_offset] == 0) {
             x[placement_offset] = 1;
-            ++slot_used[best.target];
+            ++domain_slot_used[target_index];
           }
 
           remaining = transfer_limit;
@@ -391,18 +513,65 @@ __global__ void parallel_stage2_kernel(
               static_cast<int64_t>(best.expert) * num_ranks + best.target;
           expert_rank_load[source_u_offset] -= actual;
           expert_rank_load[target_u_offset] += actual;
-          rank_load[source_rank] -= actual;
-          rank_load[best.target] += actual;
+          domain_rank_load[busiest_index] -= actual;
+          domain_rank_load[target_index] += actual;
 
-          for (int rank = 0; rank < num_ranks; ++rank) {
-            if (dom[rank] == source_domain) {
-              stuck[rank] = 0;
-            }
+          for (int index = 0; index < domain_rank_count; ++index) {
+            domain_stuck[index] = 0;
           }
         }
       }
     }
     __syncthreads();
+  }
+
+  for (int index = tid;
+       index < domain_rank_count;
+       index += static_cast<int>(blockDim.x)) {
+    const int rank = domain_ranks[index];
+    rank_load[rank] = domain_rank_load[index];
+    slot_used[rank] = domain_slot_used[index];
+    stuck[rank] = domain_stuck[index];
+  }
+}
+
+__global__ void initialize_stage2_control_kernel(
+    const int64_t* rank_load,
+    int64_t* stage2_control,
+    int num_ranks) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  int64_t theta = -1;
+  for (int rank = 0; rank < num_ranks; ++rank) {
+    theta = max_i64(theta, rank_load[rank]);
+  }
+  stage2_control[0] = theta;
+  stage2_control[1] = 0;
+  stage2_control[2] = 0;
+}
+
+__global__ void update_stage2_control_kernel(
+    const int64_t* rank_load,
+    int64_t* stage2_control,
+    int num_ranks,
+    int completed_iterations,
+    int stagnation_patience) {
+  if (blockIdx.x != 0 || threadIdx.x != 0 || stage2_control[2] != 0) {
+    return;
+  }
+  int64_t theta = -1;
+  for (int rank = 0; rank < num_ranks; ++rank) {
+    theta = max_i64(theta, rank_load[rank]);
+  }
+  if (theta < stage2_control[0]) {
+    stage2_control[0] = theta;
+    stage2_control[1] = 0;
+  } else {
+    stage2_control[1] += completed_iterations;
+    if (stage2_control[1] >= stagnation_patience) {
+      stage2_control[2] = 1;
+    }
   }
 }
 
@@ -426,8 +595,11 @@ void fast_solve_cuda(
     torch::Tensor slot_used,
     torch::Tensor rank_load,
     torch::Tensor stuck,
+    torch::Tensor stage2_control,
+    int64_t num_domains,
     int64_t num_slots,
     int64_t max_stage2_iterations,
+    int64_t stage2_stagnation_patience,
     int64_t quota_floor,
     bool allow_cross_domain) {
   check_cuda_contiguous(omega, "omega");
@@ -442,30 +614,43 @@ void fast_solve_cuda(
   check_cuda_contiguous(slot_used, "slot_used");
   check_cuda_contiguous(rank_load, "rank_load");
   check_cuda_contiguous(stuck, "stuck");
+  check_cuda_contiguous(stage2_control, "stage2_control");
 
   TORCH_CHECK(omega.scalar_type() == torch::kInt64, "omega must be int64");
   TORCH_CHECK(x.scalar_type() == torch::kInt8, "x must be int8");
   TORCH_CHECK(q.scalar_type() == torch::kInt64, "q must be int64");
   TORCH_CHECK(stuck.scalar_type() == torch::kUInt8, "stuck must be uint8");
+  TORCH_CHECK(
+      stage2_control.scalar_type() == torch::kInt64,
+      "stage2_control must be int64");
+  TORCH_CHECK(
+      stage2_control.numel() >= 3,
+      "stage2_control must contain at least three values");
   TORCH_CHECK(omega.dim() == 2, "omega must have shape [R, E]");
 
   const int num_ranks = static_cast<int>(omega.size(0));
   const int num_experts = static_cast<int>(omega.size(1));
   TORCH_CHECK(num_ranks > 0 && num_ranks <= 1024, "fast CUDA solver requires 1 <= R <= 1024");
   TORCH_CHECK(num_experts > 0, "fast CUDA solver requires E > 0");
+  TORCH_CHECK(
+      num_domains > 0 && num_domains <= num_ranks,
+      "fast CUDA solver requires 1 <= num_domains <= R");
   TORCH_CHECK(x.sizes() == torch::IntArrayRef({num_experts, num_ranks}), "x shape mismatch");
   TORCH_CHECK(
       q.sizes() == torch::IntArrayRef({num_ranks, num_experts, num_ranks}),
       "q shape mismatch");
   TORCH_CHECK(num_slots > 0, "num_slots must be positive");
   TORCH_CHECK(max_stage2_iterations > 0, "max_stage2_iterations must be positive");
+  TORCH_CHECK(
+      stage2_stagnation_patience > 0,
+      "stage2_stagnation_patience must be positive");
   TORCH_CHECK(quota_floor > 0, "quota_floor must be positive");
 
   const c10::cuda::CUDAGuard device_guard(omega.device());
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(omega.get_device());
 
   if (allow_cross_domain && candidate_expert.numel() > 0) {
-    stage1_admit_kernel<<<1, 1, 0, stream>>>(
+    stage1_admit_kernel<<<1, kWarpSize, 0, stream>>>(
         x.data_ptr<int8_t>(),
         dom.data_ptr<int64_t>(),
         candidate_expert.data_ptr<int64_t>(),
@@ -498,20 +683,82 @@ void fast_solve_cuda(
   while (stage2_threads < stage2_width) {
     stage2_threads <<= 1;
   }
-  parallel_stage2_kernel<<<1, stage2_threads, 0, stream>>>(
-      x.data_ptr<int8_t>(),
-      cost.data_ptr<int64_t>(),
-      dom.data_ptr<int64_t>(),
-      q.data_ptr<int64_t>(),
-      expert_rank_load.data_ptr<int64_t>(),
-      slot_used.data_ptr<int64_t>(),
-      rank_load.data_ptr<int64_t>(),
-      stuck.data_ptr<uint8_t>(),
-      num_ranks,
-      num_experts,
-      num_slots,
-      static_cast<int>(max_stage2_iterations),
-      quota_floor);
+  const bool use_stagnation_probe =
+      stage2_threads <= kStagnationProbeMaxThreads &&
+      num_ranks >= kStagnationProbeMinRanks &&
+      max_stage2_iterations > stage2_stagnation_patience + 1;
+  if (use_stagnation_probe) {
+    initialize_stage2_control_kernel<<<1, 1, 0, stream>>>(
+        rank_load.data_ptr<int64_t>(),
+        stage2_control.data_ptr<int64_t>(),
+        num_ranks);
+    const auto launch_stage2_probe = [&](int iterations) {
+      parallel_stage2_kernel<true><<<
+          static_cast<int>(num_domains),
+          stage2_threads,
+          0,
+          stream>>>(
+          x.data_ptr<int8_t>(),
+          cost.data_ptr<int64_t>(),
+          dom.data_ptr<int64_t>(),
+          q.data_ptr<int64_t>(),
+          expert_rank_load.data_ptr<int64_t>(),
+          slot_used.data_ptr<int64_t>(),
+          rank_load.data_ptr<int64_t>(),
+          stuck.data_ptr<uint8_t>(),
+          stage2_control.data_ptr<int64_t>(),
+          num_ranks,
+          num_experts,
+          num_slots,
+          iterations,
+          static_cast<int>(stage2_stagnation_patience),
+          quota_floor);
+    };
+
+    // The first repair round can sharply reduce theta after full routing, so it
+    // establishes the baseline and does not count as a stagnant round.
+    launch_stage2_probe(1);
+    int64_t remaining_iterations = max_stage2_iterations - 1;
+    initialize_stage2_control_kernel<<<1, 1, 0, stream>>>(
+        rank_load.data_ptr<int64_t>(),
+        stage2_control.data_ptr<int64_t>(),
+        num_ranks);
+    const int probe_iterations = static_cast<int>(std::min<int64_t>(
+        stage2_stagnation_patience,
+        remaining_iterations));
+    launch_stage2_probe(probe_iterations);
+    remaining_iterations -= probe_iterations;
+    if (remaining_iterations > 0) {
+      update_stage2_control_kernel<<<1, 1, 0, stream>>>(
+          rank_load.data_ptr<int64_t>(),
+          stage2_control.data_ptr<int64_t>(),
+          num_ranks,
+          probe_iterations,
+          static_cast<int>(stage2_stagnation_patience));
+      launch_stage2_probe(static_cast<int>(remaining_iterations));
+    }
+  } else {
+    parallel_stage2_kernel<false><<<
+        static_cast<int>(num_domains),
+        stage2_threads,
+        0,
+        stream>>>(
+        x.data_ptr<int8_t>(),
+        cost.data_ptr<int64_t>(),
+        dom.data_ptr<int64_t>(),
+        q.data_ptr<int64_t>(),
+        expert_rank_load.data_ptr<int64_t>(),
+        slot_used.data_ptr<int64_t>(),
+        rank_load.data_ptr<int64_t>(),
+        stuck.data_ptr<uint8_t>(),
+        stage2_control.data_ptr<int64_t>(),
+        num_ranks,
+        num_experts,
+        num_slots,
+        static_cast<int>(max_stage2_iterations),
+        static_cast<int>(stage2_stagnation_patience),
+        quota_floor);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

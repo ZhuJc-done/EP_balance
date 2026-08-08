@@ -16,7 +16,8 @@ class EPLBConfig:
     u_min: int = 1  # minimum routing quota granularity (C5)
     allow_cross_domain: bool = True  # if False, Stage 1 is skipped (single-domain runs)
     max_stage2_iters: int = 4096  # safety cap on replicas Stage 2 may add
-    max_fast_stage2_iters: int = 64  # bounded repair budget for the latency backend
+    max_fast_stage2_iters: int = 64  # deterministic repair budget per topology domain
+    stage2_stagnation_patience: int = 8  # non-improving rounds in Stage 2 θ probes
     theta_bisect_iters: int = 24  # reserved for an explicit θ-bisection variant
 
     def __post_init__(self) -> None:
@@ -28,6 +29,7 @@ class EPLBConfig:
             "u_min",
             "max_stage2_iters",
             "max_fast_stage2_iters",
+            "stage2_stagnation_patience",
             "theta_bisect_iters",
         ):
             if int(getattr(self, name)) <= 0:

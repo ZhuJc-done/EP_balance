@@ -59,9 +59,12 @@ def _stage1_candidates(loads, topo, spec):
         & (weight < 2 * tokens * int(spec.s_tok))
     )
 
-    order = torch.arange(experts * domains, device=device, dtype=torch.int64)
-    for key in (domain, expert, -benefit, (~valid).to(torch.int64)):
-        order = order[torch.argsort(key[order], stable=True)]
+    # ``expert``/``domain`` are already in deterministic lexicographic order.
+    # Every valid candidate has strictly positive benefit, so one stable sort
+    # preserves the expert/domain tie-break while placing all invalid entries
+    # after the descending-benefit valid prefix consumed by the CUDA kernel.
+    priority = torch.where(valid, benefit, torch.full_like(benefit, -1))
+    order = torch.argsort(priority, descending=True, stable=True)
     return (
         expert[order].contiguous(),
         domain[order].contiguous(),
@@ -93,6 +96,7 @@ def solve_cuda(loads, topo, spec, cfg) -> Plan:
     )
     rank_load = torch.zeros(ranks, dtype=torch.int64, device=device)
     stuck = torch.zeros(ranks, dtype=torch.uint8, device=device)
+    stage2_control = torch.zeros(3, dtype=torch.int64, device=device)
 
     backend.fast_solve(
         omega,
@@ -107,8 +111,11 @@ def solve_cuda(loads, topo, spec, cfg) -> Plan:
         slot_used,
         rank_load,
         stuck,
+        stage2_control,
+        int(topo.sync_free_num_domains),
         int(spec.n_slot),
         min(int(cfg.max_stage2_iters), int(cfg.max_fast_stage2_iters)),
+        int(cfg.stage2_stagnation_patience),
         int(cfg.u_min),
         bool(cfg.allow_cross_domain),
     )

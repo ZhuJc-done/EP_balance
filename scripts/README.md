@@ -18,7 +18,10 @@ Run MoE on real Megatron-LM with Scale-EPLB, in two stages selected by `EPLB_MOD
 | `run_phaseC.sh` | `torchrun` launcher, apply mode, end-to-end training. |
 | `run_gb200_4x4.sh` | Multi-node 4 nodes x 4 GB200 launcher: Slurm auto-discovery + GB200 NCCL/RDMA env; mock-data smoke test by default, `REAL=1` forwards to `run_real_moe.sh`. |
 | `sbatch_gb200_4x4.sbatch` | Slurm wrapper (`sbatch`) that `srun`s `run_gb200_4x4.sh` (1 task/node). |
-| `run_real_moe.sh` | Real-model launcher (Qwen3-30B-A3B / Mixtral); `REAL=1` from `run_gb200_4x4.sh` forwards here. `MOCK=1` = mock-data + random init, `DEEPEP=1` = native DeepEP dispatch. |
+| `run_real_moe.sh` | Real-model launcher (Qwen3-30B-A3B / Mixtral); `REAL=1` from `run_gb200_4x4.sh` forwards here. `MOCK=1` = mock-data + random init; `MOCK=0 FROM_SCRATCH=1` = real data + random init; `DEEPEP=1` = native DeepEP dispatch. |
+| `run_slot_sweep.sh` | Sweep `N_slot=1..4` with workload seed 0 and save one non-detail baseline JSON per configuration; uses a fixed LPLB Ring topology. |
+| `run_solver_scaling.sh` | Sweep the Scale-EPLB CUDA solver over logical rank and expert counts and save hot-kernel JSON results. |
+| `eval/plot_solver_scaling.py` | Read an existing solver-scaling JSON directory and independently generate PNG/PDF plots. |
 | `install_megatron.sh` | Clone+install pinned community Megatron-LM, self-check `import megatron`. |
 | `install_deepep.sh` | Optional: clone+build DeepEP (NCCL Gin backend) for the sync-free transport. |
 | `convert_hf_to_mcore.sh` | Optional: convert a HF MoE checkpoint to mcore for realistic skew. |
@@ -70,6 +73,38 @@ Optional: `EPLB_TRACE_MAX` caps the number of captured samples (0 = all),
 each strategy's reported quality is defined.
 
 ## Measuring: latency breakdown, straggler, and the N_slot sweep
+
+Solver-only scalability does not require a distributed launch. One physical GPU
+simulates the full logical problem and times only the hot `fast_solver.cu` kernels;
+JIT compilation is recorded separately and excluded from the plotted latency:
+
+```bash
+# Step 1: run the benchmark and write JSON only
+bash scripts/run_solver_scaling.sh
+# -> logs/solver_scaling/{rank_scale,expert_scale}_r*_e*.json
+
+# Step 2: plot the existing JSON results
+python eval/plot_solver_scaling.py --input-dir logs/solver_scaling
+# -> logs/solver_scaling/solver_scaling.{png,pdf}
+```
+
+The plot uses `kernel_only.min_us`, the fastest measured iteration for each
+configuration, and labels every point directly. Mean, p50, p95, and max remain
+available in the JSON for variability analysis but are not drawn.
+
+The default rank sweep holds `E=640` while varying `R=8..64`; the expert sweep
+holds `R=32` while varying `E=64..1024`. Both use four replica slots per rank,
+20 warmups, and 200 measured iterations. Override any dimension with environment
+variables, for example:
+
+```bash
+RANKS="8 16 32 64 128 256" RANK_SWEEP_EXPERTS=2048 \
+EXPERTS="128 256 512 1024 2048" EXPERT_SWEEP_RANKS=32 \
+EXTRA_SLOTS=4 ITERATIONS=500 bash scripts/run_solver_scaling.sh
+```
+
+Use an idle GPU for timing; unrelated kernels contaminate CUDA-event latency.
+Select the benchmark device with `CUDA_DEVICE=<id>`.
 
 `EPLB_PROFILE=1` emits a periodic per-region summary. CUDA events are **queued** and
 resolved in one batch, so timing injects no per-region host sync — an instrumented run
@@ -416,7 +451,8 @@ NNODES=4 NODE_RANK=$RANK MASTER_ADDR=$HEAD MASTER_PORT=29500 \
 ```
 
 Then escalate: `EPLB_MODE=apply` (active dispatcher), or `REAL=1 MODEL=qwen3_30b_a3b`
-plus `CHECKPOINT`/`DATA_PATH`/`TOKENIZER_MODEL` to forward to `run_real_moe.sh`.
+plus `DATA_PATH`/`TOKENIZER_MODEL` to forward to `run_real_moe.sh`. Choose either
+`FROM_SCRATCH=1` for random initialization or `CHECKPOINT=<mcore-dir>` for pretrained weights.
 `NCCL_SOCKET_IFNAME` is auto-detected (default route); set it (and `NCCL_IB_HCA`) only to override.
 
 ## Multi-node real model, 2 nodes x 4 GPUs = 8 ranks
@@ -437,8 +473,10 @@ NNODES=2 NODE_RANK=0 MASTER_ADDR=<NODE0_IP> MASTER_PORT=34567 GPUS_PER_NODE=4 \
 ```
 
 Toggles: `DEEPEP=1` (native DeepEP dispatch, off/observe only), `EPLB_MODE=observe|apply`
-(attach EPLB), drop `MOCK=1` + add `CHECKPOINT`/`DATA_PATH`/`TOKENIZER_MODEL` for real
-training. Experts always run the unfused `local` path, so absolute step times are higher
+(attach EPLB). For real data without a checkpoint, drop `MOCK=1` and add
+`FROM_SCRATCH=1 DATA_PATH=<prefix> TOKENIZER_MODEL=<repo-or-dir>`. To load pretrained
+weights instead, omit `FROM_SCRATCH=1` and add `CHECKPOINT=<mcore-dir>`. Experts always
+run the unfused `local` path, so absolute step times are higher
 than a production run — raise `GLOBAL_BATCH_SIZE`/`SEQ_LEN` with that in mind.
 
 ## Notes
