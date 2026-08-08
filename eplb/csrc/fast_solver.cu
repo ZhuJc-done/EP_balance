@@ -15,8 +15,6 @@ namespace {
 constexpr int kMaxStage2Threads = 1024;
 constexpr int kWarpSize = 32;
 constexpr int kMaxWarps = kMaxStage2Threads / kWarpSize;
-constexpr int kStagnationProbeMaxThreads = 128;
-constexpr int kStagnationProbeMinRanks = 32;
 constexpr unsigned kFullWarpMask = 0xffffffffu;
 
 __device__ __forceinline__ int64_t min_i64(int64_t a, int64_t b) {
@@ -41,18 +39,20 @@ __global__ void stage1_admit_kernel(
     const int64_t* candidate_valid,
     int64_t* slot_used,
     int num_ranks,
-    int64_t num_candidates,
+    int num_experts,
     int64_t num_slots) {
-  if (blockIdx.x != 0 || threadIdx.x >= kWarpSize) {
+  if (threadIdx.x >= kWarpSize) {
     return;
   }
 
   const int lane = static_cast<int>(threadIdx.x);
+  const int64_t candidate_begin =
+      static_cast<int64_t>(blockIdx.x) * num_experts;
 
-  // Admissions are intentionally ordered by the pre-sorted benefit list.  This
-  // loop preserves that order, while one warp cooperatively searches the ranks
-  // for the deterministic least-used target.
-  for (int64_t c = 0; c < num_candidates; ++c) {
+  // One warp owns one topology domain. Domain-local slot states are disjoint,
+  // so admissions commute across blocks while remaining ordered within a domain.
+  for (int index = 0; index < num_experts; ++index) {
+    const int64_t c = candidate_begin + index;
     if (candidate_valid[c] == 0) {
       // _stage1_candidates sorts all valid entries before invalid entries.
       break;
@@ -302,6 +302,9 @@ __global__ void parallel_stage2_kernel(
   __shared__ int64_t busiest_load;
   __shared__ int64_t best_domain_theta;
   __shared__ int stagnant_iterations;
+  __shared__ int64_t source_warp_prefix[kMaxWarps];
+  __shared__ int selected_target_index;
+  __shared__ int apply_parallel_move;
   __shared__ int finished;
 
   const int tid = static_cast<int>(threadIdx.x);
@@ -428,7 +431,112 @@ __global__ void parallel_stage2_kernel(
     }
     __syncthreads();
 
-    if (tid == 0) {
+    if (quota_floor == 1) {
+      if (tid == 0) {
+        const Candidate best = warp_candidates[0];
+        selected_target_index = -1;
+        for (int index = 0; index < domain_rank_count; ++index) {
+          if (domain_ranks[index] == best.target) {
+            selected_target_index = index;
+            break;
+          }
+        }
+        apply_parallel_move =
+            best.delta > 0 && selected_target_index >= 0;
+        if (!apply_parallel_move) {
+          domain_stuck[busiest_index] = 1;
+        } else {
+          const int64_t placement_offset =
+              static_cast<int64_t>(best.expert) * num_ranks + best.target;
+          if (x[placement_offset] == 0) {
+            x[placement_offset] = 1;
+            ++domain_slot_used[selected_target_index];
+          }
+        }
+      }
+      __syncthreads();
+
+      if (apply_parallel_move) {
+        const Candidate best = warp_candidates[0];
+        int64_t source_quota = 0;
+        int64_t target_quota = 0;
+        int64_t from_offset = 0;
+        int64_t to_offset = 0;
+        if (tid < num_ranks) {
+          from_offset =
+              (static_cast<int64_t>(tid) * num_experts + best.expert) *
+                  num_ranks +
+              source_rank;
+          to_offset =
+              (static_cast<int64_t>(tid) * num_experts + best.expert) *
+                  num_ranks +
+              best.target;
+          source_quota = q[from_offset];
+          target_quota = q[to_offset];
+        }
+
+        int64_t inclusive = source_quota;
+        for (int offset = 1; offset < kWarpSize; offset <<= 1) {
+          const int64_t other = static_cast<int64_t>(__shfl_up_sync(
+              kFullWarpMask,
+              static_cast<unsigned long long>(inclusive),
+              offset));
+          if (lane >= offset) {
+            inclusive += other;
+          }
+        }
+        if (lane == kWarpSize - 1) {
+          source_warp_prefix[warp] = inclusive;
+        }
+        __syncthreads();
+
+        if (warp == 0) {
+          int64_t warp_inclusive =
+              lane < num_warps ? source_warp_prefix[lane] : 0;
+          for (int offset = 1; offset < kWarpSize; offset <<= 1) {
+            const int64_t other = static_cast<int64_t>(__shfl_up_sync(
+                kFullWarpMask,
+                static_cast<unsigned long long>(warp_inclusive),
+                offset));
+            if (lane >= offset) {
+              warp_inclusive += other;
+            }
+          }
+          if (lane < num_warps) {
+            source_warp_prefix[lane] = warp_inclusive;
+          }
+        }
+        __syncthreads();
+
+        if (tid < num_ranks) {
+          const int64_t prior_warps =
+              warp == 0 ? 0 : source_warp_prefix[warp - 1];
+          const int64_t prefix_before =
+              prior_warps + inclusive - source_quota;
+          const int64_t move = min_i64(
+              source_quota,
+              max_i64(best.delta - prefix_before, 0));
+          q[from_offset] = source_quota - move;
+          q[to_offset] = target_quota + move;
+        }
+      }
+      __syncthreads();
+
+      if (tid == 0 && apply_parallel_move) {
+        const Candidate best = warp_candidates[0];
+        const int64_t source_u_offset =
+            static_cast<int64_t>(best.expert) * num_ranks + source_rank;
+        const int64_t target_u_offset =
+            static_cast<int64_t>(best.expert) * num_ranks + best.target;
+        expert_rank_load[source_u_offset] -= best.delta;
+        expert_rank_load[target_u_offset] += best.delta;
+        domain_rank_load[busiest_index] -= best.delta;
+        domain_rank_load[selected_target_index] += best.delta;
+        for (int index = 0; index < domain_rank_count; ++index) {
+          domain_stuck[index] = 0;
+        }
+      }
+    } else if (tid == 0) {
       const Candidate best = warp_candidates[0];
       int target_index = -1;
       for (int index = 0; index < domain_rank_count; ++index) {
@@ -515,7 +623,6 @@ __global__ void parallel_stage2_kernel(
           expert_rank_load[target_u_offset] += actual;
           domain_rank_load[busiest_index] -= actual;
           domain_rank_load[target_index] += actual;
-
           for (int index = 0; index < domain_rank_count; ++index) {
             domain_stuck[index] = 0;
           }
@@ -600,6 +707,7 @@ void fast_solve_cuda(
     int64_t num_slots,
     int64_t max_stage2_iterations,
     int64_t stage2_stagnation_patience,
+    bool stage2_patience_all_scales,
     int64_t quota_floor,
     bool allow_cross_domain) {
   check_cuda_contiguous(omega, "omega");
@@ -650,7 +758,7 @@ void fast_solve_cuda(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(omega.get_device());
 
   if (allow_cross_domain && candidate_expert.numel() > 0) {
-    stage1_admit_kernel<<<1, kWarpSize, 0, stream>>>(
+    stage1_admit_kernel<<<static_cast<int>(num_domains), kWarpSize, 0, stream>>>(
         x.data_ptr<int8_t>(),
         dom.data_ptr<int64_t>(),
         candidate_expert.data_ptr<int64_t>(),
@@ -658,7 +766,7 @@ void fast_solve_cuda(
         candidate_valid.data_ptr<int64_t>(),
         slot_used.data_ptr<int64_t>(),
         num_ranks,
-        candidate_expert.numel(),
+        num_experts,
         num_slots);
   }
 
@@ -684,8 +792,7 @@ void fast_solve_cuda(
     stage2_threads <<= 1;
   }
   const bool use_stagnation_probe =
-      stage2_threads <= kStagnationProbeMaxThreads &&
-      num_ranks >= kStagnationProbeMinRanks &&
+      stage2_patience_all_scales &&
       max_stage2_iterations > stage2_stagnation_patience + 1;
   if (use_stagnation_probe) {
     initialize_stage2_control_kernel<<<1, 1, 0, stream>>>(

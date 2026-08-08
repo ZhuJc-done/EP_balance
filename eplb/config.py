@@ -18,6 +18,7 @@ class EPLBConfig:
     max_stage2_iters: int = 4096  # safety cap on replicas Stage 2 may add
     max_fast_stage2_iters: int = 64  # deterministic repair budget per topology domain
     stage2_stagnation_patience: int = 8  # non-improving rounds in Stage 2 θ probes
+    stage2_patience_all_scales: bool = False  # opt-in universal probe; disabled by default
     theta_bisect_iters: int = 24  # reserved for an explicit θ-bisection variant
 
     def __post_init__(self) -> None:

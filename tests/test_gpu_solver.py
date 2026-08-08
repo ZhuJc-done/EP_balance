@@ -64,7 +64,7 @@ def test_gpu_solver_matches_reference_quality(skew, nodes, gpus, experts, n_slot
     )
 
 
-def test_stage1_single_sort_preserves_lexicographic_candidate_order():
+def test_stage1_batched_sort_preserves_domain_local_candidate_order():
     ranks, experts, domains = 8, 32, 2
     loads = make_loads(
         ranks,
@@ -107,12 +107,21 @@ def test_stage1_single_sort_preserves_lexicographic_candidate_order():
         legacy_order = legacy_order[
             torch.argsort(key[legacy_order], stable=True)
         ]
-    valid_count = int(valid.sum().item())
+    for domain_id in range(domains):
+        begin = domain_id * experts
+        end = begin + experts
+        expected = legacy_order[
+            valid[legacy_order] & (domain[legacy_order] == domain_id)
+        ]
+        valid_count = expected.numel()
 
-    assert torch.equal(actual[0][:valid_count], expert[legacy_order][:valid_count])
-    assert torch.equal(actual[1][:valid_count], domain[legacy_order][:valid_count])
-    assert torch.all(actual[2][:valid_count] == 1)
-    assert torch.all(actual[2][valid_count:] == 0)
+        assert torch.equal(
+            actual[0][begin : begin + valid_count],
+            expert[expected],
+        )
+        assert torch.all(actual[1][begin:end] == domain_id)
+        assert torch.all(actual[2][begin : begin + valid_count] == 1)
+        assert torch.all(actual[2][begin + valid_count : end] == 0)
 
 
 @pytest.mark.parametrize("u_min", [1, 2, 4])
@@ -203,7 +212,11 @@ def test_cuda_solver_is_deterministic_and_constraint_safe():
     spec = ProblemSpec.uniform_main_placement(
         experts, ranks, 1_000_000, 4096, 6, device="cuda"
     )
-    cfg = EPLBConfig(u_min=2, max_stage2_iters=64)
+    cfg = EPLBConfig(
+        u_min=2,
+        max_stage2_iters=64,
+        stage2_patience_all_scales=True,
+    )
     first = solve(loads, topo, spec, cfg, validate=False)
     second = solve(loads, topo, spec, cfg, validate=False)
     torch.cuda.synchronize()
@@ -233,7 +246,10 @@ def test_stage2_stagnation_probe_is_bitwise_deterministic():
     spec = ProblemSpec.uniform_main_placement(
         experts, ranks, 44_000_000, 7168 * 2, 6, device="cuda"
     )
-    early_cfg = EPLBConfig(stage2_stagnation_patience=8)
+    early_cfg = EPLBConfig(
+        stage2_stagnation_patience=8,
+        stage2_patience_all_scales=True,
+    )
     full_cfg = EPLBConfig(stage2_stagnation_patience=64)
 
     first = solve(loads, topo, spec, early_cfg, validate=False)
@@ -253,7 +269,10 @@ def test_cuda_solver_has_no_host_sync_after_warmup():
     loads = Loads(torch.tensor([[16, 8], [8, 16]], device="cuda"))
     topo = Topology.from_nvlink_rdma(1, 2, device="cuda")
     spec = ProblemSpec.uniform_main_placement(2, 2, 1, 1, 2, device="cuda")
-    cfg = EPLBConfig(max_stage2_iters=8)
+    cfg = EPLBConfig(
+        max_stage2_iters=16,
+        stage2_patience_all_scales=True,
+    )
     solve(loads, topo, spec, cfg, validate=False)
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
@@ -379,6 +398,7 @@ def _launch_prepared_cuda(
         prepared.n_slot,
         min(cfg.max_stage2_iters, cfg.max_fast_stage2_iters),
         cfg.stage2_stagnation_patience,
+        cfg.stage2_patience_all_scales,
         cfg.u_min,
         cfg.allow_cross_domain,
     )
@@ -453,6 +473,11 @@ def _parse_benchmark_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--cuda-device", type=int, default=0)
     parser.add_argument(
+        "--stage2-patience-all-scales",
+        action="store_true",
+        help="Force the deterministic Stage 2 stagnation probe at every scale",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Emit the benchmark report as machine-readable JSON",
@@ -515,7 +540,9 @@ def run_gpu_solver_benchmark(args: argparse.Namespace) -> dict[str, object]:
         n_slot,
         device=device,
     )
-    cfg = EPLBConfig()
+    cfg = EPLBConfig(
+        stage2_patience_all_scales=args.stage2_patience_all_scales
+    )
     baseline_rank_load = torch.zeros(
         num_ranks, dtype=torch.int64, device=device
     )
@@ -554,6 +581,7 @@ def run_gpu_solver_benchmark(args: argparse.Namespace) -> dict[str, object]:
             "max_stage2_iters": cfg.max_stage2_iters,
             "max_fast_stage2_iters": cfg.max_fast_stage2_iters,
             "stage2_stagnation_patience": cfg.stage2_stagnation_patience,
+            "stage2_patience_all_scales": cfg.stage2_patience_all_scales,
             "stage2_blocks": topology.sync_free_num_domains,
             "stage2_budget_scope": "per_domain",
         },

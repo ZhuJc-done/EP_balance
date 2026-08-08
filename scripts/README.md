@@ -103,6 +103,16 @@ EXPERTS="128 256 512 1024 2048" EXPERT_SWEEP_RANKS=32 \
 EXTRA_SLOTS=4 ITERATIONS=500 bash scripts/run_solver_scaling.sh
 ```
 
+To enable the deterministic Stage 2 patience probe at every scale for an A/B
+comparison, keep its JSON separate from the fixed-iteration default:
+
+```bash
+STAGE2_PATIENCE_ALL_SCALES=1 \
+OUT_DIR=logs/solver_scaling_patience_all \
+bash scripts/run_solver_scaling.sh
+python eval/plot_solver_scaling.py --input-dir logs/solver_scaling_patience_all
+```
+
 Use an idle GPU for timing; unrelated kernels contaminate CUDA-event latency.
 Select the benchmark device with `CUDA_DEVICE=<id>`.
 

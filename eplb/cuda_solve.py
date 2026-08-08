@@ -45,30 +45,26 @@ def _stage1_candidates(loads, topo, spec):
     dom = topo.domain_of_rank.to(torch.int64).contiguous()
     main_rank = spec.main_rank.to(torch.int64)
     demand = loads.domain_demand(dom, domains)
-    expert = torch.arange(experts, device=device, dtype=torch.int64).repeat_interleave(
-        domains
-    )
-    domain = torch.arange(domains, device=device, dtype=torch.int64).repeat(experts)
-    tokens = demand[domain, expert]
-    weight = spec.weight_bytes.to(torch.int64)[expert]
-    benefit = 2 * tokens * int(spec.s_tok) - weight
+    domain = torch.arange(domains, device=device, dtype=torch.int64).view(domains, 1)
+    weight = spec.weight_bytes.to(torch.int64).view(1, experts)
+    benefit = 2 * demand * int(spec.s_tok) - weight
     main_domain = dom[main_rank]
     valid = (
-        (domain != main_domain[expert])
-        & (tokens > 0)
-        & (weight < 2 * tokens * int(spec.s_tok))
+        (domain != main_domain.view(1, experts))
+        & (demand > 0)
+        & (weight < 2 * demand * int(spec.s_tok))
     )
 
-    # ``expert``/``domain`` are already in deterministic lexicographic order.
-    # Every valid candidate has strictly positive benefit, so one stable sort
-    # preserves the expert/domain tie-break while placing all invalid entries
-    # after the descending-benefit valid prefix consumed by the CUDA kernel.
+    # Domains have disjoint rank/slot state, so their admission streams commute.
+    # Sort each domain's experts independently and let one warp consume each row.
+    # Stable ties retain ascending expert id; invalid entries form a suffix.
     priority = torch.where(valid, benefit, torch.full_like(benefit, -1))
-    order = torch.argsort(priority, descending=True, stable=True)
+    order = torch.argsort(priority, dim=1, descending=True, stable=True)
+    ordered_domain = domain.expand(domains, experts)
     return (
-        expert[order].contiguous(),
-        domain[order].contiguous(),
-        valid[order].to(torch.int64).contiguous(),
+        order.reshape(-1).contiguous(),
+        ordered_domain.reshape(-1).contiguous(),
+        valid.gather(1, order).reshape(-1).to(torch.int64).contiguous(),
     )
 
 
@@ -116,6 +112,7 @@ def solve_cuda(loads, topo, spec, cfg) -> Plan:
         int(spec.n_slot),
         min(int(cfg.max_stage2_iters), int(cfg.max_fast_stage2_iters)),
         int(cfg.stage2_stagnation_patience),
+        bool(cfg.stage2_patience_all_scales),
         int(cfg.u_min),
         bool(cfg.allow_cross_domain),
     )

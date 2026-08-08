@@ -19,9 +19,14 @@ EXTRA_SLOTS="${EXTRA_SLOTS:-2}"
 WARMUP="${WARMUP:-20}"
 ITERATIONS="${ITERATIONS:-200}"
 CUDA_DEVICE="${CUDA_DEVICE:-0}"
+STAGE2_PATIENCE_ALL_SCALES="${STAGE2_PATIENCE_ALL_SCALES:-0}"
 
 read -r -a RANK_VALUES <<< "${RANKS}"
 read -r -a EXPERT_VALUES <<< "${EXPERTS}"
+PATIENCE_ARGS=()
+if [[ "${STAGE2_PATIENCE_ALL_SCALES}" == "1" ]]; then
+  PATIENCE_ARGS+=(--stage2-patience-all-scales)
+fi
 
 mkdir -p "${OUT_DIR}"
 cd "${EPLB_DIR}"
@@ -63,6 +68,7 @@ run_case() {
     --warmup "${WARMUP}" \
     --iterations "${ITERATIONS}" \
     --cuda-device "${CUDA_DEVICE}" \
+    "${PATIENCE_ARGS[@]}" \
     --json > "${CURRENT_TMP}"
 
   "${PYTHON_BIN}" -m json.tool "${CURRENT_TMP}" >/dev/null
