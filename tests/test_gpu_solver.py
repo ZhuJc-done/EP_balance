@@ -379,7 +379,7 @@ def _launch_prepared_cuda(
     prepared: _PreparedKernel,
     cfg: EPLBConfig,
 ) -> None:
-    """Launch the fine-grained CUDA admission, routing, and repair kernels."""
+    """Launch inter-node placement, Update Routing, and intra-node repair."""
     cuda_solver._get_backend().fast_solve(
         prepared.omega,
         prepared.x,

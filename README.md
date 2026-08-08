@@ -34,7 +34,8 @@ and validated on:
 | OS / Python | Linux `aarch64` (kernel 6.14) / Python 3.12.4 |
 | CUDA | 13.2 (PyTorch cu13 build) |
 | PyTorch | 2.11.0 (cu13 build) |
-| Megatron-Core / Megatron-LM | 0.19.0 (`main`, commit `0ff7226f6`) |
+| Megatron-Core / Megatron-LM | 0.19.0 (commit `0ff7226f6d8eba14c385a5d2ea658f92e4dcf40f`) |
+| DeepEP | 2.0.0 (commit `af9a0403188392824fc3057452822235873e0612`) |
 | NCCL / cuDNN | 2.28.9 / 9.22 |
 
 Megatron-LM and DeepEP are **external dependencies** (not vendored): install them with the
@@ -54,6 +55,11 @@ bash scripts/install_deepep.sh       # optional: DeepEP transport (NCCL Gin back
 # 3) make `eplb` importable
 pip install -e /home/tiger/EP_balance
 ```
+
+For disposable Merlin machines, `scripts/bootstrap_new_machine.sh` installs all
+three repositories and keeps datasets, HF caches, tokenizers, checkpoints, and
+logs under `/mnt/hdfs/__MERLIN_USER_DIR__/eplb_data`. See the
+[fresh-machine run book](scripts/README.md#fresh-machine-install-once-keep-artifacts-on-hdfs).
 
 `install_deepep.sh` is optional — the launchers fall back to `AllToAllAdapter` (torch
 `all_to_all_single`); install **DeepEP** for high-performance all-to-all transport.
@@ -76,6 +82,16 @@ pytest -q
 ```
 
 ## GPU solver
+
+The planner is organized as two algorithms:
+
+1. **Algorithm 1 — Inter-node Placement**
+   - **Inter-node Placement:** admit cross-domain replicas from per-domain demand.
+   - **Update Routing:** construct `Q[src, expert, dst]` from the resulting placement,
+     preferring same-domain instances and deterministically splitting each quota.
+2. **Algorithm 2 — Intra-node Replication**
+   - repair rank imbalance independently inside each topology domain by adding
+     domain-local replicas and incrementally updating the affected entries of `Q`.
 
 ```bash
 # Benchmark the CUDA solver (defaults to 32 nodes x 8 GPUs, 640 experts)

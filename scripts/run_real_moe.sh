@@ -22,6 +22,22 @@ fi
 # --- required paths / artifacts ----------------------------------------------
 MEGATRON_DIR="${MEGATRON_DIR:?set MEGATRON_DIR to the Megatron-LM repo root}"
 EPLB_DIR="${EPLB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Drop regular-package Megatron forks that would override the community
+# Megatron PEP420 namespace even when MEGATRON_DIR appears first.
+_clean_pp=""
+IFS=':' read -r -a _pp_parts <<< "${PYTHONPATH:-}"
+for _entry in "${_pp_parts[@]}"; do
+  [[ -z "${_entry}" ]] && continue
+  _keep=1
+  for _strip in ${EPLB_STRIP_PYTHONPATH:-/opt/tiger/mariana}; do
+    [[ "${_entry}" == "${_strip}" ]] && _keep=0
+  done
+  if [[ "${_keep}" == "1" ]]; then
+    _clean_pp="${_clean_pp:+${_clean_pp}:}${_entry}"
+  fi
+done
+export PYTHONPATH="${MEGATRON_DIR}:${EPLB_DIR}${_clean_pp:+:${_clean_pp}}"
+
 # MOCK=1: real model architecture, but mock-data + random init (no checkpoint/data/tokenizer needed) --
 # a pure-Megatron "does it run / throughput / memory" baseline.
 # MOCK=0 uses real tokenized data. Set FROM_SCRATCH=1 to random-initialize the model without a
@@ -69,7 +85,6 @@ EP="${EP:-8}"
 # --- EPLB mode ----------------------------------------------------------------
 EPLB_MODE="${EPLB_MODE:-observe}"           # off (pure Megatron) | observe (Phase B) | apply (Phase C)
 export EPLB_MODE GPUS_PER_NODE
-export PYTHONPATH="${MEGATRON_DIR}:${EPLB_DIR}:${PYTHONPATH:-}"
 
 # --- optional routing-trace capture (observe mode) ---------------------------
 # EPLB_TRACE_OUT=<path> makes rank 0 dump the real gathered Ω[R,E] per
@@ -104,7 +119,8 @@ fi
 #                           memory is mapped here. Default is to move those over NVLink with
 #                           load/store; with the EP group inside a node that is the whole weight
 #                           channel, so this is for A/B measurement only.
-# EPLB_DEEPEP_STATIC=1      statically size the DeepEP recv buffer; requires EPLB_CAP.
+# EPLB_DEEPEP_STATIC=1      reserved; the pinned DeepEP static path also requires top-k metadata
+#                           and padded-row handling that this adapter does not yet provide.
 # EPLB_CAP=<int>            pin the per-slot capacity (sizes the padded expert-GEMM batch and the
 #                           static DeepEP recv buffer -- a token/compute-side quantity, unrelated
 #                           to the weight channel). Unset derives it from the plan's exact per-slot
@@ -130,6 +146,10 @@ for _knob in EPLB_N_SLOT EPLB_PROFILE EPLB_PROFILE_ALL_RANKS EPLB_PROFILE_EVERY 
              EPLB_CHUNKS EPLB_MANUAL_BWD EPLB_OVERLAP EPLB_REMATERIALIZE; do
   if [[ -n "${!_knob:-}" ]]; then export "${_knob}"; fi
 done
+if [[ "${EPLB_DEEPEP_STATIC:-0}" == "1" ]]; then
+  echo "EPLB_DEEPEP_STATIC=1 is not supported by the pinned DeepEP adapter; use the default dynamic path" >&2
+  exit 1
+fi
 if [[ -n "${EPLB_N_SLOT:-}" ]]; then echo "[run_real_moe] EPLB_N_SLOT=${EPLB_N_SLOT} (slot budget override)"; fi
 if [[ "${EPLB_MODE}" == "apply" ]]; then
   echo "[run_real_moe] apply backends: adapter=${EPLB_ADAPTER:-alltoall} weight_comm=${EPLB_WEIGHT_COMM:-broadcast}" \
@@ -196,6 +216,11 @@ if [[ "${MODEL}" == "mixtral8x7b" ]]; then
     --moe-token-dispatcher-type alltoall
   )
 elif [[ "${MODEL}" == "qwen3_30b_a3b" ]]; then
+  # Megatron Bridge Qwen checkpoints store this RMSNorm as
+  # `pre_mlp_layernorm.*`; the local sequential spec otherwise aliases it to
+  # the fused-linear key and leaves the norm unloaded. Set 0 for checkpoints
+  # that already use `mlp.linear_fc1.layer_norm_*`.
+  export EPLB_SEPARATE_MLP_NORM_CKPT="${EPLB_SEPARATE_MLP_NORM_CKPT:-1}"
   MODEL_ARGS=(
     --use-mcore-models --disable-bias-linear --untie-embeddings-and-output-weights
     --seq-length "${SEQ_LEN:-8192}" --max-position-embeddings 8192
@@ -206,7 +231,7 @@ elif [[ "${MODEL}" == "qwen3_30b_a3b" ]]; then
     --position-embedding-type rope --rotary-base 1000000 --rotary-percent 1.0
     --swiglu --no-masked-softmax-fusion --attention-softmax-in-fp32
     --attention-dropout 0.0 --hidden-dropout 0.0
-    --make-vocab-size-divisible-by 128
+    --padded-vocab-size 151936 --make-vocab-size-divisible-by 128
   )
   MOE_ARGS=(
     --num-experts 128 --moe-router-topk 8 --moe-ffn-hidden-size 768
@@ -264,13 +289,18 @@ if [[ "${DEEPEP:-0}" == "1" ]]; then
   fi
 fi
 
+USE_DISTRIBUTED_OPTIMIZER="${USE_DISTRIBUTED_OPTIMIZER:-1}"
+if [[ "${USE_DISTRIBUTED_OPTIMIZER}" != "0" && "${USE_DISTRIBUTED_OPTIMIZER}" != "1" ]]; then
+  echo "invalid USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER} (expected 0 or 1)" >&2
+  exit 1
+fi
 PARALLEL_ARGS=(
   --tensor-model-parallel-size "${TP}"
   --pipeline-model-parallel-size "${PP}"
   --expert-model-parallel-size "${EP}"
-  --use-distributed-optimizer
   --distributed-backend nccl
 )
+[[ "${USE_DISTRIBUTED_OPTIMIZER}" == "1" ]] && PARALLEL_ARGS+=(--use-distributed-optimizer)
 [[ "${TP}" -gt 1 ]] && PARALLEL_ARGS+=(--sequence-parallel)   # sequence parallel requires TP>1
 
 if [[ "${MOCK}" == "1" ]]; then
@@ -315,7 +345,8 @@ DISTRIBUTED_ARGS=(
 
 # Tee stdout+stderr to a timestamped per-node log (pipefail keeps torchrun's exit code); override path via LOG_FILE, disable with LOG=0.
 LOG="${LOG:-1}"
-LOG_FILE="${LOG_FILE:-${EPLB_DIR}/logs/real_${MODEL}_${EPLB_MODE}_node${NODE_RANK}.log}"
+LOG_ROOT="${EPLB_LOG_DIR:-${EPLB_DIR}/logs}"
+LOG_FILE="${LOG_FILE:-${LOG_ROOT}/real_${MODEL}_${EPLB_MODE}_node${NODE_RANK}.log}"
 echo "[run_real_moe] model=${MODEL} mode=${EPLB_MODE} world=${WORLD_SIZE} TP=${TP} PP=${PP} EP=${EP}"
 [[ "${LOG}" != "0" ]] && { mkdir -p "$(dirname "${LOG_FILE}")"; echo "[run_real_moe] logging to ${LOG_FILE}"; }
 # Extra Megatron flags passed to this script go last, so argparse lets them override the recipe above

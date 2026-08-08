@@ -105,7 +105,7 @@ __global__ void stage1_admit_kernel(
   }
 }
 
-__global__ void parallel_route_kernel(
+__global__ void update_routing_kernel(
     const int64_t* omega,
     const int8_t* x,
     const int64_t* cost,
@@ -770,11 +770,15 @@ void fast_solve_cuda(
         num_slots);
   }
 
-  int route_threads = 32;
-  while (route_threads < num_ranks) {
-    route_threads <<= 1;
+  int update_routing_threads = 32;
+  while (update_routing_threads < num_ranks) {
+    update_routing_threads <<= 1;
   }
-  parallel_route_kernel<<<num_ranks * num_experts, route_threads, 0, stream>>>(
+  update_routing_kernel<<<
+      num_ranks * num_experts,
+      update_routing_threads,
+      0,
+      stream>>>(
       omega.data_ptr<int64_t>(),
       x.data_ptr<int8_t>(),
       cost.data_ptr<int64_t>(),
@@ -822,7 +826,7 @@ void fast_solve_cuda(
           quota_floor);
     };
 
-    // The first repair round can sharply reduce theta after full routing, so it
+    // The first repair round can sharply reduce theta after Update Routing, so it
     // establishes the baseline and does not count as a stagnant round.
     launch_stage2_probe(1);
     int64_t remaining_iterations = max_stage2_iterations - 1;

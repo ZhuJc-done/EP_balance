@@ -69,7 +69,7 @@ def _stage1_candidates(loads, topo, spec):
 
 
 def solve_cuda(loads, topo, spec, cfg) -> Plan:
-    """Solve with parallel routing plus a deterministic block-parallel repair."""
+    """Solve with parallel Update Routing plus deterministic intra-node repair."""
     backend = _get_backend()
     device = loads.device
     ranks = topo.num_ranks

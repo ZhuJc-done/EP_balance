@@ -2,24 +2,30 @@
 # Tokenize a HF text dataset into Megatron .bin/.idx using the model's tokenizer (output prefix -> DATA_PATH for training).
 set -euo pipefail
 
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${_SCRIPT_DIR}/env_hdfs.sh"
+
 MEGATRON_DIR="${MEGATRON_DIR:?set MEGATRON_DIR to the Megatron-LM repo root}"
 TOKENIZER_MODEL="${TOKENIZER_MODEL:-Qwen/Qwen3-30B-A3B}"   # HF repo/dir matching the checkpoint
 DATASET="${DATASET:-Salesforce/wikitext}"                  # any HF dataset with a text column
 DATASET_CONFIG="${DATASET_CONFIG:-wikitext-103-raw-v1}"
 SPLIT="${SPLIT:-train}"
 MAX_DOCS="${MAX_DOCS:-200000}"                             # cap docs for a quick demo (0 = all)
-OUT_DIR="${OUT_DIR:-$HOME/eplb_data}"
-OUT_PREFIX="${OUT_PREFIX:-${OUT_DIR}/corpus}"
+DATA_NAME="${DATA_NAME:-corpus}"
+RAW_DIR="${RAW_DIR:-${EPLB_RAW_DATA_DIR}}"
+OUT_DIR="${OUT_DIR:-${EPLB_INDEXED_DATA_DIR}}"
+OUT_PREFIX="${OUT_PREFIX:-${OUT_DIR}/${DATA_NAME}}"
 WORKERS="${WORKERS:-16}"
 
-mkdir -p "${OUT_DIR}"
-JSONL="${OUT_DIR}/corpus.jsonl"
+mkdir -p "${RAW_DIR}" "${OUT_DIR}"
+JSONL="${RAW_JSONL:-${RAW_DIR}/${DATA_NAME}.jsonl}"
 
 # 1) dump the dataset to one-json-per-line with a "text" field
 python - "$DATASET" "$DATASET_CONFIG" "$SPLIT" "$MAX_DOCS" "$JSONL" <<'PY'
 import json, sys
 from datasets import load_dataset
 name, config, split, max_docs, out = sys.argv[1:6]
+config = config or None
 max_docs = int(max_docs)
 ds = load_dataset(name, config, split=split, streaming=True)
 n = 0

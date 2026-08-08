@@ -24,11 +24,99 @@ Run MoE on real Megatron-LM with Scale-EPLB, in two stages selected by `EPLB_MOD
 | `eval/plot_solver_scaling.py` | Read an existing solver-scaling JSON directory and independently generate PNG/PDF plots. |
 | `install_megatron.sh` | Clone+install pinned community Megatron-LM, self-check `import megatron`. |
 | `install_deepep.sh` | Optional: clone+build DeepEP (NCCL Gin backend) for the sync-free transport. |
-| `convert_hf_to_mcore.sh` | Optional: convert a HF MoE checkpoint to mcore for realistic skew. |
+| `convert_hf_to_mcore.sh` | Optional: convert HF Mixtral to mcore. Qwen3 needs a preconverted Megatron Bridge checkpoint. |
 
 > **Install** (clone + `install_megatron.sh` / `install_deepep.sh` + `pip install -e`)
 > lives in the [top-level README](../README.md#cluster-install-megatron-integration). This file is the
 > **run book**: launchers, run recipes, toggles, and troubleshooting.
+
+## Fresh machine: install once, keep artifacts on HDFS
+
+Use local disk for source trees and compiled extensions; use the shared HDFS
+mount for datasets, Hugging Face caches, tokenizers, checkpoints, and logs.
+Building DeepEP directly under the HDFS mount is slower and can break compiler
+file-locking semantics.
+
+Prerequisites in the image: CUDA-enabled PyTorch, `nvcc`, `git`, and access to
+`/mnt/hdfs/__MERLIN_USER_DIR__`.
+
+```bash
+cd "${HOME}"
+git clone https://github.com/ZhuJc-done/EP_balance.git
+cd EP_balance
+
+# Installs into the image's active Python environment.
+bash scripts/bootstrap_new_machine.sh
+```
+
+The bootstrap installs Scale-EPLB plus pinned Megatron-LM and DeepEP, saves the
+Qwen tokenizer, installs `nvidia-nccl-cu13>=2.30.4` with `--no-deps`, and
+creates this persistent layout:
+
+```text
+/mnt/hdfs/__MERLIN_USER_DIR__/eplb_data/
+├── cache/huggingface/   # HF model/dataset downloads
+├── raw/                 # JSONL + manifests
+├── indexed/             # Megatron .bin/.idx
+├── tokenizers/
+├── checkpoints/
+└── logs/
+```
+
+On every new shell and every training node:
+
+```bash
+cd "${HOME}/EP_balance"
+source scripts/env_hdfs.sh
+export MEGATRON_DIR="${HOME}/Megatron-LM"
+export DEEPEP_DIR="${HOME}/DeepEP"
+```
+
+The HDFS directories are shared, but source trees, Python packages, and compiled
+DeepEP extensions are local to each machine. Run the bootstrap on every fresh
+machine, or bake its result into a derived image. Prepare each dataset only once.
+
+### Prepare real data
+
+Generic Hugging Face datasets with a `text` column:
+
+```bash
+source scripts/env_hdfs.sh
+MEGATRON_DIR="${HOME}/Megatron-LM" \
+TOKENIZER_MODEL="${EPLB_TOKENIZER_DIR}/qwen3_30b_a3b" \
+DATA_NAME=wikitext103 \
+DATASET=Salesforce/wikitext DATASET_CONFIG=wikitext-103-raw-v1 \
+MAX_DOCS=0 bash scripts/prepare_data.sh
+
+# Training prefix:
+# DATA_PATH=${EPLB_INDEXED_DATA_DIR}/wikitext103_text_document
+```
+
+For DAPO-Math and the other workload adapters:
+
+```bash
+source scripts/env_hdfs.sh
+python eval/prepare_open_workload.py \
+  --workload dapo_math \
+  --tokenizer-model "${EPLB_TOKENIZER_DIR}/qwen3_30b_a3b" \
+  --preprocess \
+  --megatron-dir "${HOME}/Megatron-LM"
+
+# DATA_PATH=${EPLB_INDEXED_DATA_DIR}/dapo_math_text_document
+```
+
+Qwen3 training needs an already converted Megatron Bridge checkpoint. Store it
+at `${EPLB_CHECKPOINT_DIR}/qwen3_30b_a3b_mcore`. The pinned community
+Megatron converter does not contain a Qwen3 loader. For Mixtral, use:
+
+```bash
+source scripts/env_hdfs.sh
+MEGATRON_DIR="${HOME}/Megatron-LM" \
+HF_MODEL=mistralai/Mixtral-8x7B-v0.1 \
+TOKENIZER_MODEL=/path/to/local/tokenizer.model \
+SAVE_DIR="${EPLB_CHECKPOINT_DIR}/mixtral8x7b_mcore" \
+TP=1 EP=8 bash scripts/convert_hf_to_mcore.sh
+```
 
 ## Phase B — observe (recommended first)
 
@@ -174,8 +262,7 @@ The dominant term is `cap`, the per-slot capacity that `grouped_expert_mlp` pads
 `[n_slot, cap, H]` batch to. `cap` is derived from `group_sizes.max()` — the exact per-slot token
 count under the solved plan — which keeps the padded batch close to the real token count. Because
 it is derived from the plan, **a better-balanced plan is also a cheaper one**. `EPLB_CAP=<int>`
-overrides it (and is required under `EPLB_DEEPEP_STATIC`, which needs `cap` before dispatch);
-setting it *below* the true per-slot max silently drops tokens, so only raise it.
+overrides it; setting it *below* the true per-slot max silently drops tokens, so only raise it.
 
 If apply mode still OOMs, in order of effect:
 
@@ -285,7 +372,8 @@ done
 Two caveats. Megatron randomises the logits themselves on this path, so the **loss is
 meaningless** under `ROUTER_SKEW` — never use it for the loss-curve comparison, only for step
 time and imbalance. And the skew is synthetic: pair the sweep with one real-checkpoint run
-(`convert_hf_to_mcore.sh`) to show the operating point a trained router actually lands on.
+(use `convert_hf_to_mcore.sh` for Mixtral, or a preconverted Megatron Bridge checkpoint for
+Qwen3) to show the operating point a trained router actually lands on.
 
 Token dropping is off by design: the launcher never passes `--moe-expert-capacity-factor`, and
 unset means every routed token reaches its expert (`transformer_config.py`: "None means no token
@@ -301,7 +389,36 @@ MEGATRON_DIR=/path/to/Megatron-LM EPLB_DIR=/path/to/EP_balance \
 
 Trains normally (loss should decrease) with EPLB rebalancing each micro-batch.
 Full cluster (4 nodes x 4 GPUs): set `NNODES=4` and per-node `NODE_RANK`,
-`MASTER_ADDR`, `MASTER_PORT`; `EP_SIZE` defaults to the world size.
+`MASTER_ADDR`, `MASTER_PORT`; set `EP` so it divides `world_size / (TP * PP)`.
+
+Real Qwen3-30B-A3B checkpoint + real Megatron indexed data + DeepEP token
+dispatch (run on every node, changing only `NODE_RANK`):
+
+```bash
+source scripts/env_hdfs.sh
+MEGATRON_DIR="${HOME}/Megatron-LM" \
+EPLB_DIR="${HOME}/EP_balance" \
+CHECKPOINT="${EPLB_CHECKPOINT_DIR}/qwen3_30b_a3b_mcore" \
+DATA_PATH="${EPLB_INDEXED_DATA_DIR}/dapo_math_text_document" \
+TOKENIZER_MODEL="${EPLB_TOKENIZER_DIR}/qwen3_30b_a3b" \
+MOCK=0 FROM_SCRATCH=0 MODEL=qwen3_30b_a3b \
+EPLB_MODE=apply EPLB_ADAPTER=deepep \
+GPUS_PER_NODE=4 NNODES=4 NODE_RANK=<0..3> \
+MASTER_ADDR=<node0-ip> MASTER_PORT=29500 \
+TP=2 PP=1 EP=8 MICRO_BATCH_SIZE=1 GLOBAL_BATCH_SIZE=256 \
+SEQ_LEN=4096 TRAIN_ITERS=1000 \
+  bash scripts/run_real_moe.sh
+```
+
+The Qwen recipe fixes the model vocabulary at the checkpoint's `151936` rows
+and defaults to the Megatron Bridge `pre_mlp_layernorm.*` checkpoint layout.
+Set `EPLB_SEPARATE_MLP_NORM_CKPT=0` only if a checkpoint already uses fused
+`mlp.linear_fc1.layer_norm_*` keys.
+
+The default optimizer is distributed Adam. For a memory-constrained functional
+smoke test only, `USE_DISTRIBUTED_OPTIMIZER=0` plus
+`--optimizer sgd --sgd-momentum 0.0` avoids Adam's FP32 optimizer states; do not
+use that substitution as the convergence recipe.
 
 ### Apply-mode backends: DeepEP tokens + GIN weights
 
@@ -323,7 +440,7 @@ Apply mode moves two independent things across ranks, and they use different bac
 | `EPLB_GIN_FENCE` | `barrier` (host, not stream-ordered) | `signal` — device-stream, capture-safe |
 | `EPLB_GIN_LSA` | `1` — intra-node peers over NVLink | `0` forces everything onto the network (A/B only) |
 | `EPLB_CAP` | derived from the plan (one scalar D2H) | pin it to remove that read |
-| `EPLB_DEEPEP_STATIC` | `0` | `1` statically sizes the DeepEP recv buffer; **requires** `EPLB_CAP` |
+| `EPLB_DEEPEP_STATIC` | `0` | Reserved; the launcher rejects `1` until static padded-row handling is implemented |
 
 ```bash
 EPLB_MODE=apply EPLB_ADAPTER=deepep EPLB_WEIGHT_COMM=gin \
