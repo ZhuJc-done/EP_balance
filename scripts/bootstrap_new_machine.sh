@@ -10,7 +10,6 @@ source "${SCRIPT_DIR}/env_hdfs.sh"
 LOCAL_SRC_ROOT="${LOCAL_SRC_ROOT:-${HOME}}"
 export MEGATRON_DIR="${MEGATRON_DIR:-${LOCAL_SRC_ROOT}/Megatron-LM}"
 export DEEPEP_DIR="${DEEPEP_DIR:-${LOCAL_SRC_ROOT}/DeepEP}"
-export NCCL_PKG="${NCCL_PKG:-nvidia-nccl-cu13>=2.30.4}"
 
 python - <<'PY'
 import torch
@@ -33,11 +32,9 @@ python -m pip install -e "${EPLB_DIR}[dev]"
 
 MEGATRON_DIR="${MEGATRON_DIR}" \
   bash "${SCRIPT_DIR}/install_megatron.sh"
-DEEPEP_DIR="${DEEPEP_DIR}" NCCL_PKG="${NCCL_PKG}" \
-  bash "${SCRIPT_DIR}/install_deepep.sh"
+DEEPEP_DIR="${DEEPEP_DIR}" bash "${SCRIPT_DIR}/install_deepep.sh"
 
-_nccl_lib="$(python -c 'import nvidia.nccl as n,os;print(os.path.join(n.__path__[0],"lib"))')"
-export LD_LIBRARY_PATH="${_nccl_lib}:${LD_LIBRARY_PATH:-}"
+source "${SCRIPT_DIR}/env_nccl_2307.sh"
 
 TOKENIZER_SOURCE="${TOKENIZER_SOURCE:-Qwen/Qwen3-30B-A3B}"
 TOKENIZER_SAVE_DIR="${TOKENIZER_SAVE_DIR:-${EPLB_TOKENIZER_DIR}/qwen3_30b_a3b}"
@@ -61,12 +58,13 @@ import deep_ep
 import megatron.core
 import nccl_gin
 import torch
+from eplb.integration.eplb_manager import _nccl_runtime_version
 
 assert hasattr(deep_ep, "ElasticBuffer"), "DeepEP ElasticBuffer is unavailable"
 assert hasattr(deep_ep, "topk_idx_t"), "DeepEP Elastic routing dtype is unavailable"
-nccl = torch.cuda.nccl.version()
-if isinstance(nccl, tuple):
-    assert nccl >= (2, 30, 4), f"NCCL 2.30.4+ required, got {nccl}"
+nccl_gin._ensure_loaded()
+nccl = _nccl_runtime_version()
+assert nccl == (2, 30, 7), f"NCCL 2.30.7 runtime required, got {nccl}"
 print("Scale-EPLB bootstrap complete")
 print("Megatron-Core:", getattr(megatron.core, "__version__", "unknown"))
 print("DeepEP Elastic:", getattr(deep_ep, "__version__", "unknown"))

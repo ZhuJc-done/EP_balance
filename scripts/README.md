@@ -51,7 +51,7 @@ bash scripts/bootstrap_new_machine.sh
 ```
 
 The bootstrap installs Scale-EPLB plus pinned Megatron-LM and DeepEP, saves the
-Qwen tokenizer, installs `nvidia-nccl-cu13>=2.30.4` with `--no-deps`, and
+Qwen tokenizer, installs `nvidia-nccl-cu13==2.30.7` with `--no-deps`, and
 creates this persistent layout:
 
 ```text
@@ -392,8 +392,8 @@ Trains normally (loss should decrease) with EPLB rebalancing each micro-batch.
 Full cluster (4 nodes x 4 GPUs): set `NNODES=4` and per-node `NODE_RANK`,
 `MASTER_ADDR`, `MASTER_PORT`; set `EP` so it divides `world_size / (TP * PP)`.
 
-Real Qwen3-30B-A3B checkpoint + real Megatron indexed data + DeepEP token
-dispatch (run on every node, changing only `NODE_RANK`):
+Real Qwen3-30B-A3B checkpoint + real Megatron indexed data + zero-sync
+ElasticBuffer/GIN (run on every node, changing only `NODE_RANK`):
 
 ```bash
 source scripts/env_hdfs.sh
@@ -403,7 +403,9 @@ CHECKPOINT="${EPLB_CHECKPOINT_DIR}/qwen3_30b_a3b_mcore" \
 DATA_PATH="${EPLB_INDEXED_DATA_DIR}/dapo_math_text_document" \
 TOKENIZER_MODEL="${EPLB_TOKENIZER_DIR}/qwen3_30b_a3b" \
 MOCK=0 FROM_SCRATCH=0 MODEL=qwen3_30b_a3b \
-EPLB_MODE=apply EPLB_ADAPTER=deepep EPLB_DEEPEP_ALLOW_MNNVL=1 \
+EPLB_MODE=apply EPLB_ADAPTER=deepep \
+EPLB_WEIGHT_COMM=gin EPLB_GIN_FENCE=signal EPLB_CAP=<validated-bound> \
+EPLB_DEEPEP_HYBRID=1 EPLB_PROFILE=0 PROFILE_TRACE=0 \
 GPUS_PER_NODE=4 NNODES=4 NODE_RANK=<0..3> \
 MASTER_ADDR=<node0-ip> MASTER_PORT=29500 \
 TP=2 PP=1 EP=8 MICRO_BATCH_SIZE=1 GLOBAL_BATCH_SIZE=256 \
@@ -425,9 +427,8 @@ use that substitution as the convergence recipe.
 
 Apply mode moves two independent things across ranks, and they use different backends:
 
-* **Tokens** — dispatch and combine, i.e. the routing traffic. `EPLB_ADAPTER=deepep` puts this on
-  DeepEP. (`DEEPEP=1` is a different knob: it configures *Megatron's* flex dispatcher, which apply
-  mode replaces outright, so it does nothing here.)
+* **Tokens** — `EPLB_ADAPTER=deepep` uses only DeepEP V2 `ElasticBuffer`; there is no legacy
+  `Buffer` or `all_to_all_single` fallback. (`DEEPEP=1` configures Megatron's replaced dispatcher.)
 * **Expert weights and their gradients** — forward pulls each replica slot from `main(e)`
   (`nccl_gin.get_batched`), backward pushes replica grads back to `main(e)`'s scratch column
   (`nccl_gin.put_batched`) where the owner sums them. Both directions are the in-tree
@@ -436,21 +437,24 @@ Apply mode moves two independent things across ranks, and they use different bac
 
 | Knob | Default | Device-initiated setting |
 |---|---|---|
-| `EPLB_ADAPTER` | `alltoall` | `deepep` — token dispatch/combine |
+| `EPLB_ADAPTER` | `alltoall` | `deepep` — ElasticBuffer token dispatch/combine |
 | `EPLB_WEIGHT_COMM` | host-driven `dist.broadcast` | `gin` — replica weight pull + grad reduce-to-main |
 | `EPLB_GIN_FENCE` | `barrier` (host, not stream-ordered) | `signal` — device-stream, capture-safe |
 | `EPLB_GIN_LSA` | `1` — intra-node peers over NVLink | `0` forces everything onto the network (A/B only) |
-| `EPLB_CAP` | derived from the plan (one scalar D2H) | pin it to remove that read |
-| `EPLB_DEEPEP_STATIC` | `0` | Reserved; the launcher rejects `1` until static padded-row handling is implemented |
+| `EPLB_CAP` | derived only for alltoall | required static bound for Elastic; overflow aborts asynchronously |
+| `EPLB_DEEPEP_HYBRID` | `1` | NVLink scale-up plus GIN scale-out |
+| `EPLB_DEEPEP_MAX_TOKENS_PER_RANK` | first chunk's static size | optional larger per-chunk input bound |
 
 ```bash
 EPLB_MODE=apply EPLB_ADAPTER=deepep EPLB_WEIGHT_COMM=gin \
-EPLB_GIN_FENCE=signal EPLB_CAP=<int> \
+EPLB_GIN_FENCE=signal EPLB_CAP=<validated-bound> \
+EPLB_PROFILE=0 PROFILE_TRACE=0 \
   ... bash scripts/run_real_moe.sh
 ```
 
-Selecting `gin` is enough — it always takes the re-pull path, so `EPLB_OVERLAP` is only meaningful
-for the `dist.broadcast` transport.
+This is the only supported zero-sync recipe. `EPLB_DEEPEP_STATIC`, `ALLOW_MNNVL`, and the legacy
+NVL/RDMA byte knobs are removed. ElasticBuffer initialization and GIN symmetric-buffer setup each
+synchronize once before warmup; iterations use GPU prefix counts and never read receive sizes on host.
 
 ### Which wire each replica transfer takes
 
@@ -478,26 +482,19 @@ there is none to a peer inside the node, so the mesh form fails outright on a si
 
 ### NCCL build
 
-GIN needs NCCL >= 2.29 with `ginType != NONE`, which is not what PyTorch bundles (2.27 at the time of
-writing). The extension compiles against `$NCCL_HOME` but at runtime resolves `libnccl.so.2` to
-whichever copy was loaded first, so without a preload it silently calls into PyTorch's older library
-and `ncclCommQueryProperties` fails with `invalid argument`:
+ElasticBuffer plus GIN requires NCCL >= 2.30.4 with `ginType != NONE`; this repository pins 2.30.7.
+Every launcher sources `scripts/env_nccl_2307.sh` before Python starts. It sets `NCCL_HOME` and
+`EP_NCCL_ROOT_DIR`, removes other NCCL entries from `LD_PRELOAD`, and pins build/runtime linkage
+to the same wheel. Source it explicitly before manual Python or pytest commands:
 
 ```bash
-export LD_PRELOAD=$NCCL_HOME/lib/libnccl.so.2
+source scripts/env_nccl_2307.sh
 ```
 
-DeepEP additionally compares the loaded `libnccl.so` byte-for-byte against the one under its NCCL
-root, and by default that root is the `nvidia-nccl` wheel -- whose build usually reports
-`ginType=NONE`. Point it at the GIN-capable copy instead and both backends share one library:
-
-```bash
-export EP_NCCL_ROOT_DIR=$NCCL_HOME          # what DeepEP compares against
-export LD_PRELOAD=$NCCL_HOME/lib/libnccl.so.2
-```
-
-Without the first line `EPLB_ADAPTER=deepep EPLB_WEIGHT_COMM=gin` aborts at import with
-`Invalid NCCL versions`; without the second, GIN init reports `ginType=NONE`.
+`torch.cuda.nccl.version()` still reports PyTorch's compile-time 2.28.9; it cannot change without
+rebuilding PyTorch. Startup instead checks `ncclGetVersion` on the loaded shared object and must
+print `(2, 30, 7)`. The adapter uses `EP_REUSE_NCCL_COMM=0` so Elastic owns a compatible
+communicator; that one-time setup may sync.
 
 `EPLB_CHUNKS=2` composes with all of the above. It splits this rank's routing units in two and
 pipelines them across a compute and a comm stream, so `dispatch(c2)` hides behind `compute(c1)` and
@@ -532,30 +529,28 @@ Ordering is invisible in gradients — every schedule produces the same numbers 
 directly by `test_sync_free_two_chunk_backward_issue_order`, which asserts the sequence
 `combine⁻¹(c1), combine⁻¹(c2), dispatch⁻¹(c1), dispatch⁻¹(c2), reduce`.
 
-Pin `EPLB_CAP` when `EPLB_WEIGHT_COMM=gin`. The cap is a *token/compute-side* quantity — it sizes
-`grouped_expert_mlp`'s padded `[n_slot, cap, H]` batch and DeepEP's static recv buffer — and has
-nothing to do with the weight channel. It only becomes visible here because the broadcast path
-already pays a control-plane D2H (`dist.broadcast` needs a host-side `src`) that the cap rides
-along in for free, whereas GIN's schedule is fully device-resident, so deriving the cap becomes
-the one standalone host read left in that block. The launcher prints a note when it is unset.
-Size it from a run's per-slot max and only ever raise it: pinning it *below* the true max
-silently drops tokens.
+`EPLB_CAP` sizes the compute batch `[n_slot, cap, H]` and is mandatory in Elastic mode. Choose it
+from a measured per-slot maximum plus headroom. A low value triggers `torch._assert_async` instead
+of dropping or overwriting tokens. With `do_cpu_sync=False`, non-expanded Elastic receive storage is
+the worst case `[EP * max_units_per_chunk, padded_hidden]`; lower
+`EPLB_DEEPEP_MAX_TOKENS_PER_RANK` by using fixed-size chunks when memory is tight.
 
 **Validate the combination before spending cluster hours on it.** The CPU suite pins
 `AllToAllAdapter` over gloo, so neither backend is exercised there. On the target cluster:
 
 ```bash
-EPLB_WEIGHT_COMM=gin RUN_GIN_TESTS=1 pytest -s tests/test_gin_weights.py
+source scripts/env_nccl_2307.sh
+EPLB_WEIGHT_COMM=gin EPLB_GIN_FENCE=signal RUN_GIN_TESTS=1 \
+  pytest -s tests/test_gin_weights.py
 ```
 
-This checks outputs and `main(e)` gradients against a single-device reference for GIN alone, for
-the GIN rematerialise/overlap path, and for DeepEP tokens combined with GIN weights. The two
+This checks outputs plus token, router and `main(e)` weight gradients for single/two chunks,
+autograd/manual backward, and runs the warmed full Elastic+GIN forward/backward under
+`torch.cuda.set_sync_debug_mode("error")`. The two
 backends never talk to each other, but they agree on slot *ordering* — tokens arrive grouped by
 physical slot and the weight stack is indexed by that same slot — so a disagreement between them
-produces silently wrong numbers rather than a crash, which is why the combination is worth its own
-case. The DeepEP case runs in bf16 on purpose: DeepEP's kernels only move 16B-aligned bf16/fp16
-rows and fall back to `all_to_all_single` for anything else, so an fp32 run would pass without
-entering DeepEP at all.
+produces silently wrong numbers rather than a crash. Elastic tests run in BF16 and reject unsupported
+types rather than falling back to a host-synchronized transport.
 
 ## Multi-node 4 x GB200 (4 nodes x 4 GPUs = 16 ranks)
 
@@ -577,6 +572,25 @@ MEGATRON_DIR=/path/to/Megatron-LM EPLB_DIR=/path/to/EP_balance \
 NNODES=4 NODE_RANK=$RANK MASTER_ADDR=$HEAD MASTER_PORT=29500 \
   bash scripts/run_gb200_4x4.sh
 ```
+
+ElasticBuffer zero-sync smoke (same command on all four nodes; change only `NODE_RANK`):
+
+```bash
+MEGATRON_DIR=/home/tiger/Megatron-LM EPLB_DIR=/home/tiger/EP_balance \
+NNODES=4 NODE_RANK=<0..3> MASTER_ADDR=<node0-ip> MASTER_PORT=29500 \
+EPLB_MODE=apply EPLB_ADAPTER=deepep \
+EPLB_WEIGHT_COMM=gin EPLB_GIN_FENCE=signal \
+EPLB_CAP=8192 EPLB_N_SLOT=4 \
+EPLB_CHUNKS=2 EPLB_DEEPEP_MAX_TOKENS_PER_RANK=4096 \
+EPLB_PROFILE=0 PROFILE_TRACE=0 \
+EP_SIZE=16 NUM_EXPERTS=32 TOPK=4 TRAIN_ITERS=3 \
+  bash scripts/run_gb200_4x4.sh
+```
+
+Here `SEQ_LEN=2048`, `TOPK=4`, so each rank has 8192 routing units and each of two chunks has
+4096. `EPLB_CAP=8192` is the conservative no-drop bound. The log must print
+`transport=deep_ep.buffers.elastic.ElasticBuffer GIN=ready`; keep synchronous in-training
+profilers disabled for this zero-sync check.
 
 Then escalate: `EPLB_MODE=apply` (active dispatcher), or `REAL=1 MODEL=qwen3_30b_a3b`
 plus `DATA_PATH`/`TOKENIZER_MODEL` to forward to `run_real_moe.sh`. Choose either

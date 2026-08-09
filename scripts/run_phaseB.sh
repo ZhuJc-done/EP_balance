@@ -2,6 +2,9 @@
 # Phase B launcher: tiny MoE GPT on Megatron (--mock-data) with the Scale-EPLB observer; set MEGATRON_DIR/EPLB_DIR.
 set -euo pipefail
 
+# Pin torchrun and optional DeepEP to the validated NCCL runtime.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env_nccl_2307.sh"
+
 # --- paths -------------------------------------------------------------------
 MEGATRON_DIR="${MEGATRON_DIR:?set MEGATRON_DIR to the Megatron-LM repo root}"
 EPLB_DIR="${EPLB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"

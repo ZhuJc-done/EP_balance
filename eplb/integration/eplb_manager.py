@@ -2,8 +2,8 @@
 
 Pipeline (per MoE layer, per forward). Two concerns are kept orthogonal:
 
-  * TRANSPORT  - moving tokens between ranks (all-to-all), behind :class:`CommAdapter`
-                 (``AllToAllAdapter`` fallback / ``DeepEPAdapter``).
+  * TRANSPORT  - moving tokens between ranks behind :class:`CommAdapter`
+                 (``AllToAllAdapter`` reference / Elastic ``DeepEPAdapter``).
   * REPLICATION - broadcasting a replicated expert's weight from its main owner and
                  reducing that expert's grad back to main. This lives in the compute
                  stage (``broadcast_from_main`` / overlap) and is adapter-independent.
@@ -35,6 +35,32 @@ def _env_truthy(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() not in ("0", "", "false", "no")
 
 
+def _nccl_runtime_version() -> Tuple[int, int, int]:
+    """Return the version of the NCCL shared object loaded in this process."""
+    import ctypes
+
+    paths = set()
+    try:
+        with open("/proc/self/maps", encoding="utf-8") as maps:
+            paths = {
+                line.split()[-1] for line in maps
+                if "libnccl.so" in line and line.split()[-1].startswith("/")
+            }
+    except OSError:
+        pass
+    if paths:
+        lib = ctypes.CDLL(sorted(paths)[0])
+        encoded = ctypes.c_int()
+        if lib.ncclGetVersion(ctypes.byref(encoded)) == 0:
+            value = int(encoded.value)
+            return value // 10000, (value % 10000) // 100, value % 100
+    compiled = torch.cuda.nccl.version()
+    if isinstance(compiled, tuple):
+        return tuple(int(v) for v in compiled[:3])
+    value = int(compiled)
+    return value // 10000, (value % 10000) // 100, value % 100
+
+
 # Cache one GIN replicator per (group, layout, dtype) so the symmetric buffers + static main(e)
 # layout are allocated once and recycled across layers/steps.
 _GIN_REPLICATORS: Dict[tuple, GinWeightReplicator] = {}
@@ -61,17 +87,16 @@ def _get_gin_replicator(group, spec, weight_shapes, dtype, device) -> GinWeightR
 # adapter changes the transport but not the routing/compute math above it.
 
 
-# ElasticBuffer kernels move int4 vectors, so every token row must be 16-byte aligned.
-DEEPEP_ROW_ALIGN = 16
+# Elastic combine reduces 32 int4 vectors at a time: BF16 rows must be 512-byte aligned.
+DEEPEP_ROW_ALIGN = 512
 
 
-def _payload_pad_cols(h: int, elem: int) -> int:
-    """Columns appended after the ``H`` token columns: they carry the physical id and pad the row.
-
-    Always at least one column, and enough of them to land the row on ``DEEPEP_ROW_ALIGN``.
-    """
+def _payload_pad_cols(h: int, elem: int, *, elastic: bool = True) -> int:
+    """Return payload padding columns for Elastic alignment or one all-to-all metadata column."""
+    if not elastic:
+        return 1
     pad_bytes = (DEEPEP_ROW_ALIGN - (h * elem) % DEEPEP_ROW_ALIGN) % DEEPEP_ROW_ALIGN
-    return (pad_bytes or DEEPEP_ROW_ALIGN) // elem
+    return pad_bytes // elem
 
 
 class CommAdapter(Protocol):
@@ -181,7 +206,9 @@ class _ElasticCombine(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         grad_in, _, _, _, _ = ctx.buffer.dispatch(
-            x=grad_out.contiguous(), handle=ctx.handle, do_cpu_sync=False, do_expand=False
+            x=grad_out.contiguous(), handle=ctx.handle,
+            num_experts=ctx.handle.num_experts,
+            do_cpu_sync=False, do_expand=False,
         )
         return grad_in, None, None
 
@@ -198,6 +225,15 @@ class DeepEPAdapter:
             ) from e
         if not hasattr(deep_ep, "ElasticBuffer"):
             raise RuntimeError("installed DeepEP does not export ElasticBuffer")
+        nccl = _nccl_runtime_version() if torch.cuda.is_available() else None
+        if getattr(deep_ep, "__file__", None) and nccl is not None and nccl < (2, 30, 4):
+            raise RuntimeError(f"ElasticBuffer zero-sync mode requires NCCL 2.30.4+, got {nccl}")
+        if _env_truthy("EP_REUSE_NCCL_COMM", "0"):
+            raise ValueError(
+                "ElasticBuffer requires EP_REUSE_NCCL_COMM=0; its one-time managed communicator "
+                "avoids PyTorch/DeepEP NCCL communicator ABI mismatches"
+            )
+        os.environ["EP_REUSE_NCCL_COMM"] = "0"
         self._deep_ep = deep_ep
         env_max = os.environ.get("EPLB_DEEPEP_MAX_TOKENS_PER_RANK")
         self._requested_max_tokens = int(
@@ -215,7 +251,7 @@ class DeepEPAdapter:
 
     @staticmethod
     def _deepep_eligible(inp: torch.Tensor) -> bool:
-        """Elastic dispatch accepts contiguous BF16 rows aligned to one int4."""
+        """Elastic dispatch accepts contiguous BF16 rows aligned to DeepEP's TMA boundary."""
         return (
             inp.dim() == 2
             and inp.dtype == torch.bfloat16
@@ -384,6 +420,7 @@ class DeepEPAdapter:
             grad_comb = padded
         grad_recv = self._buffer.dispatch(
             x=grad_comb.contiguous(), handle=state["comb"]["handle"],
+            num_experts=state["comb"]["handle"].num_experts,
             do_cpu_sync=False, do_expand=False,
         )[0]
         return grad_recv[:, :hidden]
@@ -439,9 +476,14 @@ def _group_sizes_by_slot(
 ) -> torch.Tensor:
     """int64 ``[n_slot]``: number of received tokens landing in each local slot."""
     valid_slot = slot_to_e >= 0
-    group_sizes = torch.zeros(n_slot, dtype=torch.int64, device=device)
-    group_sizes[valid_slot] = recv_per_expert[slot_to_e[valid_slot]]
-    return group_sizes
+    gathered = recv_per_expert[slot_to_e.clamp(min=0)]
+    return torch.where(valid_slot, gathered, torch.zeros_like(gathered))
+
+
+def _fixed_bincount(index: torch.Tensor, size: int) -> torch.Tensor:
+    """Fixed-shape device bincount without CUDA's dynamic-size host check."""
+    out = torch.zeros(size, dtype=torch.int64, device=index.device)
+    return out.scatter_add_(0, index.to(torch.int64), torch.ones_like(index, dtype=torch.int64))
 
 
 # ===================== Expert compute (replication + grouped MLP) =====================
@@ -551,8 +593,7 @@ def _rec(t: torch.Tensor, stream) -> None:
 def _exchange_recv_counts(send_counts: torch.Tensor, group) -> torch.Tensor:
     """All-to-all the per-dst send counts -> per-src recv counts (uniform 1-int-per-rank split).
 
-    Only used by adapters whose ``needs_recv_counts()`` is True (``AllToAllAdapter``); DeepEP sizes
-    the recv buffer statically and skips this. ``send_counts`` is int64 ``[R]`` (== world size).
+    Only ``AllToAllAdapter`` needs this; ElasticBuffer keeps receive counts in its GPU handle.
     """
     if not dist.is_initialized():
         return send_counts
@@ -656,20 +697,25 @@ def _moe_forward_two_chunks(
     # ---- per-chunk static prep (cheap, on the default stream) ----------------------------------
     chunk_units = torch.chunk(torch.arange(U, device=device), num_chunks)
     prep: List[Dict[str, torch.Tensor]] = []
+    elastic = adapter.uses_padded_layout()
     for idx in chunk_units:
         dst_c = dst_rank.index_select(0, idx)
         perm_c = torch.argsort(dst_c, stable=True)
         idx_p = idx.index_select(0, perm_c)                              # unit ids in send (by-dst) order
-        sent_c = torch.bincount(dst_c, minlength=R).to(torch.int64)      # [R] tokens sent to each dst
+        sent_c = _fixed_bincount(dst_c, R)                               # [R] tokens sent to each dst
         utok_c = unit_token_idx.index_select(0, idx_p)                   # [Uc] owning token of each sent unit
         prob_c = unit_prob.index_select(0, idx_p)                        # [Uc] gate weight
         phys_c = phys_id.index_select(0, idx_p)                          # [Uc] target physical id
         send_tokens_c = tokens.index_select(0, utok_c)                   # [Uc, H]
         elem = send_tokens_c.element_size()
-        pad_cols = _payload_pad_cols(H, elem)
-        m = send_tokens_c.new_zeros((send_tokens_c.shape[0], pad_cols))
-        m[:, 0] = phys_c.to(dtype)                                       # phys id carried through the token dtype
-        payload_c = torch.cat([send_tokens_c, m], dim=1)
+        pad_cols = _payload_pad_cols(H, elem, elastic=elastic)
+        if pad_cols:
+            m = send_tokens_c.new_zeros((send_tokens_c.shape[0], pad_cols))
+            if not elastic:
+                m[:, 0] = phys_c.to(dtype)
+            payload_c = torch.cat([send_tokens_c, m], dim=1)
+        else:
+            payload_c = send_tokens_c.contiguous()
         recv_c = _exchange_recv_counts(sent_c, group) if adapter.needs_recv_counts() else sent_c
         prep.append({
             "sent": sent_c, "recv": recv_c, "payload": payload_c, "route": phys_c,
@@ -725,9 +771,9 @@ def _moe_forward_two_chunks(
         else:
             recv_phys_k = rp[:, H].round().to(torch.int64)
             recv_slot_k = recv_phys_k - my_rank * n_slot
-            group_sizes_k = torch.bincount(
-                recv_slot_k.clamp(min=0, max=n_slot - 1), minlength=n_slot
-            ).to(torch.int64)
+            group_sizes_k = _fixed_bincount(
+                recv_slot_k.clamp(min=0, max=n_slot - 1), n_slot
+            )
         if experts is not None:
             y_k = experts.chunk(recv_tokens_k, recv_slot_k, group_sizes_k, cap, valid_k)
         else:
@@ -922,10 +968,14 @@ def sync_free_moe_forward(
     send_tokens = tokens[unit_token_idx][perm]
     send_phys = phys_id[perm]
     elem = send_tokens.element_size()
-    pad_cols = _payload_pad_cols(H, elem)
-    meta = send_tokens.new_zeros((send_tokens.shape[0], pad_cols))
-    meta[:, 0] = send_phys.to(dtype)                             # phys carried (rounded) through the token dtype
-    send_payload = torch.cat([send_tokens, meta], dim=1)
+    pad_cols = _payload_pad_cols(H, elem, elastic=elastic)
+    if pad_cols:
+        meta = send_tokens.new_zeros((send_tokens.shape[0], pad_cols))
+        if not elastic:
+            meta[:, 0] = send_phys.to(dtype)
+        send_payload = torch.cat([send_tokens, meta], dim=1)
+    else:
+        send_payload = send_tokens.contiguous()
     with profiling.record("apply/dispatch", time_it=True, device=device):
         recv_payload = adapter.dispatch_chunk(
             send_payload, sent_per_dst, recv_per_src, group, tag=0,

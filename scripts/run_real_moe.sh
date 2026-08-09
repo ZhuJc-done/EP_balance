@@ -4,20 +4,8 @@ set -euo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-# DeepEP's extension links libnccl.so from the nvidia-nccl wheel (install_deepep.sh); put it on the
-# runtime linker path so `import deep_ep` resolves. No-op if the wheel isn't installed.
-_nccl_lib="$(python -c 'import nvidia.nccl as n,os;print(os.path.join(n.__path__[0],"lib"))' 2>/dev/null || true)"
-if [ -n "${_nccl_lib}" ] && [ -d "${_nccl_lib}" ]; then
-  export LD_LIBRARY_PATH="${_nccl_lib}:${LD_LIBRARY_PATH:-}"
-fi
-
-# GIN needs an NCCL built with ginType != NONE, which the wheel above generally is not. Preload the
-# GIN-capable copy and point DeepEP's byte-for-byte library check at the same file, so the two
-# backends share one NCCL instead of one of them refusing to start.
-if [ -n "${NCCL_HOME:-}" ] && [ -f "${NCCL_HOME}/lib/libnccl.so.2" ]; then
-  export EP_NCCL_ROOT_DIR="${EP_NCCL_ROOT_DIR:-${NCCL_HOME}}"
-  export LD_PRELOAD="${NCCL_HOME}/lib/libnccl.so.2:${LD_PRELOAD:-}"
-fi
+# Pin runtime and JIT linkage to the validated NCCL build before Python starts.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env_nccl_2307.sh"
 
 # --- required paths / artifacts ----------------------------------------------
 MEGATRON_DIR="${MEGATRON_DIR:?set MEGATRON_DIR to the Megatron-LM repo root}"
@@ -175,12 +163,13 @@ if [[ "${EPLB_MODE}" == "apply" ]]; then
     python - <<'PY'
 import deep_ep
 import nccl_gin
-import torch
+from eplb.integration.eplb_manager import _nccl_runtime_version
 assert hasattr(deep_ep, "ElasticBuffer"), "DeepEP ElasticBuffer is unavailable"
-v = torch.cuda.nccl.version()
-if isinstance(v, tuple):
-    assert v >= (2, 30, 4), f"NCCL 2.30.4+ required, got {v}"
-print(f"[run_real_moe] ElasticBuffer hybrid={__import__('os').environ.get('EPLB_DEEPEP_HYBRID', '1')} NCCL={v}")
+nccl_gin._ensure_loaded()
+v = _nccl_runtime_version()
+assert v == (2, 30, 7), f"NCCL 2.30.7 runtime required, got {v}"
+print(f"[run_real_moe] transport={deep_ep.ElasticBuffer.__module__}.ElasticBuffer "
+      f"hybrid={__import__('os').environ.get('EPLB_DEEPEP_HYBRID', '1')} NCCL={v}")
 PY
   fi
 fi

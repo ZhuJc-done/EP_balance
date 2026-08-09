@@ -2,6 +2,9 @@
 # Phase C launcher: end-to-end MoE training with Scale-EPLB ACTIVE (EPLB_MODE=apply, SequentialMLP, no --moe-grouped-gemm).
 set -euo pipefail
 
+# Pin torchrun, DeepEP and GIN to the same NCCL runtime.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env_nccl_2307.sh"
+
 # --- paths -------------------------------------------------------------------
 MEGATRON_DIR="${MEGATRON_DIR:?set MEGATRON_DIR to the Megatron-LM repo root}"
 EPLB_DIR="${EPLB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"

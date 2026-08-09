@@ -106,11 +106,10 @@ static void configure_gin_requirements(ncclDevCommRequirements* reqs,
 static void log_created_dev_comm(const char* caller) {
   fprintf(stderr,
           "[nccl_gin_ext] %s: DevComm created successfully, rank=%d, "
-          "ginConnectionCount=%u, ginContextCount=%u, ginContextBase=%u\n",
+          "ginConnectionCount=%u, ginContextCount=%u\n",
           caller, g_state.rank,
           static_cast<unsigned>(g_state.devComm.ginConnectionCount),
-          static_cast<unsigned>(g_state.devComm.ginContextCount),
-          static_cast<unsigned>(g_state.devComm.ginContextBase));
+          static_cast<unsigned>(g_state.devComm.ginContextCount));
 }
 
 // ---------------------------------------------------------------------------
@@ -729,8 +728,6 @@ py::dict get_comm_properties() {
       g_state.hasDevComm ? (int)g_state.devComm.ginConnectionCount : 0;
   out["devGinContextCount"] =
       g_state.hasDevComm ? (int)g_state.devComm.ginContextCount : 0;
-  out["devGinContextBase"] =
-      g_state.hasDevComm ? (int)g_state.devComm.ginContextBase : 0;
   return out;
 }
 

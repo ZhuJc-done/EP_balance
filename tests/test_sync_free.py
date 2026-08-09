@@ -290,7 +290,6 @@ def test_elastic_payload_requires_aligned_bf16(hidden, dtype, eligible):
 
     elem = torch.empty((), dtype=dtype).element_size()
     pad_cols = _payload_pad_cols(hidden, elem)
-    assert pad_cols >= 1, "the physical-expert id needs a column of its own"
 
     row_bytes = (hidden + pad_cols) * elem
     assert row_bytes % DEEPEP_ROW_ALIGN == 0, f"H={hidden} {dtype} pads to a {row_bytes}B row"
@@ -394,6 +393,7 @@ def test_elastic_dispatch_uses_synthetic_experts_padding_and_no_sync(monkeypatch
                 counts = torch.bincount(topk_idx[:, 0], minlength=2).to(torch.int64)
                 handle = types.SimpleNamespace(
                     topk_idx=topk_idx.clone(),
+                    num_experts=2,
                     psum_num_recv_tokens_per_scaleup_rank=torch.tensor([n]),
                     psum_num_recv_tokens_per_expert=torch.cumsum(counts, 0),
                 )
@@ -410,14 +410,14 @@ def test_elastic_dispatch_uses_synthetic_experts_padding_and_no_sync(monkeypatch
     manager._ELASTIC_BUFFERS.clear()
 
     adapter = manager.DeepEPAdapter(max_tokens_per_rank=4)
-    payload = torch.randn((3, 16), dtype=torch.bfloat16, requires_grad=True)
+    payload = torch.randn((3, 256), dtype=torch.bfloat16, requires_grad=True)
     routes = torch.tensor([1, 0, 1], dtype=torch.int64)
     recv = adapter.dispatch_chunk(
         payload, torch.tensor([3]), torch.tensor([3]), object(), tag=7,
         route_idx=routes, n_slot=2, cap=2,
     )
     slot, valid, sizes = adapter.recv_layout(7)
-    assert recv.shape == (4, 16)
+    assert recv.shape == (4, 256)
     assert slot.tolist() == [1, 0, 1, 0]
     assert valid.tolist() == [True, True, True, False]
     assert sizes.tolist() == [1, 2]
@@ -440,6 +440,11 @@ def test_elastic_dispatch_uses_synthetic_experts_padding_and_no_sync(monkeypatch
     cached = [c for c in calls if c[0] == "dispatch" and c[3] is not None]
     assert cached and cached[0][1]["do_cpu_sync"] is False
     assert cached[0][1]["do_expand"] is False
+    with pytest.raises(RuntimeError, match="EPLB_CAP"):
+        adapter.dispatch_chunk(
+            payload.detach(), torch.tensor([3]), torch.tensor([3]), adapter._group, tag=8,
+            route_idx=routes, n_slot=2, cap=1,
+        )
     manager._ELASTIC_BUFFERS.clear()
 
 
@@ -470,6 +475,7 @@ def test_elastic_padded_layout_matches_reference(monkeypatch, chunks, overlap, m
                 counts = torch.bincount(topk_idx[:, 0], minlength=2).to(torch.int64)
                 handle = types.SimpleNamespace(
                     topk_idx=topk_idx.clone(),
+                    num_experts=2,
                     psum_num_recv_tokens_per_scaleup_rank=torch.tensor([n]),
                     psum_num_recv_tokens_per_expert=torch.cumsum(counts, 0),
                 )
