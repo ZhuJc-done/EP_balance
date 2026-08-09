@@ -63,16 +63,35 @@ def _event(on_cuda: bool, stream):
     return e
 
 
-def _slot_layout(recv_slot: torch.Tensor, group_sizes: torch.Tensor, n_slot: int, cap: int):
+def _slot_layout(
+    recv_slot: torch.Tensor,
+    group_sizes: torch.Tensor,
+    n_slot: int,
+    cap: int,
+    valid_mask: Optional[torch.Tensor] = None,
+):
     """Permutation + padded destination index that group received tokens by physical slot."""
     T, device = recv_slot.shape[0], recv_slot.device
-    order = torch.argsort(recv_slot, stable=True)
-    slot_sorted = recv_slot[order]
+    if valid_mask is None:
+        valid_mask = torch.ones(T, dtype=torch.bool, device=device)
+    else:
+        valid_mask = valid_mask.to(torch.bool)
+    sort_slot = torch.where(valid_mask, recv_slot, torch.full_like(recv_slot, n_slot))
+    order = torch.argsort(sort_slot, stable=True)
+    slot_sorted = sort_slot[order]
+    valid_sorted = valid_mask[order]
+    safe_slot = slot_sorted.clamp(max=n_slot - 1)
     seg_start = torch.zeros(n_slot, dtype=torch.int64, device=device)
     if n_slot > 1:
         seg_start[1:] = torch.cumsum(group_sizes, dim=0)[:-1]
-    pos_in_slot = torch.arange(T, device=device, dtype=torch.int64) - seg_start[slot_sorted]
-    return order, slot_sorted * cap + pos_in_slot.clamp(max=cap - 1)
+    pos_in_slot = torch.arange(T, device=device, dtype=torch.int64) - seg_start[safe_slot]
+    overflow = n_slot * cap
+    flat = torch.where(
+        valid_sorted,
+        safe_slot * cap + pos_in_slot.clamp(max=cap - 1),
+        torch.full_like(pos_in_slot, overflow),
+    )
+    return order, flat, valid_sorted
 
 
 class _ManualExpertPipeline(torch.autograd.Function):
@@ -90,7 +109,9 @@ class _ManualExpertPipeline(torch.autograd.Function):
         payloads, main_w = list(tensors[:nc]), list(tensors[nc:])
         meta, adapter, group = cfg["meta"], cfg["adapter"], cfg["group"]
         cap, n_slot, H = int(cfg["cap"]), int(cfg["n_slot"]), int(cfg["H"])
-        my_rank, sent, recv = int(cfg["my_rank"]), cfg["sent"], cfg["recv"]
+        my_rank, sent, recv, routes = (
+            int(cfg["my_rank"]), cfg["sent"], cfg["recv"], cfg["routes"]
+        )
         device, dtype = payloads[0].device, payloads[0].dtype
 
         cs, ws = _comm_stream(device), _weight_stream(device)
@@ -107,13 +128,16 @@ class _ManualExpertPipeline(torch.autograd.Function):
         disp_evt: List[Optional[torch.cuda.Event]] = [None] * nc
         with _sctx(cs):
             for k in range(nc):
-                recv_pl[k] = adapter.dispatch_chunk(payloads[k], sent[k], recv[k], group, tag=k)
+                recv_pl[k] = adapter.dispatch_chunk(
+                    payloads[k], sent[k], recv[k], group, tag=k,
+                    route_idx=routes[k], n_slot=n_slot, cap=cap,
+                )
                 if on_cuda:
                     _rec(recv_pl[k], ms)
                     disp_evt[k] = _event(on_cuda, cs)
 
         saved: List[torch.Tensor] = []
-        idx: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        idx: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         comb: List[Optional[torch.Tensor]] = [None] * nc
         for k in range(nc):
             if on_cuda:
@@ -122,24 +146,32 @@ class _ManualExpertPipeline(torch.autograd.Function):
                     ms.wait_stream(ws)              # replica slots are read from here on
             rp = recv_pl[k]
             recv_tokens = rp[:, :H].contiguous()
-            recv_slot = rp[:, H].round().to(torch.int64) - my_rank * n_slot
-            group_sizes = torch.bincount(
-                recv_slot.clamp(min=0, max=n_slot - 1), minlength=n_slot
-            ).to(torch.int64)
-            order, flat = _slot_layout(recv_slot, group_sizes, n_slot, cap)
+            valid_mask = None
+            if adapter.uses_padded_layout():
+                recv_slot, valid_mask, group_sizes = adapter.recv_layout(k)
+            else:
+                recv_slot = rp[:, H].round().to(torch.int64) - my_rank * n_slot
+                group_sizes = torch.bincount(
+                    recv_slot.clamp(min=0, max=n_slot - 1), minlength=n_slot
+                ).to(torch.int64)
+            order, flat, valid_sorted = _slot_layout(
+                recv_slot, group_sizes, n_slot, cap, valid_mask
+            )
 
             T = recv_tokens.shape[0]
-            x_pad = recv_tokens.new_zeros((n_slot * cap, H))
-            x_pad.index_copy_(0, flat, recv_tokens[order])
-            x_pad = x_pad.view(n_slot, cap, H)
+            overflow = n_slot * cap
+            x_ext = recv_tokens.new_zeros((overflow + 1, H))
+            x_ext.index_copy_(0, flat, recv_tokens[order])
+            x_pad = x_ext[:overflow].view(n_slot, cap, H)
             h_pre = torch.bmm(x_pad, w1_eff)
             y_pad = torch.bmm(_activation(meta, h_pre), w2_eff)
-            y_sorted = y_pad.reshape(n_slot * cap, H)[flat]
+            y_sorted = y_pad.reshape(overflow, H)[flat.clamp(max=overflow - 1)]
+            y_sorted = y_sorted * valid_sorted.unsqueeze(1).to(y_sorted.dtype)
             y = y_sorted.new_empty((T, H))
             y.index_copy_(0, order, y_sorted)
 
             saved.extend([x_pad, h_pre])
-            idx.append((order, flat))
+            idx.append((order, flat, valid_sorted))
             comp_evt = _event(on_cuda, ms)
             if on_cuda:
                 _rec(y, cs)
@@ -204,12 +236,13 @@ class _ManualExpertPipeline(torch.autograd.Function):
             if on_cuda:
                 ms.wait_event(comb_evt[k])
             x_pad, h_pre = saved[2 * k], saved[2 * k + 1]
-            order, flat = ctx.idx[k]
+            order, flat, valid_sorted = ctx.idx[k]
             T = gy[k].shape[0]
 
-            g_pad = gy[k].new_zeros((n_slot * cap, H))
-            g_pad.index_add_(0, flat, gy[k].index_select(0, order))
-            g_pad = g_pad.view(n_slot, cap, H)
+            overflow = n_slot * cap
+            g_ext = gy[k].new_zeros((overflow + 1, H))
+            g_ext.index_add_(0, flat, gy[k].index_select(0, order))
+            g_pad = g_ext[:overflow].view(n_slot, cap, H)
 
             # --- Dgrad chain: needs the replica weights, so this is where a late pull would stall ---
             w1_eff, w2_eff = lease.wait()
@@ -219,7 +252,8 @@ class _ManualExpertPipeline(torch.autograd.Function):
                 a_g = _activation(meta, hp)
                 (grad_h_pre,) = torch.autograd.grad(a_g, hp, grad_a)
             gx_pad = torch.bmm(grad_h_pre, w1_eff.transpose(1, 2))
-            gx_sorted = gx_pad.reshape(n_slot * cap, H)[flat]
+            gx_sorted = gx_pad.reshape(overflow, H)[flat.clamp(max=overflow - 1)]
+            gx_sorted = gx_sorted * valid_sorted.unsqueeze(1).to(gx_sorted.dtype)
             gx = gx_sorted.new_zeros((T, H))
             gx.index_copy_(0, order, gx_sorted)
             # the payload's trailing columns carried the physical ids, a constant -> zero grad
@@ -300,6 +334,7 @@ class ManualMoEBlock:
         payloads: Sequence[torch.Tensor],
         sent: Sequence[torch.Tensor],
         recv: Sequence[torch.Tensor],
+        routes: Sequence[torch.Tensor],
         *,
         adapter,
         group,
@@ -312,7 +347,8 @@ class ManualMoEBlock:
         cfg = {
             "nc": len(payloads), "meta": self.meta, "adapter": adapter, "group": group,
             "cap": cap, "n_slot": n_slot, "H": H, "pad_cols": pad_cols, "my_rank": my_rank,
-            "sent": list(sent), "recv": list(recv), "lease": self.lease, "state": [],
+            "sent": list(sent), "recv": list(recv), "routes": list(routes),
+            "lease": self.lease, "state": [],
         }
         # one consumer for the lease: the single node now owns every chunk's backward
         self.lease.expect_consumer()

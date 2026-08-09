@@ -283,27 +283,254 @@ def test_routing_to_units():
 
 
 @pytest.mark.parametrize("hidden", [16, 512, 1024, 2048, 4096, 5120, 7168, 8192])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_dispatch_payload_alignment_matches_deepep_screen(hidden, dtype):
-    """The padded dispatch row must land on the alignment the adapter screens for.
-
-    These are two independent encodings of one DeepEP kernel constraint -- the payload builders pad
-    the row, ``_deepep_eligible`` decides whether DeepEP is used at all -- and they drifted once:
-    the padding targeted 16B while the kernel wants an even number of 16B chunks. Nothing failed.
-    Every dispatch and combine quietly took the ``all_to_all_single`` fallback, which reads its
-    split sizes on the host, so the integration was inert and each layer paid back the D2H that
-    adopting DeepEP was meant to remove. Only a check like this one surfaces that.
-
-    Rows too wide for the kernel's per-warp TMA buffer are a separate matter: declining those is
-    correct, and the assertion below deliberately does not demand eligibility for them.
-    """
+@pytest.mark.parametrize("dtype,eligible", [(torch.bfloat16, True), (torch.float16, False)])
+def test_elastic_payload_requires_aligned_bf16(hidden, dtype, eligible):
+    """ElasticBuffer accepts only BF16 rows aligned to one int4."""
     from eplb.integration.eplb_manager import DEEPEP_ROW_ALIGN, DeepEPAdapter, _payload_pad_cols
 
     elem = torch.empty((), dtype=dtype).element_size()
     pad_cols = _payload_pad_cols(hidden, elem)
-    assert pad_cols >= 1, "the physical-expert id needs a column of its own"
 
     row_bytes = (hidden + pad_cols) * elem
     assert row_bytes % DEEPEP_ROW_ALIGN == 0, f"H={hidden} {dtype} pads to a {row_bytes}B row"
-    if row_bytes // 2 + 8 <= 8192:  # within the TMA buffer, so alignment is the only thing left
-        assert DeepEPAdapter._deepep_eligible(torch.empty((4, hidden + pad_cols), dtype=dtype))
+    assert DeepEPAdapter._deepep_eligible(
+        torch.empty((4, hidden + pad_cols), dtype=dtype)
+    ) is eligible
+
+
+def test_elastic_buffer_is_shared_and_uses_static_shape(monkeypatch):
+    """Adapters with one layout share one ElasticBuffer allocation."""
+    import sys
+    import types
+
+    import eplb.integration.eplb_manager as manager
+
+    calls = []
+    fake_deep_ep = types.ModuleType("deep_ep")
+
+    def fake_buffer(*args, **kwargs):
+        calls.append((args, kwargs))
+        return object()
+
+    fake_deep_ep.ElasticBuffer = fake_buffer
+    fake_deep_ep.topk_idx_t = torch.int64
+    monkeypatch.setitem(sys.modules, "deep_ep", fake_deep_ep)
+    monkeypatch.setenv("EPLB_DEEPEP_HYBRID", "1")
+    manager._ELASTIC_BUFFERS.clear()
+    group = object()
+    payload = torch.zeros((4, 16), dtype=torch.bfloat16)
+    a0 = manager.DeepEPAdapter(max_tokens_per_rank=8)
+    a1 = manager.DeepEPAdapter(max_tokens_per_rank=8)
+    assert a0._get_buffer(group, payload) is a1._get_buffer(group, payload)
+    assert len(calls) == 1
+    assert calls[0][0] == (group,)
+    assert calls[0][1] == {
+        "num_max_tokens_per_rank": 8,
+        "hidden": 16,
+        "num_topk": 1,
+        "deterministic": False,
+        "allow_hybrid_mode": True,
+    }
+    manager._ELASTIC_BUFFERS.clear()
+
+
+def test_elastic_adapter_configuration_is_strict(monkeypatch):
+    """Elastic mode rejects legacy or host-synchronizing configurations."""
+    import sys
+    import types
+
+    from eplb.integration.megatron_moe import _make_adapter
+
+    fake_deep_ep = types.ModuleType("deep_ep")
+    fake_deep_ep.ElasticBuffer = object
+    fake_deep_ep.topk_idx_t = torch.int64
+    monkeypatch.setitem(sys.modules, "deep_ep", fake_deep_ep)
+    monkeypatch.setenv("EPLB_ADAPTER", "deepep")
+    for key in (
+        "EPLB_CAP", "EPLB_WEIGHT_COMM", "EPLB_GIN_FENCE", "EPLB_PROFILE",
+        "PROFILE_TRACE", "EPLB_DEEPEP_ALLOW_MNNVL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    with pytest.raises(ValueError, match="EPLB_CAP"):
+        _make_adapter()
+    monkeypatch.setenv("EPLB_CAP", "16")
+    with pytest.raises(ValueError, match="WEIGHT_COMM"):
+        _make_adapter()
+    monkeypatch.setenv("EPLB_WEIGHT_COMM", "gin")
+    with pytest.raises(ValueError, match="GIN_FENCE"):
+        _make_adapter()
+    monkeypatch.setenv("EPLB_GIN_FENCE", "signal")
+    assert _make_adapter().uses_padded_layout()
+    monkeypatch.setenv("EPLB_DEEPEP_ALLOW_MNNVL", "1")
+    with pytest.raises(ValueError, match="legacy"):
+        _make_adapter()
+
+
+def test_elastic_dispatch_uses_synthetic_experts_padding_and_no_sync(monkeypatch):
+    """Dispatch keeps counts on device and autograd uses combine/dispatch transposes."""
+    import sys
+    import types
+
+    import eplb.integration.eplb_manager as manager
+
+    class FakeElastic:
+        def __init__(self, group, **kwargs):
+            self.default_max = kwargs["num_max_tokens_per_rank"]
+            self.calls = []
+
+        def dispatch(self, x, topk_idx=None, handle=None, **kwargs):
+            self.calls.append(("dispatch", dict(kwargs), topk_idx, handle))
+            if handle is not None:
+                topk_idx = handle.topk_idx
+            n, h = topk_idx.shape[0], x.shape[1]
+            m = self.default_max
+            recv = x.new_zeros((m, h))
+            recv[:n] = x[:n]
+            recv_idx = torch.full((m, 1), -1, dtype=torch.int64)
+            recv_idx[:n] = topk_idx
+            if handle is None:
+                counts = torch.bincount(topk_idx[:, 0], minlength=2).to(torch.int64)
+                handle = types.SimpleNamespace(
+                    topk_idx=topk_idx.clone(),
+                    num_experts=2,
+                    psum_num_recv_tokens_per_scaleup_rank=torch.tensor([n]),
+                    psum_num_recv_tokens_per_expert=torch.cumsum(counts, 0),
+                )
+            return recv, recv_idx, None, handle, None
+
+        def combine(self, x, handle, **kwargs):
+            self.calls.append(("combine", dict(kwargs), None, handle))
+            return x[:handle.topk_idx.shape[0]], None, None
+
+    fake_deep_ep = types.ModuleType("deep_ep")
+    fake_deep_ep.ElasticBuffer = FakeElastic
+    fake_deep_ep.topk_idx_t = torch.int64
+    monkeypatch.setitem(sys.modules, "deep_ep", fake_deep_ep)
+    manager._ELASTIC_BUFFERS.clear()
+
+    adapter = manager.DeepEPAdapter(max_tokens_per_rank=4)
+    payload = torch.randn((3, 256), dtype=torch.bfloat16, requires_grad=True)
+    routes = torch.tensor([1, 0, 1], dtype=torch.int64)
+    recv = adapter.dispatch_chunk(
+        payload, torch.tensor([3]), torch.tensor([3]), object(), tag=7,
+        route_idx=routes, n_slot=2, cap=2,
+    )
+    slot, valid, sizes = adapter.recv_layout(7)
+    assert recv.shape == (4, 256)
+    assert slot.tolist() == [1, 0, 1, 0]
+    assert valid.tolist() == [True, True, True, False]
+    assert sizes.tolist() == [1, 2]
+
+    combined = adapter.combine_chunk(
+        recv[:, :8] * 2, torch.tensor([3]), torch.tensor([3]), object(), tag=7
+    )
+    combined.sum().backward()
+    assert torch.equal(payload.grad[:, :8], torch.full_like(payload.grad[:, :8], 2))
+    assert torch.count_nonzero(payload.grad[:, 8:]) == 0
+
+    calls = adapter._buffer.calls
+    first = calls[0]
+    assert torch.equal(first[2].flatten(), routes)
+    assert first[1]["num_experts"] == 2
+    assert first[1]["num_max_tokens_per_rank"] == 4
+    assert first[1]["expert_alignment"] == 1
+    assert first[1]["do_cpu_sync"] is False
+    assert first[1]["do_expand"] is False
+    cached = [c for c in calls if c[0] == "dispatch" and c[3] is not None]
+    assert cached and cached[0][1]["do_cpu_sync"] is False
+    assert cached[0][1]["do_expand"] is False
+    with pytest.raises(RuntimeError, match="EPLB_CAP"):
+        adapter.dispatch_chunk(
+            payload.detach(), torch.tensor([3]), torch.tensor([3]), adapter._group, tag=8,
+            route_idx=routes, n_slot=2, cap=1,
+        )
+    manager._ELASTIC_BUFFERS.clear()
+
+
+@pytest.mark.parametrize(
+    "chunks,overlap,manual",
+    [(1, False, False), (2, False, False), (2, True, False), (2, True, True)],
+)
+def test_elastic_padded_layout_matches_reference(monkeypatch, chunks, overlap, manual):
+    """Plain, overlapped and manual chunk paths ignore ElasticBuffer padding."""
+    import sys
+    import types
+
+    import eplb.integration.eplb_manager as manager
+
+    class FakeElastic:
+        def __init__(self, group, **kwargs):
+            self.max_tokens = kwargs["num_max_tokens_per_rank"]
+
+        def dispatch(self, x, topk_idx=None, handle=None, **kwargs):
+            if handle is not None:
+                topk_idx = handle.topk_idx
+            n, h = topk_idx.shape[0], x.shape[1]
+            recv = x.new_zeros((self.max_tokens, h))
+            recv[:n] = x[:n]
+            recv_idx = torch.full((self.max_tokens, 1), -1, dtype=torch.int64)
+            recv_idx[:n] = topk_idx
+            if handle is None:
+                counts = torch.bincount(topk_idx[:, 0], minlength=2).to(torch.int64)
+                handle = types.SimpleNamespace(
+                    topk_idx=topk_idx.clone(),
+                    num_experts=2,
+                    psum_num_recv_tokens_per_scaleup_rank=torch.tensor([n]),
+                    psum_num_recv_tokens_per_expert=torch.cumsum(counts, 0),
+                )
+            return recv, recv_idx, None, handle, None
+
+        def combine(self, x, handle, **kwargs):
+            return x[:handle.topk_idx.shape[0]], None, None
+
+    fake_deep_ep = types.ModuleType("deep_ep")
+    fake_deep_ep.ElasticBuffer = FakeElastic
+    fake_deep_ep.topk_idx_t = torch.int64
+    monkeypatch.setitem(sys.modules, "deep_ep", fake_deep_ep)
+    monkeypatch.setenv("EPLB_CHUNKS", str(chunks))
+    monkeypatch.setenv("EPLB_MANUAL_BWD", "1" if manual else "0")
+    manager._ELASTIC_BUFFERS.clear()
+
+    torch.manual_seed(7)
+    n, e, h, f = 8, 2, 8, 12
+    unit_expert = torch.tensor([0, 1, 0, 1, 1, 0, 0, 1], dtype=torch.int64)
+    spec = ProblemSpec.uniform_main_placement(e, 1, weight_bytes_each=1, s_tok=1, n_slot=2)
+    topo = Topology.from_nvlink_rdma(1, 1, 1, 1)
+    plan = solve(
+        Loads(torch.bincount(unit_expert, minlength=e).reshape(1, e)),
+        topo, spec, EPLBConfig(),
+    )
+    tokens = torch.randn(n, h, dtype=torch.bfloat16, requires_grad=True)
+    w0 = [torch.randn(h, f, dtype=torch.bfloat16).requires_grad_(True) for _ in range(e)]
+    w1 = [torch.randn(f, h, dtype=torch.bfloat16).requires_grad_(True) for _ in range(e)]
+    weights = {i: (w0[i], w1[i]) for i in range(e)}
+
+    ref_tokens = tokens.detach().clone().requires_grad_(True)
+    rw0 = [w.detach().clone().requires_grad_(True) for w in w0]
+    rw1 = [w.detach().clone().requires_grad_(True) for w in w1]
+    ref = torch.zeros_like(ref_tokens)
+    for expert in range(e):
+        idx = torch.nonzero(unit_expert == expert, as_tuple=False).flatten()
+        y = torch.relu(ref_tokens[idx] @ rw0[expert]) @ rw1[expert]
+        ref = ref.index_copy(0, idx, y)
+
+    got = sync_free_moe_forward(
+        tokens=tokens,
+        unit_token_idx=torch.arange(n),
+        unit_expert=unit_expert,
+        unit_prob=torch.ones(n, dtype=torch.bfloat16),
+        plan=plan, spec=spec, weights_local=weights,
+        weight_shapes=[torch.Size((h, f)), torch.Size((f, h))],
+        batched_mlp_fn=_batched_mlp, cap=n,
+        adapter=manager.DeepEPAdapter(max_tokens_per_rank=n),
+        overlap=overlap, gated=False, act=torch.relu,
+    )
+    assert torch.allclose(got, ref, atol=2e-2, rtol=2e-2)
+    got.float().sum().backward()
+    ref.float().sum().backward()
+    assert torch.allclose(tokens.grad, ref_tokens.grad, atol=2e-2, rtol=2e-2)
+    for expert in range(e):
+        assert torch.allclose(w0[expert].grad, rw0[expert].grad, atol=2e-2, rtol=2e-2)
+        assert torch.allclose(w1[expert].grad, rw1[expert].grad, atol=2e-2, rtol=2e-2)
+    manager._ELASTIC_BUFFERS.clear()

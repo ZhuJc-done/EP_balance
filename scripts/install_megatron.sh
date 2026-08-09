@@ -6,10 +6,10 @@
 # Override via env: MEGATRON_DIR, MEGATRON_REPO, MEGATRON_COMMIT.
 set -euo pipefail
 
-MEGATRON_DIR="${MEGATRON_DIR:-/home/tiger/Megatron-LM}"
+MEGATRON_DIR="${MEGATRON_DIR:-${HOME}/Megatron-LM}"
 MEGATRON_REPO="${MEGATRON_REPO:-https://github.com/NVIDIA/Megatron-LM.git}"
 # Validated with Scale-EPLB on GB200 (megatron-core 0.19.0+0ff7226f6). Pin a new SHA after re-validating.
-MEGATRON_COMMIT="${MEGATRON_COMMIT:-0ff7226f6}"
+MEGATRON_COMMIT="${MEGATRON_COMMIT:-0ff7226f6d8eba14c385a5d2ea658f92e4dcf40f}"
 
 echo "[install_megatron] dir=$MEGATRON_DIR repo=$MEGATRON_REPO commit=$MEGATRON_COMMIT"
 
@@ -21,8 +21,8 @@ git -C "$MEGATRON_DIR" checkout "$MEGATRON_COMMIT"
 
 # Editable install + the deps the GPT/MoE path needs (the launchers pin `--transformer-impl local`
 # + `--no-*-fusion`, so no fused-kernel extensions are required).
-pip install -e "$MEGATRON_DIR"
-pip install transformers einops sentencepiece tiktoken regex
+python -m pip install -e "$MEGATRON_DIR"
+python -m pip install transformers datasets einops sentencepiece tiktoken regex
 
 # Self-check: a concrete submodule must resolve INSIDE $MEGATRON_DIR (megatron is a namespace pkg,
 # so `megatron.__file__` is None and unreliable; check megatron.training instead).

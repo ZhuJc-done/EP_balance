@@ -3,9 +3,23 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import torch
+
+# Megatron 0ff7226f6 imports EventOverlap from deep_ep.utils, while DeepEP
+# af9a040 exposes it from deep_ep.utils.event. Populate the compatibility
+# export before pretrain_gpt imports Megatron's fused_a2a module.
+if "--moe-enable-deepep" in sys.argv:
+    try:
+        import deep_ep.utils as _deep_ep_utils
+        from deep_ep.utils.event import EventOverlap as _EventOverlap
+
+        _deep_ep_utils.EventOverlap = _EventOverlap
+    except Exception:
+        # Let Megatron's native dispatcher report its normal installation error.
+        pass
 
 import pretrain_gpt as pg  # NVIDIA Megatron-LM example script (repo root)
 from megatron.core import parallel_state as mpu
@@ -62,10 +76,38 @@ def _eplb_params(args):
     )
 
 
+def _use_separate_mlp_norm_checkpoint_keys(model) -> None:
+    """Match Bridge Qwen checkpoints that store the pre-MLP norm separately.
+
+    Megatron's local layer spec normally aliases this key to the fused
+    ``mlp.linear_fc1.layer_norm_*`` layout. Bridge Qwen checkpoints use
+    ``pre_mlp_layernorm.*`` instead, even though the tensors are identical.
+    """
+    if os.environ.get("EPLB_SEPARATE_MLP_NORM_CKPT", "0") != "1":
+        return
+    for module in model.modules():
+        submodules = getattr(module, "submodules_config", None)
+        key_map = getattr(submodules, "sharded_state_dict_keys_map", None)
+        if key_map is not None:
+            key_map.pop("pre_mlp_layernorm.", None)
+
+
 def model_provider(
     pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None
 ):
     """Megatron's GPT model_provider plus the EPLB observer (Phase B) or dispatcher binding (Phase C)."""
+    args = get_args()
+    if args.normalization == "RMSNorm" and args.transformer_impl == "local":
+        # This Megatron revision picks Apex FusedLayerNorm whenever Apex is
+        # importable, but that implementation rejects RMSNorm. Keep Apex
+        # available for FusedAdam and select Megatron's torch RMSNorm locally.
+        from megatron.core.models import backends
+        from megatron.core.models.gpt import gpt_layer_specs
+        from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+        backends.LNImpl = WrappedTorchNorm
+        gpt_layer_specs.LNImpl = WrappedTorchNorm
+
     model = pg.model_provider(
         pg.gpt_builder,
         pre_process,
@@ -74,7 +116,7 @@ def model_provider(
         config=config,
         pg_collection=pg_collection,
     )
-    args = get_args()
+    _use_separate_mlp_norm_checkpoint_keys(model)
     mode = os.environ.get("EPLB_MODE", "observe")
     if mode == "off" or not getattr(args, "num_experts", None):
         return model

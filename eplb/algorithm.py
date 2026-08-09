@@ -90,14 +90,14 @@ def _waterfill(
     return add
 
 
-def _assign_quota(
+def _update_routing(
     omega: torch.Tensor,
     x: torch.Tensor,
     cost: torch.Tensor,
     dom: torch.Tensor,
     u_min: int = 1,
 ):
-    """Route tokens under strict domain-local serving (cross-domain only when no in-domain instance).
+    """Update routing quotas after placement under strict domain-local serving.
 
     Args:
         omega: int64 ``[R, E]`` load matrix.
@@ -291,13 +291,13 @@ def solve(
                 x[e, chosen] = 1
                 slot_used[chosen] += 1
 
-    # Stage 2: monotonic incremental relief inside each domain.  The initial
-    # route above is the only full route; every accepted action moves one
-    # expert's existing quotas between two same-domain ranks.
-    q, load = _assign_quota(omega, x, cost, dom, int(cfg.u_min))
+    # Update Routing is the only full quota construction.
+    q, load = _update_routing(omega, x, cost, dom, int(cfg.u_min))
     contrib = q.sum(dim=0).to(torch.int64)  # [E, R]
     stuck = torch.zeros(R, dtype=torch.bool, device=device)
 
+    # Stage 2: monotonic incremental relief inside each domain. Every accepted
+    # action moves one expert's existing quotas between two same-domain ranks.
     iters = 0
     while iters < cfg.max_stage2_iters:
         iters += 1
@@ -556,10 +556,10 @@ def solve_bisect(
     # θ-bisection descent: halve the gap to the even-split lower bound.
     lo = (int(omega.sum().item()) + R - 1) // R
     best_x = x_cur.clone()
-    best_q, best_load = _assign_quota(omega, best_x, cost, dom, int(cfg.u_min))
+    best_q, best_load = _update_routing(omega, best_x, cost, dom, int(cfg.u_min))
     best_theta = int(best_load.max().item())
     for _ in range(int(cfg.theta_bisect_iters)):
-        q, load = _assign_quota(omega, x_cur, cost, dom, int(cfg.u_min))
+        q, load = _update_routing(omega, x_cur, cost, dom, int(cfg.u_min))
         theta = int(load.max().item())
         if theta < best_theta:
             best_theta, best_x, best_q = theta, x_cur.clone(), q

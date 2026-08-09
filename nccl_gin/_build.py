@@ -22,7 +22,7 @@ def _get_backend():
 
     extra_ldflags = [
         f"-L{os.path.join(_NCCL_HOME, 'lib')}",
-        "-lnccl",
+        "-l:libnccl.so.2",
         f"-Wl,-rpath,{os.path.join(_NCCL_HOME, 'lib')}",
     ]
 

@@ -45,6 +45,7 @@ def select_shadow_experts(
     s_tok: int,
     num_ranks: int,
     cost: ShadowCostModel | None = None,
+    n_slot: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pick the shadowed experts and return the resulting per-rank token load.
 
@@ -56,6 +57,10 @@ def select_shadow_experts(
         s_tok: bytes of one token's activation vector (``H * dtype_size``).
         num_ranks: number of ranks/workers ``R``.
         cost: performance-model constants; defaults to :class:`ShadowCostModel`.
+        n_slot: Additional replica slots available on each rank. ``None`` keeps
+            FasterMoE's original unconstrained shadow policy; the common
+            benchmark always supplies an integer so every strategy receives the
+            same per-rank replica budget.
 
     Returns:
         ``(shadow_mask, rank_load)`` where ``shadow_mask`` is a bool ``[E]`` tensor
@@ -63,6 +68,8 @@ def select_shadow_experts(
         tensor of realized per-rank token load after redistribution.
     """
     cost = cost or ShadowCostModel()
+    if n_slot is not None and int(n_slot) < 0:
+        raise ValueError("n_slot must be non-negative")
 
     # FasterMoE runs this policy on host-side integer counts; do the same on CPU.
     omega_f = omega.detach().to(device="cpu", dtype=torch.float64)
@@ -92,10 +99,21 @@ def select_shadow_experts(
     w_bytes_l = w_bytes.tolist()
 
     shadow_mask = torch.zeros(num_experts, dtype=torch.bool)
+    replicas_per_rank = torch.zeros(num_ranks, dtype=torch.int64)
     broadcast_bytes = 0.0
 
     for e in order:
         h = home_l[e]
+        # A global shadow adds one copy on every rank except the expert's main
+        # rank, which already owns that expert. Enforce the same *additional*
+        # per-rank replica budget used by the other benchmark strategies.
+        replica_delta = torch.ones(num_ranks, dtype=torch.int64)
+        replica_delta[h] = 0
+        if n_slot is not None and torch.any(
+            replicas_per_rank + replica_delta > int(n_slot)
+        ):
+            break
+
         # Redistribute: home keeps only its own tokens (Ω[h, e]); every source
         # rank now computes the Ω[r, e] tokens it used to ship (Alg. 1, l.6-8).
         rank_load[h] -= expert_load_l[e]
@@ -109,6 +127,7 @@ def select_shadow_experts(
             c_min = c
             broadcast_bytes = broadcast_try
             shadow_mask[e] = True
+            replicas_per_rank += replica_delta
         else:
             # Diminishing returns: this shadow no longer helps -> undo it and stop.
             rank_load -= omega_f[:, e]

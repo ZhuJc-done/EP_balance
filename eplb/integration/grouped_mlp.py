@@ -38,6 +38,7 @@ def grouped_expert_mlp(
     batched_mlp_fn: Callable[[torch.Tensor, Tuple[torch.Tensor, ...]], torch.Tensor],
     cap: int,
     *,
+    valid_mask: torch.Tensor | None = None,
     check_overflow: bool = False,
 ) -> torch.Tensor:
     """Compute per-slot expert outputs for received tokens, fully sync-free.
@@ -49,6 +50,7 @@ def grouped_expert_mlp(
         weights: stacked expert weights, each tensor shaped ``[S, ...]``.
         batched_mlp_fn: ``(x[S, cap, H], weights) -> y[S, cap, H']`` batched expert forward.
         cap: Per-slot capacity (host-static upper bound; must satisfy ``max(group_sizes) <= cap``).
+        valid_mask: Optional device bool ``[T]``; false rows are ElasticBuffer worst-case padding.
         check_overflow: If True, assert no slot exceeds ``cap`` (forces one host sync; debug only).
 
     Returns:
@@ -58,27 +60,42 @@ def grouped_expert_mlp(
     S = int(group_sizes.shape[0])
     device = recv_tokens.device
 
-    # group tokens by slot (stable -> ascending arrival order within a slot)
-    order = torch.argsort(recv_slot, stable=True)
-    slot_sorted = recv_slot[order]
+    if valid_mask is None:
+        valid_mask = torch.ones(T, dtype=torch.bool, device=device)
+    else:
+        valid_mask = valid_mask.to(torch.bool)
+
+    # Invalid ElasticBuffer rows sort into an overflow slot and never enter the GEMM buckets.
+    sort_slot = torch.where(valid_mask, recv_slot, torch.full_like(recv_slot, S))
+    order = torch.argsort(sort_slot, stable=True)
+    slot_sorted = sort_slot[order]
+    valid_sorted = valid_mask[order]
+    safe_slot = slot_sorted.clamp(max=S - 1)
 
     # each token's position within its slot via exclusive-cumsum offsets
     seg_start = torch.zeros(S, dtype=torch.int64, device=device)
     if S > 1:
         seg_start[1:] = torch.cumsum(group_sizes, dim=0)[:-1]
-    pos_in_slot = torch.arange(T, device=device, dtype=torch.int64) - seg_start[slot_sorted]
+    pos_in_slot = torch.arange(T, device=device, dtype=torch.int64) - seg_start[safe_slot]
 
     if check_overflow:  # debug-only host sync
-        assert bool((pos_in_slot < cap).all()), "grouped_expert_mlp: a slot exceeded cap"
+        assert bool((~valid_sorted | (pos_in_slot < cap)).all()), "grouped_expert_mlp: a slot exceeded cap"
 
-    flat_idx = slot_sorted * cap + pos_in_slot.clamp(max=cap - 1)
+    overflow = S * cap
+    flat_idx = torch.where(
+        valid_sorted,
+        safe_slot * cap + pos_in_slot.clamp(max=cap - 1),
+        torch.full_like(pos_in_slot, overflow),
+    )
 
-    # scatter into the padded [S, cap, H] buffer, run one batched MLP, gather back
-    x_pad = recv_tokens.new_zeros((S * cap, H))
-    x_pad = x_pad.index_copy(0, flat_idx, recv_tokens[order])
-    y_pad = batched_mlp_fn(x_pad.view(S, cap, H), weights)  # [S, cap, H']
+    # The extra row absorbs all invalid writes and is sliced away before expert compute.
+    x_ext = recv_tokens.new_zeros((S * cap + 1, H))
+    x_ext = x_ext.index_copy(0, flat_idx, recv_tokens[order])
+    y_pad = batched_mlp_fn(x_ext[:overflow].view(S, cap, H), weights)  # [S, cap, H']
     Hout = y_pad.shape[-1]
-    out_sorted = y_pad.reshape(S * cap, Hout)[flat_idx]  # [T, H']
+    gather_idx = flat_idx.clamp(max=overflow - 1)
+    out_sorted = y_pad.reshape(S * cap, Hout)[gather_idx]
+    out_sorted = out_sorted * valid_sorted.unsqueeze(1).to(out_sorted.dtype)
 
     out = out_sorted.new_empty((T, Hout))
     out = out.index_copy(0, order, out_sorted)

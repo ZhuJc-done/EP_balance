@@ -5,12 +5,8 @@
 # to forward to scripts/run_real_moe.sh with the same multi-node + GB200 env.
 set -euo pipefail
 
-# DeepEP's extension links libnccl.so from the nvidia-nccl wheel (install_deepep.sh); put it on the
-# runtime linker path so `import deep_ep` resolves. No-op if the wheel isn't installed.
-_nccl_lib="$(python -c 'import nvidia.nccl as n,os;print(os.path.join(n.__path__[0],"lib"))' 2>/dev/null || true)"
-if [ -n "${_nccl_lib}" ] && [ -d "${_nccl_lib}" ]; then
-  export LD_LIBRARY_PATH="${_nccl_lib}:${LD_LIBRARY_PATH:-}"
-fi
+# Pin runtime and JIT linkage to the validated NCCL build before Python starts.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env_nccl_2307.sh"
 
 # --- paths -------------------------------------------------------------------
 MEGATRON_DIR="${MEGATRON_DIR:?set MEGATRON_DIR to the Megatron-LM repo root}"
@@ -88,6 +84,29 @@ export EPLB_PROFILE_EVERY="${EPLB_PROFILE_EVERY:-20}"
 # EPLB_REMATERIALIZE=1 (apply mode) -> don't hold replica expert weights across fwd->bwd; free them
 # after forward and re-broadcast at backward start (weight recompute). Trades extra broadcast for memory.
 export EPLB_REMATERIALIZE="${EPLB_REMATERIALIZE:-0}"
+
+if [[ "${EPLB_MODE}" == "apply" && "${EPLB_ADAPTER:-alltoall}" == "deepep" ]]; then
+  [[ -n "${EPLB_CAP:-}" && "${EPLB_CAP}" -gt 0 ]] || {
+    echo "ElasticBuffer smoke requires EPLB_CAP=<positive static bound>" >&2; exit 1;
+  }
+  [[ "${EPLB_WEIGHT_COMM:-}" == "gin" && "${EPLB_GIN_FENCE:-}" == "signal" ]] || {
+    echo "ElasticBuffer smoke requires EPLB_WEIGHT_COMM=gin EPLB_GIN_FENCE=signal" >&2; exit 1;
+  }
+  [[ "${EPLB_PROFILE}" == "0" && "${PROFILE_TRACE:-0}" == "0" ]] || {
+    echo "zero-sync smoke requires EPLB_PROFILE=0 PROFILE_TRACE=0" >&2; exit 1;
+  }
+  python - <<'PY'
+import deep_ep
+import nccl_gin
+from eplb.integration.eplb_manager import _nccl_runtime_version
+assert hasattr(deep_ep, "ElasticBuffer"), "DeepEP ElasticBuffer is unavailable"
+nccl_gin._ensure_loaded()
+v = _nccl_runtime_version()
+assert v == (2, 30, 7), f"NCCL 2.30.7 runtime required, got {v}"
+print(f"[run_gb200_4x4] transport={deep_ep.ElasticBuffer.__module__}.ElasticBuffer "
+      f"GIN=ready NCCL={v}")
+PY
+fi
 
 # PROFILE_TRACE=1 -> Megatron's native PyTorch profiler emits a perfetto/chrome trace under
 # PROFILE_DIR; the eplb/* record_function labels show up inline so you can read the call stack.

@@ -31,7 +31,7 @@ from eplb.loads import Loads
 
 W = 2   # ranks / GPUs (keep small: 1 replica is enough to exercise the get/put + reduce)
 E = 4
-H = 16  # bf16 rows must be an even number of 16B chunks or DeepEP declines them (see below)
+H = 16
 F = 32
 T = 32
 
@@ -58,7 +58,9 @@ def _global_data(dtype=torch.float32):
 
 
 def _ground_truth(unit_expert, unit_prob, tokens, base_w1, base_w2):
-    tokens, base_w1, base_w2 = tokens.float(), base_w1.float(), base_w2.float()
+    tokens = tokens.float().requires_grad_(True)
+    unit_prob = unit_prob.float().requires_grad_(True)
+    base_w1, base_w2 = base_w1.float(), base_w2.float()
     gt_w1 = [base_w1[e].clone().requires_grad_(True) for e in range(E)]
     gt_w2 = [base_w2[e].clone().requires_grad_(True) for e in range(E)]
     results = []
@@ -71,11 +73,11 @@ def _ground_truth(unit_expert, unit_prob, tokens, base_w1, base_w2):
         results.append(res)
     loss = sum(r.sum() for r in results)
     loss.backward()
-    return torch.stack(results), gt_w1, gt_w2
+    return torch.stack(results), gt_w1, gt_w2, tokens.grad, unit_prob.grad
 
 
 def _worker(rank, port, transport="alltoall", dtype=torch.float32, fence="barrier", chunks=1,
-            manual=True, lsa=True):
+            manual=True, lsa=True, sync_debug=False):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["EPLB_WEIGHT_COMM"] = "gin"
@@ -115,39 +117,50 @@ def _worker(rank, port, transport="alltoall", dtype=torch.float32, fence="barrie
         for e in my_experts
     }
 
-    local_tokens = tokens[rank].to(dev)
+    local_tokens = tokens[rank].to(dev).detach().requires_grad_(True)
+    local_prob = unit_prob[rank].to(dev).detach().requires_grad_(True)
+    local_unit_expert = unit_expert[rank].to(dtype=torch.int64, device=dev)
+    local_unit_token_idx = torch.arange(T, dtype=torch.int64, device=dev)
     if transport == "deepep":
-        # DeepEP only moves bf16/fp16 rows that are an even number of 16B chunks; every other tensor
-        # silently takes the all_to_all_single fallback, which would leave this test green without
-        # ever entering DeepEP. Assert the token channel qualifies, and again after the run that no
-        # leg declined.
-        assert DeepEPAdapter._deepep_eligible(local_tokens), (
-            f"token channel is not DeepEP-eligible (dtype={dtype}, row={H * local_tokens.element_size()}B); "
-            "the test would silently fall back to all_to_all_single"
-        )
         adapter = DeepEPAdapter()
     else:
         adapter = AllToAllAdapter()
 
-    result = sync_free_moe_forward(
-        tokens=local_tokens,
-        unit_token_idx=torch.arange(T, dtype=torch.int64, device=dev),
-        unit_expert=unit_expert[rank].to(torch.int64).to(dev),
-        unit_prob=unit_prob[rank].to(torch.float32).to(dev),
-        plan=plan, spec=spec, weights_local=weights_local,
-        weight_shapes=[(H, F), (F, H)], batched_mlp_fn=_batched_mlp, cap=W * T,
-        adapter=adapter,
-        # `overlap` is left False on purpose: selecting the GIN weight backend is enough to route
-        # through GinReplicaTransport, which holds no replica clone and re-pulls in backward.
-        gated=False, act=torch.relu, transpose_w=False,
-    )
-    result.sum().backward()
-    if transport == "deepep":
-        assert not adapter._warned_fallback, "a DeepEP leg declined and fell back to all_to_all_single"
+    def one_step():
+        return sync_free_moe_forward(
+            tokens=local_tokens,
+            unit_token_idx=local_unit_token_idx,
+            unit_expert=local_unit_expert,
+            unit_prob=local_prob,
+            plan=plan, spec=spec, weights_local=weights_local,
+            weight_shapes=[(H, F), (F, H)], batched_mlp_fn=_batched_mlp, cap=W * T,
+            adapter=adapter,
+            gated=False, act=torch.relu, transpose_w=False,
+        )
+
+    if sync_debug:
+        one_step().sum().backward()
+        torch.cuda.synchronize()
+        dist.barrier()
+        local_tokens.grad = local_prob.grad = None
+        for pair in weights_local.values():
+            for weight in pair:
+                weight.grad = None
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            result = one_step()
+            result.sum().backward()
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+    else:
+        result = one_step()
+        result.sum().backward()
 
     gathered = [torch.empty(T, H, device=dev, dtype=result.dtype) for _ in range(W)]
     dist.all_gather(gathered, result.detach().contiguous())
-    gt_results, gt_w1, gt_w2 = _ground_truth(unit_expert, unit_prob, tokens, base_w1, base_w2)
+    gt_results, gt_w1, gt_w2, gt_tokens, gt_prob = _ground_truth(
+        unit_expert, unit_prob, tokens, base_w1, base_w2
+    )
 
     # bf16 keeps ~3 decimal digits, so the bar is looser there -- still far tighter than the
     # order-1 errors a routing, placement or grad-reduction bug produces.
@@ -161,6 +174,8 @@ def _worker(rank, port, transport="alltoall", dtype=torch.float32, fence="barrie
             f"W1 grad mismatch e{e} rank {rank}: max={float((w1.grad.float().cpu() - gt_w1[e].grad).abs().max())}"
         assert torch.allclose(w2.grad.float().cpu(), gt_w2[e].grad, atol=atol, rtol=rtol), \
             f"W2 grad mismatch e{e} rank {rank}: max={float((w2.grad.float().cpu() - gt_w2[e].grad).abs().max())}"
+    assert torch.allclose(local_tokens.grad.float().cpu(), gt_tokens[rank], atol=atol, rtol=rtol)
+    assert torch.allclose(local_prob.grad.float().cpu(), gt_prob[rank], atol=atol, rtol=rtol)
 
     dist.destroy_process_group()
 
@@ -296,16 +311,17 @@ def _deepep_available() -> bool:
     if not _gin_available():
         return False
     try:
-        import deep_ep  # noqa: F401
+        import deep_ep
+        from eplb.integration.eplb_manager import _nccl_runtime_version
     except Exception:
         return False
-    return True
+    return hasattr(deep_ep, "ElasticBuffer") and _nccl_runtime_version() >= (2, 30, 4)
 
 
 @pytest.mark.skipif(not _deepep_available(),
                     reason="needs the GIN prerequisites plus the 'deep_ep' package")
 def test_deepep_tokens_with_gin_weights_compute_invariant():
-    """Both device-initiated backends together: DeepEP tokens + GIN weights/grads.
+    """ElasticBuffer tokens plus GIN weights/grads match the reference.
 
     This is the configuration the cluster runs use, and it is the only test that covers it. The
     backends never talk to each other -- DeepEP moves tokens, nccl_gin moves expert weights and
@@ -318,7 +334,7 @@ def test_deepep_tokens_with_gin_weights_compute_invariant():
 @pytest.mark.skipif(not _deepep_available(),
                     reason="needs the GIN prerequisites plus the 'deep_ep' package")
 def test_deepep_gin_two_chunk_compute_invariant():
-    """The full cluster configuration: DeepEP tokens + GIN weights + the two-chunk token pipeline.
+    """ElasticBuffer + GIN with two manual chunks matches the reference.
 
     Chunking multiplies the token-side work but must not multiply the weight-side: both chunks read
     one acquired stack, and one shared lease re-acquires once in backward. If that sharing broke, GIN
@@ -330,7 +346,7 @@ def test_deepep_gin_two_chunk_compute_invariant():
 @pytest.mark.skipif(not _deepep_available(),
                     reason="needs the GIN prerequisites plus the 'deep_ep' package")
 def test_deepep_gin_two_chunk_autograd_matches_reference():
-    """The same configuration with ``EPLB_MANUAL_BWD=0``, as a differential check on the schedule.
+    """ElasticBuffer + GIN with two autograd chunks matches the reference.
 
     The hand-scheduled backward drives DeepEP's transpose legs itself (``buffer.combine`` for
     ``dispatch^-1``, ``buffer.dispatch`` for ``combine^-1``) instead of going through the autograd
@@ -338,6 +354,22 @@ def test_deepep_gin_two_chunk_autograd_matches_reference():
     and a handle mixed up between chunks would land grads on the wrong ranks -- which is only visible
     as a numeric mismatch against the same run with autograd doing the ordering."""
     mp.spawn(_worker, args=(6035, "deepep", torch.bfloat16, "signal", 2, False), nprocs=W, join=True)
+
+
+@pytest.mark.parametrize(
+    "chunks,manual,port",
+    [(1, True, 6040), (2, True, 6041), (2, False, 6042)],
+)
+@pytest.mark.skipif(not _deepep_available(),
+                    reason="needs ElasticBuffer, NCCL 2.30.4+, GIN, RUN_GIN_TESTS=1 and >=2 GPUs")
+def test_elastic_gin_hot_path_issues_no_cpu_sync(chunks, manual, port):
+    """After initialization, full forward/backward must pass CUDA sync-debug error mode."""
+    mp.spawn(
+        _worker,
+        args=(port, "deepep", torch.bfloat16, "signal", chunks, manual, True, True),
+        nprocs=W,
+        join=True,
+    )
 
 
 def test_replica_schedule_device_math():

@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# Install DeepEP (OPTIONAL sync-free EP transport) for Scale-EPLB (external dependency, NOT vendored).
-# Not required to run/test: Phase C defaults to AllToAllAdapter (torch all_to_all_single).
-# Install this only to wire DeepEPAdapter on a DeepEP-capable cluster.
-#
-# DeepEP V2 uses the lightweight NCCL Gin backend (no NVSHMEM needed).
-# Override via env: DEEPEP_DIR, DEEPEP_REPO, DEEPEP_COMMIT, NCCL_PKG, TORCH_CUDA_ARCH_LIST.
+# Install DeepEP V2 ElasticBuffer for Scale-EPLB's zero-sync token transport.
+# Override via env: DEEPEP_DIR, DEEPEP_REPO, DEEPEP_COMMIT, TORCH_CUDA_ARCH_LIST.
 set -euo pipefail
 
-DEEPEP_DIR="${DEEPEP_DIR:-/home/tiger/DeepEP}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEEPEP_DIR="${DEEPEP_DIR:-${HOME}/DeepEP}"
 DEEPEP_REPO="${DEEPEP_REPO:-https://github.com/deepseek-ai/DeepEP.git}"
-DEEPEP_COMMIT="${DEEPEP_COMMIT:-main}"        # pin a SHA once validated on-cluster
-NCCL_PKG="${NCCL_PKG:-nvidia-nccl-cu13>=2.30.4}"
+# Validated with the apply-mode DeepEP adapter on GB200. Pin a new SHA only after
+# rerunning tests/test_gin_weights.py and a real-model training step.
+DEEPEP_COMMIT="${DEEPEP_COMMIT:-af9a0403188392824fc3057452822235873e0612}"
+NCCL_PKG="nvidia-nccl-cu13==2.30.7"
 
 # Default arch from the live GPU (Blackwell -> 10.0a, Hopper -> 9.0a); DeepEP's default 9.0 breaks on Blackwell.
 if [ -z "${TORCH_CUDA_ARCH_LIST:-}" ]; then
@@ -27,36 +26,43 @@ fi
 export TORCH_CUDA_ARCH_LIST
 echo "[install_deepep] dir=$DEEPEP_DIR commit=$DEEPEP_COMMIT arch=$TORCH_CUDA_ARCH_LIST nccl=$NCCL_PKG"
 
-# NCCL into the Python env so DeepEP auto-locates it (Device API + GIN; 2.30.4+).
-pip install "$NCCL_PKG" --no-deps
+# Install and select the exact NCCL runtime validated with ElasticBuffer and GIN.
+python -m pip install "$NCCL_PKG" --no-deps
+source "${SCRIPT_DIR}/env_nccl_2307.sh"
 
 if [ ! -d "$DEEPEP_DIR/.git" ]; then
   git clone "$DEEPEP_REPO" "$DEEPEP_DIR"
 fi
-if [ "$DEEPEP_COMMIT" != "main" ]; then
-  git -C "$DEEPEP_DIR" fetch origin "$DEEPEP_COMMIT"
-  git -C "$DEEPEP_DIR" checkout "$DEEPEP_COMMIT"
-fi
+git -C "$DEEPEP_DIR" fetch origin "$DEEPEP_COMMIT" || git -C "$DEEPEP_DIR" fetch origin
+git -C "$DEEPEP_DIR" checkout "$DEEPEP_COMMIT"
 
-NCCL_LIB_DIR="$(python - <<'PY'
-import os
-try:
-    import deep_ep.find_pkgs as fp  # DeepEP ships the same resolver it uses in setup.py
-    print(f"{fp.find_nccl_root()}/lib")
-except Exception:
-    import nvidia.nccl, os
-    # nvidia is a PEP420 namespace pkg -> __file__ is None; use __path__ for the install dir.
-    print(os.path.join(nvidia.nccl.__path__[0], "lib"))
-PY
-)"
+NCCL_LIB_DIR="${NCCL_HOME}/lib"
 if [ -n "$NCCL_LIB_DIR" ] && [ -d "$NCCL_LIB_DIR" ]; then
   export LIBRARY_PATH="${NCCL_LIB_DIR}:${LIBRARY_PATH:-}"
   echo "[install_deepep] LIBRARY_PATH += ${NCCL_LIB_DIR} (link-time NCCL search path)"
 fi
 
-# install into the user site-packages (system /usr/local/... is not writable here); reuses the
-# already-compiled build/ dir. Override the target with PIP_USER=0 + a writable prefix if needed.
+# Install into the user site-packages because the system Python prefix may be read-only.
 ( cd "$DEEPEP_DIR" && python setup.py install --user )
 
-python -c "import deep_ep; print('[install_deepep] import OK:', deep_ep.__file__)"
-echo "[install_deepep] done -> swap AllToAllAdapter() for DeepEPAdapter() in bind_eplb_to_moe_layer"
+python - <<'PY'
+import deep_ep
+import ctypes
+
+assert hasattr(deep_ep, "ElasticBuffer"), "pinned DeepEP does not export ElasticBuffer"
+assert hasattr(deep_ep, "topk_idx_t"), "pinned DeepEP lacks the Elastic routing dtype"
+paths = {
+    line.split()[-1] for line in open("/proc/self/maps", encoding="utf-8")
+    if "libnccl.so" in line and line.split()[-1].startswith("/")
+}
+assert len(paths) == 1, f"expected one loaded NCCL runtime, got {paths}"
+lib = ctypes.CDLL(next(iter(paths)))
+encoded = ctypes.c_int()
+assert lib.ncclGetVersion(ctypes.byref(encoded)) == 0
+value = encoded.value
+version = value // 10000, (value % 10000) // 100, value % 100
+assert version == (2, 30, 7), f"NCCL 2.30.7 required, got {version}"
+print("[install_deepep] ElasticBuffer OK:", deep_ep.__file__)
+print("[install_deepep] NCCL:", version)
+PY
+echo "[install_deepep] done -> EPLB_ADAPTER=deepep uses ElasticBuffer only"

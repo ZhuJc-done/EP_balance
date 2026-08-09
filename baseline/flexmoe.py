@@ -6,9 +6,11 @@ reproduced -- FlexMoE never modifies token routing (so model quality is
 untouched); instead it changes the expert->device mapping ``P`` by giving hot
 experts more GPU replicas and reclaiming replicas from cold experts.
 
-The unit of management is a **vExpert**: every rank exposes ``n_slot`` vExpert
-slots (``|G| * n_slot`` in total), each expert ``e`` is allocated ``n_e`` vExperts,
-and its load is split evenly so each vExpert carries ``cap_e = I_e / n_e`` tokens.
+The unit of management is a **vExpert**. In this benchmark ``n_slot`` uniformly
+means the number of *additional replica* slots per rank. Each rank therefore has
+``E / |G| + n_slot`` physical vExpert slots, each expert ``e`` is allocated
+``n_e`` vExperts, and its load is split evenly so each vExpert carries
+``cap_e = I_e / n_e`` tokens.
 
 * ``flexmoe_schedule`` implements the Scheduler + Policy Maker greedy (paper
   Algorithms 1-2): while the balance ratio (Eq. 6, ``max_g load_g / mean_g``)
@@ -46,9 +48,9 @@ def _balanced_pack(
     cap_e: torch.Tensor,
     counts: list[int],
     num_ranks: int,
-    n_slot: int,
+    physical_slots_per_rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """LPT-pack the vExperts onto ranks, each rank holding at most ``n_slot`` of them.
+    """LPT-pack vExperts with a fixed total physical capacity per rank.
 
     Expert ``e`` contributes ``counts[e]`` vExperts, each weighing ``cap_e[e]``.
     Every vExpert is placed on the least-loaded rank that still has a free slot.
@@ -65,7 +67,7 @@ def _balanced_pack(
     # min-heap keyed by (load, rank); only ranks with a free slot are present.
     heap = [(0.0, g) for g in range(num_ranks)]
     heapq.heapify(heap)
-    free = [n_slot] * num_ranks
+    free = [physical_slots_per_rank] * num_ranks
 
     for w, e in items:
         load, g = heapq.heappop(heap)
@@ -92,7 +94,8 @@ def flexmoe_schedule(
         weight_bytes: numeric ``[E]`` byte size of each expert's parameters
             (drives the ``T_Sync`` replication penalty, paper Eq. 9).
         num_ranks: number of ranks/GPUs ``|G|``.
-        n_slot: vExpert slots per rank; the total slot budget is ``num_ranks * n_slot``.
+        n_slot: Additional replica vExpert slots per rank. Each rank's total
+            physical capacity is ``num_experts / num_ranks + n_slot``.
         cost: cost-model + trigger constants; defaults to :class:`FlexMoECostModel`.
 
     Returns:
@@ -107,16 +110,19 @@ def flexmoe_schedule(
     w_bytes = weight_bytes.detach().to(device="cpu", dtype=torch.float64)
     num_experts = expert_load.numel()
 
-    total_slots = num_ranks * n_slot
-    if total_slots < num_experts:
-        raise ValueError("num_ranks * n_slot must be >= number of experts")
+    if num_ranks <= 0 or num_experts % num_ranks != 0:
+        raise ValueError("num_experts must be divisible by num_ranks")
+    if n_slot < 0:
+        raise ValueError("n_slot must be non-negative")
+    main_slots_per_rank = num_experts // num_ranks
+    physical_slots_per_rank = main_slots_per_rank + int(n_slot)
 
     total = float(expert_load.sum().item())
     mean = total / num_ranks if num_ranks else 0.0
 
     n = [1] * num_experts  # every expert starts with one vExpert (uses E slots)
     cap = expert_load.clone()  # cap_e = I_e / n_e, initially I_e
-    slots_left = total_slots - num_experts
+    slots_left = num_ranks * int(n_slot)
     sync_bytes = 0.0
 
     def objective(max_cap: float, sync_total: float) -> float:
@@ -145,7 +151,9 @@ def flexmoe_schedule(
             cap[e0] = prev
             break
 
-    rank_load, placement = _balanced_pack(cap, n, num_ranks, n_slot)
+    rank_load, placement = _balanced_pack(
+        cap, n, num_ranks, physical_slots_per_rank
+    )
     return n, rank_load, placement
 
 

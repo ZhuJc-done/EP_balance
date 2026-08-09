@@ -45,6 +45,43 @@ class LPLBUnavailableError(RuntimeError):
     """The optional compiled LPLB package is not importable."""
 
 
+def _slot_budget(
+    num_experts: int, num_ranks: int, n_slot: int
+) -> tuple[int, int, int]:
+    """Return ``(main, replica, physical)`` slots per rank.
+
+    The baseline-facing ``n_slot`` has one uniform meaning: the number of
+    *additional expert replica* slots available on every rank. Logical experts
+    are placed evenly, so each rank also owns ``num_experts / num_ranks`` mains.
+    """
+    if num_ranks <= 0 or num_experts % num_ranks != 0:
+        raise ValueError("num_experts must be divisible by num_ranks")
+    if int(n_slot) < 0:
+        raise ValueError("n_slot must be non-negative")
+    main_slots = num_experts // num_ranks
+    replica_slots = int(n_slot)
+    return main_slots, replica_slots, main_slots + replica_slots
+
+
+def _budget_metadata(
+    num_experts: int,
+    num_ranks: int,
+    n_slot: int,
+    physical_instances: int,
+) -> dict[str, int]:
+    main_slots, replica_slots, physical_slots = _slot_budget(
+        num_experts, num_ranks, n_slot
+    )
+    return {
+        "main_slots_per_rank": main_slots,
+        "replica_slots_per_rank": replica_slots,
+        "physical_slots_per_rank": physical_slots,
+        "replica_budget": num_ranks * replica_slots,
+        "physical_instances": int(physical_instances),
+        "replicas": max(0, int(physical_instances) - num_experts),
+    }
+
+
 def run_scale_eplb(
     loads: Loads,
     topology: Topology,
@@ -53,6 +90,11 @@ def run_scale_eplb(
 ) -> BaselineResult:
     """Run this repository's exact placement-and-quota solver."""
     plan = solve(loads, topology, spec, cfg or EPLBConfig(), validate=False)
+    main_slots, _, _ = _slot_budget(
+        spec.num_experts, topology.num_ranks, 0
+    )
+    replica_slots = int(spec.n_slot) - main_slots
+    physical_instances = int(plan.x.sum().item())
     return BaselineResult(
         name="scale-eplb",
         rank_load=plan.rank_load(),
@@ -60,7 +102,12 @@ def run_scale_eplb(
         metadata={
             "load_kind": "realized quota load",
             "placement_kind": "binary expert presence",
-            "replicas": int(plan.x.sum().item()),
+            **_budget_metadata(
+                spec.num_experts,
+                topology.num_ranks,
+                replica_slots,
+                physical_instances,
+            ),
         },
     )
 
@@ -78,12 +125,12 @@ def run_deepseek_eplb(
 
     DeepSeek EPLB does not produce source-to-destination quotas.  Its quality
     metric therefore follows the algorithm's assumption that an expert's load
-    is divided equally among all of its replicas.
+    is divided equally among all of its replicas. ``n_slot`` is the common
+    per-rank *additional replica* budget, excluding main experts.
     """
     num_experts = loads.num_experts
-    num_physical = num_gpus * n_slot
-    if num_physical < num_experts:
-        raise ValueError("num_gpus * n_slot must cover all logical experts")
+    _, _, physical_slots = _slot_budget(num_experts, num_gpus, n_slot)
+    num_physical = num_experts + num_gpus * int(n_slot)
 
     current_load = loads.expert_load().cpu()
     placement_load = (
@@ -101,11 +148,13 @@ def run_deepseek_eplb(
     phy2log = phy2log[0]
     logcnt = logcnt[0]
     per_physical = current_load.double() / logcnt.double()
-    rank_load = per_physical[phy2log].view(num_gpus, n_slot).sum(dim=1)
+    rank_load = per_physical[phy2log].view(num_gpus, physical_slots).sum(dim=1)
     placement = torch.zeros(
         (num_experts, num_gpus), dtype=torch.int64, device=phy2log.device
     )
-    ranks = torch.arange(num_gpus, dtype=torch.int64).repeat_interleave(n_slot)
+    ranks = torch.arange(num_gpus, dtype=torch.int64).repeat_interleave(
+        physical_slots
+    )
     placement.index_put_(
         (phy2log, ranks), torch.ones_like(phy2log), accumulate=True
     )
@@ -116,8 +165,10 @@ def run_deepseek_eplb(
         metadata={
             "load_kind": "ideal equal-split predicted load",
             "placement_kind": "physical replica count",
-            "replicas": num_physical,
             "num_groups": num_groups,
+            **_budget_metadata(
+                num_experts, num_gpus, n_slot, num_physical
+            ),
         },
     )
 
@@ -127,6 +178,7 @@ def run_fastermoe(
     spec: ProblemSpec,
     *,
     num_ranks: int,
+    n_slot: int,
     cost: ShadowCostModel | None = None,
 ) -> BaselineResult:
     """Run FasterMoE dynamic shadowing and report its realized per-rank load.
@@ -142,6 +194,7 @@ def run_fastermoe(
         spec.s_tok,
         num_ranks,
         cost,
+        n_slot,
     )
     placement = torch.zeros(
         (spec.num_experts, num_ranks), dtype=torch.int64
@@ -150,6 +203,7 @@ def run_fastermoe(
     placement[experts, spec.main_rank.cpu()] = 1
     # A shadowed expert is transiently replicated onto every rank.
     placement[shadow_mask] = 1
+    physical_instances = int(placement.sum().item())
     return BaselineResult(
         name="fastermoe",
         rank_load=rank_load,
@@ -157,8 +211,10 @@ def run_fastermoe(
         metadata={
             "load_kind": "shadow-redistributed token load",
             "placement_kind": "binary expert presence (shadow=all ranks)",
-            "replicas": int(placement.sum().item()),
             "shadowed_experts": int(shadow_mask.sum().item()),
+            **_budget_metadata(
+                spec.num_experts, num_ranks, n_slot, physical_instances
+            ),
         },
     )
 
@@ -168,6 +224,7 @@ def run_flexmoe(
     spec: ProblemSpec,
     *,
     num_ranks: int,
+    n_slot: int,
     cost: FlexMoECostModel | None = None,
 ) -> BaselineResult:
     """Run FlexMoE dynamic device placement and report its realized per-rank load.
@@ -180,10 +237,11 @@ def run_flexmoe(
         loads.omega,
         spec.weight_bytes,
         num_ranks,
-        spec.n_slot,
+        n_slot,
         cost,
     )
     mean = rank_load.mean().item() if rank_load.numel() else 0.0
+    physical_instances = int(sum(counts))
     return BaselineResult(
         name="flexmoe",
         rank_load=rank_load,
@@ -191,8 +249,10 @@ def run_flexmoe(
         metadata={
             "load_kind": "even-split vExpert load (balance ratio)",
             "placement_kind": "binary expert presence (vExpert replicas)",
-            "replicas": int(sum(counts)),
             "balance_ratio": (rank_load.max().item() / mean) if mean > 0 else 1.0,
+            **_budget_metadata(
+                spec.num_experts, num_ranks, n_slot, physical_instances
+            ),
         },
     )
 
@@ -212,6 +272,26 @@ def cube8_topology() -> torch.Tensor:
         ],
         dtype=torch.int32,
     )
+
+
+def ring8_topology() -> torch.Tensor:
+    """Official LPLB 8-rank, one-redundant directed ring topology."""
+    return torch.tensor(
+        [[1], [2], [3], [4], [5], [6], [7], [0]],
+        dtype=torch.int32,
+    )
+
+
+def select_lplb_topology(name: str, n_slot: int) -> tuple[str, torch.Tensor]:
+    """Select an official LPLB topology compatible with the replica budget."""
+    normalized = name.strip().lower()
+    if normalized == "auto":
+        normalized = "cube" if int(n_slot) % 2 == 0 else "ring"
+    if normalized == "cube":
+        return normalized, cube8_topology()
+    if normalized == "ring":
+        return normalized, ring8_topology()
+    raise ValueError("LPLB topology must be one of: auto, cube, ring")
 
 
 def load_lplb(lplb_root: str | Path | None = None):
@@ -240,17 +320,23 @@ class LPLBBaseline:
         n_slot: int,
         lplb_root: str | Path | None = None,
         topology: torch.Tensor | None = None,
+        topology_name: str = "auto",
     ) -> None:
         if not torch.cuda.is_available():
             raise LPLBUnavailableError("LPLB requires CUDA")
-        if num_experts % ep_size != 0:
-            raise ValueError("LPLB requires num_experts divisible by ep_size")
-        base_per_rank = num_experts // ep_size
-        redundant_per_rank = n_slot - base_per_rank
+        _, redundant_per_rank, physical_per_rank = _slot_budget(
+            num_experts, ep_size, n_slot
+        )
         if redundant_per_rank <= 0:
             raise ValueError("LPLB requires at least one redundant slot per rank")
 
-        self.r2o = (topology if topology is not None else cube8_topology()).int().cuda()
+        if topology is None:
+            self.topology_name, topology = select_lplb_topology(
+                topology_name, redundant_per_rank
+            )
+        else:
+            self.topology_name = "custom"
+        self.r2o = topology.int().cuda()
         if ep_size % self.r2o.shape[0] != 0:
             raise ValueError("ep_size must be divisible by the LPLB topology size")
         if redundant_per_rank % self.r2o.shape[1] != 0:
@@ -261,13 +347,14 @@ class LPLBBaseline:
         lplb = load_lplb(lplb_root)
         self.planner = lplb.Planner(
             self.r2o,
-            ep_size * n_slot,
+            ep_size * physical_per_rank,
             num_experts,
             ep_size=ep_size,
         )
         self.num_experts = num_experts
         self.ep_size = ep_size
-        self.n_slot = n_slot
+        self.n_slot = int(n_slot)
+        self.physical_slots_per_rank = physical_per_rank
 
     def update_mapping(self, workload_history: torch.Tensor) -> None:
         self.planner.update_redundancy_mapping(workload_history)
@@ -294,14 +381,34 @@ class LPLBBaseline:
         duplicated = duplicated.sum(2)
         fixed = physical_load[:, :, width:-width].sum(2)
         rank_load = (duplicated + fixed).flatten()
+        phy2log = self.planner.phy2log.long()
+        ranks = torch.arange(
+            self.ep_size, dtype=torch.int64, device=phy2log.device
+        ).repeat_interleave(self.physical_slots_per_rank)
+        placement = torch.zeros(
+            (self.num_experts, self.ep_size),
+            dtype=torch.int64,
+            device=phy2log.device,
+        )
+        placement.index_put_(
+            (phy2log, ranks), torch.ones_like(phy2log), accumulate=True
+        )
         return BaselineResult(
             name="lplb",
             rank_load=rank_load,
+            placement=placement,
             metadata={
                 "load_kind": "LP predicted load",
                 "placement_kind": "fixed LPLB redundant topology",
-                "replicas": self.ep_size * self.n_slot,
+                "lplb_topology": self.topology_name,
+                "topology_edges_per_rank": int(self.r2o.shape[1]),
                 "available_groups": int(available.item()),
+                **_budget_metadata(
+                    self.num_experts,
+                    self.ep_size,
+                    self.n_slot,
+                    self.ep_size * self.physical_slots_per_rank,
+                ),
             },
         )
 
@@ -313,6 +420,8 @@ __all__ = [
     "LPLBUnavailableError",
     "ShadowCostModel",
     "cube8_topology",
+    "ring8_topology",
+    "select_lplb_topology",
     "run_deepseek_eplb",
     "run_fastermoe",
     "run_flexmoe",
