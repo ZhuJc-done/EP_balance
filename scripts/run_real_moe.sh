@@ -65,6 +65,17 @@ MASTER_ADDR="${MASTER_ADDR:-localhost}"     # set to node-0 address on every nod
 MASTER_PORT="${MASTER_PORT:-6000}"
 WORLD_SIZE=$(( GPUS_PER_NODE * NNODES ))
 
+# Some cluster images inject NCCL_SOCKET_FAMILY=AF_INET. Override it when the
+# rendezvous address is an IPv6 literal; otherwise NCCL cannot select eth0 on
+# IPv6-only nodes and fails with "Bootstrap : no socket interface found".
+if [[ "${MASTER_ADDR}" == *:* ]]; then
+  export NCCL_SOCKET_FAMILY=AF_INET6
+  export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-=eth0}"
+  export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-eth0}"
+  echo "[run_real_moe] IPv6 bootstrap: NCCL_SOCKET_FAMILY=${NCCL_SOCKET_FAMILY}" \
+       "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME} GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME}"
+fi
+
 # --- parallelism (override via env; EP must divide world/(TP*PP)) -------------
 TP="${TP:-2}"
 PP="${PP:-1}"
