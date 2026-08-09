@@ -30,7 +30,6 @@ and validated on:
 
 | Component | Version |
 |---|---|
-| Hardware | NVIDIA GB200 (`aarch64` Grace-Blackwell), driver 580.126.20 |
 | OS / Python | Linux `aarch64` (kernel 6.14) / Python 3.12.4 |
 | CUDA | 13.2 (PyTorch cu13 build) |
 | PyTorch | 2.11.0 (cu13 build) |
@@ -56,31 +55,6 @@ bash scripts/install_deepep.sh       # optional: DeepEP transport (NCCL Gin back
 pip install -e /home/tiger/EP_balance
 ```
 
-For disposable Merlin machines, `scripts/bootstrap_new_machine.sh` installs all
-three repositories and keeps datasets, HF caches, tokenizers, checkpoints, and
-logs under `/mnt/hdfs/__MERLIN_USER_DIR__/eplb_data`. See the
-[fresh-machine run book](scripts/README.md#fresh-machine-install-once-keep-artifacts-on-hdfs).
-
-`install_deepep.sh` is optional — the launchers fall back to `AllToAllAdapter` (torch
-`all_to_all_single`); install **DeepEP** for high-performance all-to-all transport.
-Run recipes (single-node, multi-node 2×4 / 4×4, observe/apply, baselines) are in
-[`scripts/README.md`](scripts/README.md).
-
-## Quick start (CPU solver / simulation)
-
-```bash
-pip install -e ".[dev]"
-
-# single-process simulation: build a 4x8 topology, skewed load, solve, verify
-python -m sim.run_sim --nodes 4 --gpus 8 --experts 64 --skew 1.5
-
-# multi-process determinism check (gloo): every rank computes a bit-identical plan
-python -m sim.run_dist --world-size 8 --experts 64 --skew 1.5
-
-# tests
-pytest -q
-```
-
 ## GPU solver
 
 The planner is organized as two algorithms:
@@ -92,17 +66,3 @@ The planner is organized as two algorithms:
 2. **Algorithm 2 — Intra-node Replication**
    - repair rank imbalance independently inside each topology domain by adding
      domain-local replicas and incrementally updating the affected entries of `Q`.
-
-```bash
-# Benchmark the CUDA solver (defaults to 32 nodes x 8 GPUs, 640 experts)
-python tests/test_gpu_solver.py --nodes 4 --gpus-per-node 8 --experts 640
-```
-
-Example `run_sim` output (imbalance 8.9× → 2.2×):
-
-```
-Baseline (no replication):  theta=  218957  imbalance= 8.909
-Scale-EPLB plan          :  theta=   53988  imbalance= 2.197
-Theta reduction          :   4.056x
-Constraints C1-C7: OK
-```

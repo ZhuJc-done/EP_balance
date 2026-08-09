@@ -29,7 +29,7 @@ def _get_backend():
     extra_cuda_cflags = [
         "-std=c++17",
         "-O3",
-        # "-gencode", "arch=compute_90,code=sm_90", # speedup build
+        "-gencode", "arch=compute_90,code=sm_90",
         "-gencode", "arch=compute_100,code=sm_100",
         "-DNCCL_GIN_PROXY_ENABLE=1",
     ]
