@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "eval" / "prepare_open_workload.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "prepare_open_workload.py"
 SPEC = importlib.util.spec_from_file_location("prepare_open_workload", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None

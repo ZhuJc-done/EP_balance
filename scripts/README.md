@@ -21,6 +21,7 @@ Run MoE on real Megatron-LM with Scale-EPLB, in two stages selected by `EPLB_MOD
 | `run_real_moe.sh` | Real-model launcher (Qwen3-30B-A3B / Mixtral); `REAL=1` from `run_gb200_4x4.sh` forwards here. `MOCK=1` = mock-data + random init; `MOCK=0 FROM_SCRATCH=1` = real data + random init; `DEEPEP=1` = native DeepEP dispatch. |
 | `run_slot_sweep.sh` | Sweep `N_slot=1..4` with workload seed 0 and save one non-detail baseline JSON per configuration; uses a fixed LPLB Ring topology. |
 | `run_solver_scaling.sh` | Sweep the Scale-EPLB CUDA solver over logical rank and expert counts and save hot-kernel JSON results. |
+| `prepare_open_workload.py` | Download task/corpus workloads, extract model inputs, and optionally build Megatron `.bin/.idx`. |
 | `eval/plot_solver_scaling.py` | Read an existing solver-scaling JSON directory and independently generate PNG/PDF plots. |
 | `install_megatron.sh` | Clone+install pinned community Megatron-LM, self-check `import megatron`. |
 | `install_deepep.sh` | Optional: clone+build DeepEP (NCCL Gin backend) for the sync-free transport. |
@@ -96,7 +97,7 @@ For DAPO-Math and the other workload adapters:
 
 ```bash
 source scripts/env_hdfs.sh
-python eval/prepare_open_workload.py \
+python scripts/prepare_open_workload.py \
   --workload dapo_math \
   --tokenizer-model "${EPLB_TOKENIZER_DIR}/qwen3_30b_a3b" \
   --preprocess \
