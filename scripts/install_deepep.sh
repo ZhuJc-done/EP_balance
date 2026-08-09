@@ -54,8 +54,8 @@ if [ -n "$NCCL_LIB_DIR" ] && [ -d "$NCCL_LIB_DIR" ]; then
   echo "[install_deepep] LIBRARY_PATH += ${NCCL_LIB_DIR} (link-time NCCL search path)"
 fi
 
-# Install into the active Python environment.
-( cd "$DEEPEP_DIR" && python setup.py install )
+# Install into the user site-packages because the system Python prefix may be read-only.
+( cd "$DEEPEP_DIR" && python setup.py install --user )
 
 python -c "import deep_ep; print('[install_deepep] import OK:', deep_ep.__file__)"
 echo "[install_deepep] done -> swap AllToAllAdapter() for DeepEPAdapter() in bind_eplb_to_moe_layer"
