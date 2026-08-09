@@ -106,6 +106,7 @@ fi
 #
 # apply-mode backends (ignored in off/observe, which use Megatron's own dispatcher):
 # EPLB_ADAPTER=deepep       token dispatch/combine through DeepEP (default `alltoall`).
+# EPLB_DEEPEP_ALLOW_MNNVL=1 use CUDA fabric handles for EP groups spanning a GB200 NVLink fabric.
 # EPLB_WEIGHT_COMM=gin      replica expert weights AND their grad reduce-to-main over the in-tree
 #                           nccl_gin backend, both directions device-initiated (default:
 #                           host-driven dist.broadcast). Independent of the token transport.
@@ -142,7 +143,7 @@ fi
 # EPLB_REMATERIALIZE=1      dist.broadcast transport only: free replica weights after forward and
 #                           re-broadcast them in backward.
 for _knob in EPLB_N_SLOT EPLB_PROFILE EPLB_PROFILE_ALL_RANKS EPLB_PROFILE_EVERY EPLB_PROFILE_RESET_AT \
-             EPLB_ADAPTER EPLB_WEIGHT_COMM EPLB_GIN_FENCE EPLB_GIN_LSA EPLB_DEEPEP_STATIC EPLB_CAP \
+             EPLB_ADAPTER EPLB_DEEPEP_ALLOW_MNNVL EPLB_WEIGHT_COMM EPLB_GIN_FENCE EPLB_GIN_LSA EPLB_DEEPEP_STATIC EPLB_CAP \
              EPLB_CHUNKS EPLB_MANUAL_BWD EPLB_OVERLAP EPLB_REMATERIALIZE; do
   if [[ -n "${!_knob:-}" ]]; then export "${_knob}"; fi
 done

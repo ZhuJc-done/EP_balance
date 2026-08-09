@@ -209,6 +209,7 @@ class DeepEPAdapter:
         self._deep_ep = deep_ep
         self._num_nvl_bytes = int(num_nvl_bytes or os.environ.get("EPLB_DEEPEP_NVL_BYTES", 1_000_000_000))
         self._num_qps_per_rank = int(num_qps_per_rank)
+        self._allow_mnnvl = os.environ.get("EPLB_DEEPEP_ALLOW_MNNVL", "0") == "1"
         env_max = os.environ.get("EPLB_DEEPEP_MAX_RECV")
         self._max_recv_tokens = int(max_recv_tokens if max_recv_tokens is not None else (env_max or 0))
         self._buffer = None
@@ -231,7 +232,9 @@ class DeepEPAdapter:
                 group = dist.distributed_c10d._get_default_group()
             self._buffer = self._deep_ep.Buffer(
                 group, self._num_nvl_bytes, 0,
-                low_latency_mode=False, num_qps_per_rank=self._num_qps_per_rank, allow_mnnvl=False,
+                low_latency_mode=False,
+                num_qps_per_rank=self._num_qps_per_rank,
+                allow_mnnvl=self._allow_mnnvl,
             )
             self._group = group
         return self._buffer

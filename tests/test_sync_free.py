@@ -307,3 +307,32 @@ def test_dispatch_payload_alignment_matches_deepep_screen(hidden, dtype):
     assert row_bytes % DEEPEP_ROW_ALIGN == 0, f"H={hidden} {dtype} pads to a {row_bytes}B row"
     if row_bytes // 2 + 8 <= 8192:  # within the TMA buffer, so alignment is the only thing left
         assert DeepEPAdapter._deepep_eligible(torch.empty((4, hidden + pad_cols), dtype=dtype))
+
+
+@pytest.mark.parametrize("value,expected", [(None, False), ("0", False), ("1", True)])
+def test_deepep_adapter_forwards_mnnvl_setting(monkeypatch, value, expected):
+    import sys
+    import types
+
+    calls = []
+    fake_deep_ep = types.ModuleType("deep_ep")
+
+    def fake_buffer(*args, **kwargs):
+        calls.append((args, kwargs))
+        return object()
+
+    fake_deep_ep.Buffer = fake_buffer
+    monkeypatch.setitem(sys.modules, "deep_ep", fake_deep_ep)
+    if value is None:
+        monkeypatch.delenv("EPLB_DEEPEP_ALLOW_MNNVL", raising=False)
+    else:
+        monkeypatch.setenv("EPLB_DEEPEP_ALLOW_MNNVL", value)
+
+    from eplb.integration.eplb_manager import DeepEPAdapter
+
+    group = object()
+    adapter = DeepEPAdapter()
+    adapter._get_buffer(group)
+
+    assert calls[0][0][:3] == (group, 1_000_000_000, 0)
+    assert calls[0][1]["allow_mnnvl"] is expected
