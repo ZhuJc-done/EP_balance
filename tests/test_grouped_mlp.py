@@ -79,3 +79,35 @@ def test_empty_slots_ok():
     got = grouped_expert_mlp(recv_tokens, recv_slot, group_sizes, (W0, W1), _batched_relu_mlp, cap)
     ref = _loop_reference(recv_tokens, recv_slot, W0, W1, S)
     assert torch.allclose(got, ref, atol=1e-5)
+
+
+def test_elastic_padding_is_excluded_from_output_and_grad():
+    """Worst-case rows never enter expert forward, Dgrad or Wgrad."""
+    torch.manual_seed(3)
+    S, H, F, actual, padded = 4, 6, 10, 17, 32
+    slot = torch.randint(0, S, (actual,), dtype=torch.int64)
+    recv_slot = torch.cat([slot, torch.zeros(padded - actual, dtype=torch.int64)])
+    valid = torch.arange(padded) < actual
+    sizes = torch.bincount(slot, minlength=S).to(torch.int64)
+    cap = actual
+
+    x = torch.randn(padded, H, requires_grad=True)
+    xr = x[:actual].detach().clone().requires_grad_(True)
+    w0 = torch.randn(S, H, F) * 0.1
+    w1 = torch.randn(S, F, H) * 0.1
+    w0g, w1g = w0.clone().requires_grad_(True), w1.clone().requires_grad_(True)
+    w0r, w1r = w0.clone().requires_grad_(True), w1.clone().requires_grad_(True)
+
+    got = grouped_expert_mlp(
+        x, recv_slot, sizes, (w0g, w1g), _batched_relu_mlp, cap, valid_mask=valid
+    )
+    ref = _loop_reference(xr, slot, w0r, w1r, S)
+    assert torch.allclose(got[:actual], ref, atol=1e-5)
+    assert torch.count_nonzero(got[actual:]) == 0
+
+    got.sum().backward()
+    ref.sum().backward()
+    assert torch.allclose(x.grad[:actual], xr.grad, atol=1e-5)
+    assert torch.count_nonzero(x.grad[actual:]) == 0
+    assert torch.allclose(w0g.grad, w0r.grad, atol=1e-5)
+    assert torch.allclose(w1g.grad, w1r.grad, atol=1e-5)

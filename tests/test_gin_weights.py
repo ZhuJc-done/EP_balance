@@ -31,7 +31,7 @@ from eplb.loads import Loads
 
 W = 2   # ranks / GPUs (keep small: 1 replica is enough to exercise the get/put + reduce)
 E = 4
-H = 16  # bf16 rows must be an even number of 16B chunks or DeepEP declines them (see below)
+H = 16
 F = 32
 T = 32
 
@@ -117,13 +117,9 @@ def _worker(rank, port, transport="alltoall", dtype=torch.float32, fence="barrie
 
     local_tokens = tokens[rank].to(dev)
     if transport == "deepep":
-        # DeepEP only moves bf16/fp16 rows that are an even number of 16B chunks; every other tensor
-        # silently takes the all_to_all_single fallback, which would leave this test green without
-        # ever entering DeepEP. Assert the token channel qualifies, and again after the run that no
-        # leg declined.
         assert DeepEPAdapter._deepep_eligible(local_tokens), (
-            f"token channel is not DeepEP-eligible (dtype={dtype}, row={H * local_tokens.element_size()}B); "
-            "the test would silently fall back to all_to_all_single"
+            f"ElasticBuffer requires BF16 aligned rows, got dtype={dtype}, "
+            f"row={H * local_tokens.element_size()}B"
         )
         adapter = DeepEPAdapter()
     else:
@@ -142,8 +138,6 @@ def _worker(rank, port, transport="alltoall", dtype=torch.float32, fence="barrie
         gated=False, act=torch.relu, transpose_w=False,
     )
     result.sum().backward()
-    if transport == "deepep":
-        assert not adapter._warned_fallback, "a DeepEP leg declined and fell back to all_to_all_single"
 
     gathered = [torch.empty(T, H, device=dev, dtype=result.dtype) for _ in range(W)]
     dist.all_gather(gathered, result.detach().contiguous())
@@ -296,16 +290,16 @@ def _deepep_available() -> bool:
     if not _gin_available():
         return False
     try:
-        import deep_ep  # noqa: F401
+        import deep_ep
     except Exception:
         return False
-    return True
+    return hasattr(deep_ep, "ElasticBuffer")
 
 
 @pytest.mark.skipif(not _deepep_available(),
                     reason="needs the GIN prerequisites plus the 'deep_ep' package")
 def test_deepep_tokens_with_gin_weights_compute_invariant():
-    """Both device-initiated backends together: DeepEP tokens + GIN weights/grads.
+    """ElasticBuffer tokens plus GIN weights/grads match the reference.
 
     This is the configuration the cluster runs use, and it is the only test that covers it. The
     backends never talk to each other -- DeepEP moves tokens, nccl_gin moves expert weights and
@@ -318,7 +312,7 @@ def test_deepep_tokens_with_gin_weights_compute_invariant():
 @pytest.mark.skipif(not _deepep_available(),
                     reason="needs the GIN prerequisites plus the 'deep_ep' package")
 def test_deepep_gin_two_chunk_compute_invariant():
-    """The full cluster configuration: DeepEP tokens + GIN weights + the two-chunk token pipeline.
+    """ElasticBuffer + GIN with two manual chunks matches the reference.
 
     Chunking multiplies the token-side work but must not multiply the weight-side: both chunks read
     one acquired stack, and one shared lease re-acquires once in backward. If that sharing broke, GIN
@@ -330,7 +324,7 @@ def test_deepep_gin_two_chunk_compute_invariant():
 @pytest.mark.skipif(not _deepep_available(),
                     reason="needs the GIN prerequisites plus the 'deep_ep' package")
 def test_deepep_gin_two_chunk_autograd_matches_reference():
-    """The same configuration with ``EPLB_MANUAL_BWD=0``, as a differential check on the schedule.
+    """ElasticBuffer + GIN with two autograd chunks matches the reference.
 
     The hand-scheduled backward drives DeepEP's transpose legs itself (``buffer.combine`` for
     ``dispatch^-1``, ``buffer.dispatch`` for ``combine^-1``) instead of going through the autograd

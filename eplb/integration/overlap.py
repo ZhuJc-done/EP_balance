@@ -481,25 +481,39 @@ class OverlappedExperts:
         recv_slot: torch.Tensor,
         group_sizes: torch.Tensor,
         cap: int,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Expert compute for one chunk of received tokens; returns them in ``recv_tokens`` order."""
         T, H = recv_tokens.shape
         n_slot, device = self.n_slot, recv_tokens.device
-
-        order = torch.argsort(recv_slot, stable=True)
-        slot_sorted = recv_slot[order]
+        if valid_mask is None:
+            valid_mask = torch.ones(T, dtype=torch.bool, device=device)
+        else:
+            valid_mask = valid_mask.to(torch.bool)
+        sort_slot = torch.where(valid_mask, recv_slot, torch.full_like(recv_slot, n_slot))
+        order = torch.argsort(sort_slot, stable=True)
+        slot_sorted = sort_slot[order]
+        valid_sorted = valid_mask[order]
+        safe_slot = slot_sorted.clamp(max=n_slot - 1)
         seg_start = torch.zeros(n_slot, dtype=torch.int64, device=device)
         if n_slot > 1:
             seg_start[1:] = torch.cumsum(group_sizes, dim=0)[:-1]
-        pos_in_slot = torch.arange(T, device=device, dtype=torch.int64) - seg_start[slot_sorted]
-        flat_idx = slot_sorted * cap + pos_in_slot.clamp(max=cap - 1)
+        pos_in_slot = torch.arange(T, device=device, dtype=torch.int64) - seg_start[safe_slot]
+        overflow = n_slot * cap
+        flat_idx = torch.where(
+            valid_sorted,
+            safe_slot * cap + pos_in_slot.clamp(max=cap - 1),
+            torch.full_like(pos_in_slot, overflow),
+        )
 
-        x_pad = recv_tokens.new_zeros((n_slot * cap, H))
-        x_pad = x_pad.index_copy(0, flat_idx, recv_tokens[order]).view(n_slot, cap, H)
+        x_ext = recv_tokens.new_zeros((overflow + 1, H))
+        x_ext = x_ext.index_copy(0, flat_idx, recv_tokens[order])
+        x_pad = x_ext[:overflow].view(n_slot, cap, H)
 
         self.lease.expect_consumer()
         y_pad = _ChunkExperts.apply(x_pad, self.w1_eff, self.w2_eff, self.meta, self.lease)
-        out_sorted = y_pad.reshape(n_slot * cap, H)[flat_idx]
+        out_sorted = y_pad.reshape(overflow, H)[flat_idx.clamp(max=overflow - 1)]
+        out_sorted = out_sorted * valid_sorted.unsqueeze(1).to(out_sorted.dtype)
         out = out_sorted.new_empty((T, H))
         return out.index_copy(0, order, out_sorted)
 
@@ -523,6 +537,7 @@ def overlapped_grouped_expert_mlp(
     group=None,
     pool: WeightPool = _POOL,
     transport: "Optional[ReplicaTransport]" = None,
+    valid_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Single-chunk :class:`OverlappedExperts`: grouped expert MLP whose backward re-acquires the weights.
 
@@ -554,4 +569,4 @@ def overlapped_grouped_expert_mlp(
         n_slot=n_slot, dtype=recv_tokens.dtype, device=recv_tokens.device, group=group, pool=pool,
         transport=transport,
     )
-    return layer.chunk(recv_tokens, recv_slot, group_sizes, cap)
+    return layer.chunk(recv_tokens, recv_slot, group_sizes, cap, valid_mask)

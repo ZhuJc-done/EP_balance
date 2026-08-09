@@ -59,11 +59,19 @@ fi
 python - <<'PY'
 import deep_ep
 import megatron.core
+import nccl_gin
 import torch
 
+assert hasattr(deep_ep, "ElasticBuffer"), "DeepEP ElasticBuffer is unavailable"
+assert hasattr(deep_ep, "topk_idx_t"), "DeepEP Elastic routing dtype is unavailable"
+nccl = torch.cuda.nccl.version()
+if isinstance(nccl, tuple):
+    assert nccl >= (2, 30, 4), f"NCCL 2.30.4+ required, got {nccl}"
 print("Scale-EPLB bootstrap complete")
 print("Megatron-Core:", getattr(megatron.core, "__version__", "unknown"))
-print("DeepEP:", getattr(deep_ep, "__version__", "unknown"))
+print("DeepEP Elastic:", getattr(deep_ep, "__version__", "unknown"))
+print("NCCL:", nccl)
+print("GIN module:", nccl_gin.__file__)
 print("CUDA capability:", torch.cuda.get_device_capability(0))
 PY
 

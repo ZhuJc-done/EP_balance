@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
-# Install DeepEP (OPTIONAL sync-free EP transport) for Scale-EPLB (external dependency, NOT vendored).
-# Not required to run/test: Phase C defaults to AllToAllAdapter (torch all_to_all_single).
-# Install this only to wire DeepEPAdapter on a DeepEP-capable cluster.
-#
-# DeepEP V2 uses the lightweight NCCL Gin backend (no NVSHMEM needed).
+# Install DeepEP V2 ElasticBuffer for Scale-EPLB's zero-sync token transport.
 # Override via env: DEEPEP_DIR, DEEPEP_REPO, DEEPEP_COMMIT, NCCL_PKG, TORCH_CUDA_ARCH_LIST.
 set -euo pipefail
 
@@ -57,5 +53,17 @@ fi
 # Install into the user site-packages because the system Python prefix may be read-only.
 ( cd "$DEEPEP_DIR" && python setup.py install --user )
 
-python -c "import deep_ep; print('[install_deepep] import OK:', deep_ep.__file__)"
-echo "[install_deepep] done -> swap AllToAllAdapter() for DeepEPAdapter() in bind_eplb_to_moe_layer"
+python - <<'PY'
+import deep_ep
+import torch
+
+assert hasattr(deep_ep, "ElasticBuffer"), "pinned DeepEP does not export ElasticBuffer"
+assert hasattr(deep_ep, "topk_idx_t"), "pinned DeepEP lacks the Elastic routing dtype"
+version = torch.cuda.nccl.version()
+version = tuple(version) if isinstance(version, tuple) else version
+if isinstance(version, tuple):
+    assert version >= (2, 30, 4), f"NCCL 2.30.4+ required, got {version}"
+print("[install_deepep] ElasticBuffer OK:", deep_ep.__file__)
+print("[install_deepep] NCCL:", version)
+PY
+echo "[install_deepep] done -> EPLB_ADAPTER=deepep uses ElasticBuffer only"

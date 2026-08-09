@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import warnings
 from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import torch
@@ -39,6 +38,7 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 # Cache one GIN replicator per (group, layout, dtype) so the symmetric buffers + static main(e)
 # layout are allocated once and recycled across layers/steps.
 _GIN_REPLICATORS: Dict[tuple, GinWeightReplicator] = {}
+_ELASTIC_BUFFERS: Dict[tuple, object] = {}
 
 
 def _get_gin_replicator(group, spec, weight_shapes, dtype, device) -> GinWeightReplicator:
@@ -61,12 +61,8 @@ def _get_gin_replicator(group, spec, weight_shapes, dtype, device) -> GinWeightR
 # adapter changes the transport but not the routing/compute math above it.
 
 
-# DeepEP's dispatch kernel stages each row through TMA as two int4 halves, so a row has to be an
-# even number of 16B chunks (`intranode.cu:304`, a device-side assert). Both the payload builders
-# and `DeepEPAdapter._deepep_eligible` derive from this one constant: when they disagree the
-# payload is merely declined, the exact all_to_all_single fallback runs, and the only visible
-# symptom is the D2H per chunk per layer that DeepEP was adopted to remove.
-DEEPEP_ROW_ALIGN = 32
+# ElasticBuffer kernels move int4 vectors, so every token row must be 16-byte aligned.
+DEEPEP_ROW_ALIGN = 16
 
 
 def _payload_pad_cols(h: int, elem: int) -> int:
@@ -108,16 +104,26 @@ class AllToAllAdapter:
         """all_to_all_single needs the per-src recv counts on host, so the caller must supply them."""
         return True
 
-    def dispatch_chunk(self, payload, sent_per_dst, recv_per_src, group, tag: int = 0):
+    def dispatch_chunk(
+        self, payload, sent_per_dst, recv_per_src, group, tag: int = 0,
+        *, route_idx=None, n_slot=None, cap=None,
+    ):
         splits = (recv_per_src.tolist(), sent_per_dst.tolist())
         self._state.setdefault(tag, {})["disp"] = splits
         return all_to_all_single(payload, splits[0], splits[1], group)
 
-    def combine_chunk(self, y, sent_per_dst, recv_per_src, group, tag: int = 0):
+    def combine_chunk(
+        self, y, sent_per_dst, recv_per_src, group, tag: int = 0,
+        *, route_idx=None, n_slot=None, cap=None,
+    ):
         # reverse leg: send back what we received, receive back what we sent
         splits = (sent_per_dst.tolist(), recv_per_src.tolist())
         self._state.setdefault(tag, {})["comb"] = splits
         return all_to_all_single(y, splits[0], splits[1], group)
+
+    def uses_padded_layout(self) -> bool:
+        """Whether dispatch returns a fixed worst-case tensor with invalid rows."""
+        return False
 
     # ---- transpose legs for callers that schedule the backward themselves ----
     def chunk_state(self, tag: int):
@@ -133,34 +139,37 @@ class AllToAllAdapter:
         return a2a_raw(grad_comb, in_splits, out_splits, group)
 
 
-class _DeepEPDispatch(torch.autograd.Function):
-    """Forward all-to-all (scatter) via DeepEP ``dispatch``; backward is the paired ``combine`` (gather)."""
+class _ElasticDispatch(torch.autograd.Function):
+    """ElasticBuffer dispatch whose transpose is combine."""
 
     @staticmethod
-    def forward(ctx, inp, buffer, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, num_worst_tokens, holder):
-        # num_worst_tokens > 0 statically sizes the recv buffer to a host-known worst case, so DeepEP
-        # skips the D2H that would read the actual recv count -> no CPU sync, CUDA-graph capturable.
-        recv, _, _, _, handle, _ = buffer.dispatch(
+    def forward(ctx, inp, buffer, topk_idx, num_experts, max_tokens, holder):
+        recv, recv_topk_idx, _, handle, _ = buffer.dispatch(
             x=inp.contiguous(),
-            num_tokens_per_rank=num_tokens_per_rank,
-            is_token_in_rank=is_token_in_rank,
-            num_tokens_per_expert=num_tokens_per_expert,
-            num_worst_tokens=int(num_worst_tokens),
+            topk_idx=topk_idx,
+            num_experts=int(num_experts),
+            num_max_tokens_per_rank=int(max_tokens),
+            expert_alignment=1,
+            do_handle_copy=True,
+            do_cpu_sync=False,
+            do_expand=False,
         )
+        if recv_topk_idx is None:
+            raise RuntimeError("ElasticBuffer non-expand dispatch did not return expert indices")
         ctx.buffer = buffer
         ctx.handle = handle
-        holder["handle"] = handle          # expose to the adapter so the paired combine reuses this layout
+        holder["handle"] = handle
+        holder["recv_topk_idx"] = recv_topk_idx
         return recv
 
     @staticmethod
     def backward(ctx, grad_recv):
-        # each token is routed to exactly one rank, so the gather (combine) is the exact transpose
         grad_in, _, _ = ctx.buffer.combine(x=grad_recv.contiguous(), handle=ctx.handle)
-        return grad_in, None, None, None, None, None, None
+        return grad_in, None, None, None, None, None
 
 
-class _DeepEPCombine(torch.autograd.Function):
-    """Reverse all-to-all (gather) via DeepEP ``combine`` reusing a dispatch handle; backward is the cached ``dispatch``."""
+class _ElasticCombine(torch.autograd.Function):
+    """ElasticBuffer combine whose transpose is cached non-expand dispatch."""
 
     @staticmethod
     def forward(ctx, inp, buffer, handle):
@@ -171,194 +180,213 @@ class _DeepEPCombine(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        grad_in, _, _, _, _, _ = ctx.buffer.dispatch(x=grad_out.contiguous(), handle=ctx.handle)
+        grad_in, _, _, _, _ = ctx.buffer.dispatch(
+            x=grad_out.contiguous(), handle=ctx.handle, do_cpu_sync=False, do_expand=False
+        )
         return grad_in, None, None
 
 
 class DeepEPAdapter:
-    """Sync-free transport over DeepEP ``dispatch``/``combine`` (device-side counts, no D2H on the token channel).
+    """Zero-sync token transport over DeepEP V2 ``ElasticBuffer``."""
 
-    Drop-in for :class:`AllToAllAdapter` inside :func:`sync_free_moe_forward`, which issues, per forward,
-    a dispatch (tokens), a same-direction metadata send (phys ids), and a reverse combine. The heavy
-    ``[Ntok, H]`` token channel goes through DeepEP (NVLink, fully on-device); narrow / non-16B-aligned
-    metadata (e.g. ``[U, 1]`` phys ids) transparently falls back to ``all_to_all_single`` whose ordering is
-    bit-identical to DeepEP dispatch, so the two channels stay consistent.
-
-    Sync-free knob: ``max_recv_tokens`` is a host-static worst-case bound (``= n_slot * cap``, guaranteed
-    tight by the EPLB capacity policy). When set, dispatch runs with ``num_worst_tokens=max_recv_tokens``
-    so the recv buffer is statically sized and DeepEP never does the D2H that reads the true recv count
-    -> zero CPU sync, CUDA-graph capturable. Left unset, it uses the plain dynamic path (one recv-count
-    D2H per dispatch, same behaviour as Megatron's flex+DeepEP integration).
-    """
-
-    def __init__(
-        self,
-        num_nvl_bytes: Optional[int] = None,
-        num_qps_per_rank: int = 1,
-        max_recv_tokens: Optional[int] = None,
-    ):
+    def __init__(self, max_tokens_per_rank: Optional[int] = None):
         try:
-            import deep_ep  # noqa: F401
+            import deep_ep
         except Exception as e:  # pragma: no cover - environment-dependent
             raise RuntimeError(
-                "DeepEPAdapter requires the 'deep_ep' package (PyTorch>=2.10, NCCL>=2.30.4, "
-                "SM90+ cluster). Use AllToAllAdapter for CPU/single-GPU testing."
+                "DeepEPAdapter requires DeepEP V2, PyTorch>=2.10, NCCL>=2.30.4 and SM90+"
             ) from e
-        import os
-
+        if not hasattr(deep_ep, "ElasticBuffer"):
+            raise RuntimeError("installed DeepEP does not export ElasticBuffer")
         self._deep_ep = deep_ep
-        self._num_nvl_bytes = int(num_nvl_bytes or os.environ.get("EPLB_DEEPEP_NVL_BYTES", 1_000_000_000))
-        self._num_qps_per_rank = int(num_qps_per_rank)
-        self._allow_mnnvl = os.environ.get("EPLB_DEEPEP_ALLOW_MNNVL", "0") == "1"
-        env_max = os.environ.get("EPLB_DEEPEP_MAX_RECV")
-        self._max_recv_tokens = int(max_recv_tokens if max_recv_tokens is not None else (env_max or 0))
+        env_max = os.environ.get("EPLB_DEEPEP_MAX_TOKENS_PER_RANK")
+        self._requested_max_tokens = int(
+            max_tokens_per_rank if max_tokens_per_rank is not None else (env_max or 0)
+        )
+        if self._requested_max_tokens < 0:
+            raise ValueError("EPLB_DEEPEP_MAX_TOKENS_PER_RANK must be non-negative")
+        self._allow_hybrid = _env_truthy("EPLB_DEEPEP_HYBRID", "1")
         self._buffer = None
         self._group = None
-        self._pending = None  # holder dict of the in-flight dispatch handle, consumed by the paired combine
-        self._handles: Dict[int, Dict[str, object]] = {}  # per-chunk dispatch handles (two-chunk pipeline)
-        # per-chunk record of which transport each leg took, so a hand-written backward can replay the
-        # matching transpose; eligibility is decided per tensor, so the two legs can differ
-        self._state: Dict[int, Dict[str, tuple]] = {}
-        self._warned_fallback = False
-
-    def set_max_recv_tokens(self, n: int) -> None:
-        """Set the host-static worst-case recv bound (``n_slot * cap``) that enables the sync-free path."""
-        self._max_recv_tokens = int(n)
-
-    def _get_buffer(self, group):
-        if self._buffer is None:
-            # torch collectives read group=None as "the default group"; DeepEP wants the object.
-            if group is None:
-                group = dist.distributed_c10d._get_default_group()
-            self._buffer = self._deep_ep.Buffer(
-                group, self._num_nvl_bytes, 0,
-                low_latency_mode=False,
-                num_qps_per_rank=self._num_qps_per_rank,
-                allow_mnnvl=self._allow_mnnvl,
-            )
-            self._group = group
-        return self._buffer
+        self._hidden = 0
+        self._max_tokens = 0
+        self._handles: Dict[int, Dict[str, object]] = {}
+        self._state: Dict[int, Dict[str, object]] = {}
 
     @staticmethod
     def _deepep_eligible(inp: torch.Tensor) -> bool:
-        """Whether DeepEP's kernels can move these rows; everything else takes the exact fallback.
-
-        The dispatch kernel stages a row through TMA as two int4 halves into a per-warp SMEM buffer,
-        and asserts on device that the row is an even number of 16B chunks and that a half plus its
-        mbarrier fits (``intranode.cu:304``). Screening for that here matters because the failure
-        mode is a device-side assert, which takes down the CUDA context for the whole job -- a much
-        worse outcome than the ``all_to_all_single`` fallback, which is merely slower.
-        """
-        if inp.dim() != 2 or inp.dtype not in (torch.bfloat16, torch.float16):
-            return False
-        row_bytes = inp.shape[1] * inp.element_size()
-        return row_bytes % DEEPEP_ROW_ALIGN == 0 and row_bytes // 2 + 8 <= 8192
-
-    def _dispatch(self, inp, in_splits, group) -> Tuple[torch.Tensor, Dict[str, object]]:
-        """Run one DeepEP dispatch keyed by device-side per-dst counts; return ``(recv, handle_holder)``."""
-        buffer = self._get_buffer(group)
-        # forward dispatch: rows arrive pre-grouped by destination rank, so split sizes define the layout.
-        # DeepEP models one "expert" per destination rank here; we regroup received tokens by physical
-        # slot ourselves afterwards, so num_tokens_per_expert == num_tokens_per_rank is consistent.
-        R = int(in_splits.shape[0])
-        device = inp.device
-        counts = in_splits.to(torch.long)
-        # output_size == number of local rows (host-static): lets repeat_interleave skip the
-        # sum().item() it would otherwise do to size its output -> no D2H on the token channel.
-        dst = torch.repeat_interleave(
-            torch.arange(R, device=device), counts, output_size=inp.shape[0]
+        """Elastic dispatch accepts contiguous BF16 rows aligned to one int4."""
+        return (
+            inp.dim() == 2
+            and inp.dtype == torch.bfloat16
+            and inp.shape[1] * inp.element_size() % DEEPEP_ROW_ALIGN == 0
         )
-        is_token_in_rank = torch.zeros(inp.shape[0], R, dtype=torch.bool, device=device)
-        is_token_in_rank[torch.arange(inp.shape[0], device=device), dst] = True
-        npr = in_splits.to(torch.int32)
+
+    def _get_buffer(self, group, payload: torch.Tensor):
+        if group is None and dist.is_initialized():
+            group = dist.distributed_c10d._get_default_group()
+        max_tokens = self._requested_max_tokens or int(payload.shape[0])
+        hidden = int(payload.shape[1])
+        if int(payload.shape[0]) > max_tokens:
+            raise ValueError(
+                f"ElasticBuffer input has {payload.shape[0]} rows, above max_tokens_per_rank={max_tokens}"
+            )
+        if self._buffer is not None:
+            if group is not self._group or hidden != self._hidden:
+                raise RuntimeError("DeepEPAdapter cannot change process group or hidden size after initialization")
+            if int(payload.shape[0]) > self._max_tokens:
+                raise ValueError(
+                    f"ElasticBuffer input has {payload.shape[0]} rows, above initialized maximum {self._max_tokens}"
+                )
+            return self._buffer
+
+        key = (
+            id(group),
+            payload.device.type,
+            payload.device.index,
+            hidden,
+            max_tokens,
+            self._allow_hybrid,
+        )
+        buffer = _ELASTIC_BUFFERS.get(key)
+        if buffer is None:
+            buffer = self._deep_ep.ElasticBuffer(
+                group,
+                num_max_tokens_per_rank=max_tokens,
+                hidden=hidden,
+                num_topk=1,
+                deterministic=False,
+                allow_hybrid_mode=self._allow_hybrid,
+            )
+            _ELASTIC_BUFFERS[key] = buffer
+        self._buffer = buffer
+        self._group = group
+        self._hidden = hidden
+        self._max_tokens = max_tokens
+        return buffer
+
+    def _dispatch(
+        self,
+        payload: torch.Tensor,
+        route_idx: torch.Tensor,
+        n_slot: int,
+        cap: int,
+        group,
+    ) -> Tuple[torch.Tensor, Dict[str, object]]:
+        if not self._deepep_eligible(payload):
+            raise TypeError(
+                "ElasticBuffer token rows must be contiguous BF16 with a 16-byte-aligned width"
+            )
+        if route_idx is None:
+            raise ValueError("ElasticBuffer dispatch requires physical route indices")
+        R = dist.get_world_size(group) if dist.is_initialized() else 1
+        num_experts = R * int(n_slot)
+        if num_experts > 2048 or int(n_slot) > 256:
+            raise ValueError(
+                f"ElasticBuffer synthetic expert layout exceeds DeepEP limits: "
+                f"experts={num_experts}, per_rank={n_slot}"
+            )
+        topk_dtype = getattr(self._deep_ep, "topk_idx_t", torch.int64)
+        topk_idx = route_idx.reshape(-1, 1).to(dtype=topk_dtype).contiguous()
+        buffer = self._get_buffer(group, payload)
         holder: Dict[str, object] = {}
-        recv = _DeepEPDispatch.apply(
-            inp, buffer, npr, is_token_in_rank, npr, self._max_recv_tokens, holder
+        recv = _ElasticDispatch.apply(
+            payload,
+            buffer,
+            topk_idx,
+            num_experts,
+            self._max_tokens,
+            holder,
+        )
+
+        handle = holder["handle"]
+        psum_expert = handle.psum_num_recv_tokens_per_expert.to(torch.int64)
+        starts = torch.zeros_like(psum_expert)
+        if psum_expert.shape[0] > 1:
+            starts[1:] = psum_expert[:-1]
+        group_sizes = psum_expert - starts
+        total_recv = handle.psum_num_recv_tokens_per_scaleup_rank[-1].to(torch.int64)
+        rows = torch.arange(recv.shape[0], device=recv.device, dtype=torch.int64)
+        valid = rows < total_recv
+        recv_topk_idx = holder["recv_topk_idx"]
+        recv_slot = torch.where(valid, recv_topk_idx[:, 0].to(torch.int64), 0)
+        if hasattr(torch, "_assert_async"):
+            torch._assert_async(
+                torch.all(group_sizes <= int(cap)),
+                "ElasticBuffer: EPLB_CAP is below a physical slot's received-token count",
+            )
+        holder.update(
+            recv_slot=recv_slot,
+            valid=valid,
+            group_sizes=group_sizes,
         )
         return recv, holder
 
     def all_to_all(self, inp, out_splits, in_splits, group):
-        if not self._deepep_eligible(inp):
-            # metadata channel: exact, ordering matches DeepEP dispatch (one small D2H on the splits)
-            self._warn_token_fallback("all_to_all", inp)
-            return all_to_all_single(inp, out_splits.tolist(), in_splits.tolist(), group)
+        raise RuntimeError("ElasticBuffer requires physical route indices; use dispatch_chunk/combine_chunk")
 
-        buffer = self._get_buffer(group)
-        if self._pending is not None:
-            # second aligned call of this forward == the reverse leg -> combine reusing the dispatch layout
-            handle = self._pending["handle"]
-            self._pending = None
-            return _DeepEPCombine.apply(inp, buffer, handle)
-
-        recv, holder = self._dispatch(inp, in_splits, group)
-        self._pending = holder  # consumed by the paired combine (reverse leg) above
-        return recv
-
-    # ---- two-chunk pipeline hooks (explicit per-chunk handles so 2 dispatch + 2 combine don't collide) ----
     def needs_recv_counts(self) -> bool:
-        """DeepEP sizes recv statically (``num_worst_tokens``); it does not need host-side recv counts."""
+        """ElasticBuffer derives receive counts on device."""
         return False
 
-    def _warn_token_fallback(self, leg: str, t: torch.Tensor) -> None:
-        """Warn once: the token channel silently losing DeepEP is a sync cliff, not a correctness bug.
+    def uses_padded_layout(self) -> bool:
+        """ElasticBuffer returns a fixed worst-case row count."""
+        return True
 
-        ``all_to_all_single`` needs its splits on the host, so every fallback dispatch/combine costs a
-        D2H per chunk per layer -- the exact CPU sync this adapter exists to remove. The numbers stay
-        right, so nothing else surfaces it.
-        """
-        if self._warned_fallback:
-            return
-        self._warned_fallback = True
-        warnings.warn(
-            f"DeepEP token {leg} fell back to all_to_all_single: dtype={t.dtype}, "
-            f"row={t.shape[-1] * t.element_size()}B (needs bf16/fp16 and a 32B-multiple row). "
-            "That path takes its split sizes on the host, so it costs a D2H sync per chunk per layer. "
-            "Run the token channel in bf16/fp16 to keep it sync-free.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+    def recv_layout(self, tag: int):
+        """Return device-only ``(slot, valid, group_sizes)`` for a dispatched chunk."""
+        holder = self._handles[tag]
+        return holder["recv_slot"], holder["valid"], holder["group_sizes"]
 
-    def dispatch_chunk(self, payload, sent_per_dst, recv_per_src, group, tag: int = 0):
-        st = self._state.setdefault(tag, {})
-        if not self._deepep_eligible(payload):
-            self._warn_token_fallback("dispatch", payload)
-            splits = (recv_per_src.tolist(), sent_per_dst.tolist())
-            st["disp"] = ("a2a", splits)
-            return all_to_all_single(payload, splits[0], splits[1], group)
-        recv, holder = self._dispatch(payload, sent_per_dst, group)
-        self._handles[tag] = holder  # combine_chunk(tag) reuses this exact dispatch layout
-        st["disp"] = ("deepep", holder)
+    def dispatch_chunk(
+        self, payload, sent_per_dst, recv_per_src, group, tag: int = 0,
+        *, route_idx=None, n_slot=None, cap=None,
+    ):
+        if n_slot is None or cap is None:
+            raise ValueError("ElasticBuffer dispatch requires n_slot and cap")
+        recv, holder = self._dispatch(payload, route_idx, int(n_slot), int(cap), group)
+        self._handles[tag] = holder
+        self._state.setdefault(tag, {})["disp"] = holder
         return recv
 
-    def combine_chunk(self, y, sent_per_dst, recv_per_src, group, tag: int = 0):
-        st = self._state.setdefault(tag, {})
-        if not self._deepep_eligible(y):
-            self._warn_token_fallback("combine", y)
-            splits = (sent_per_dst.tolist(), recv_per_src.tolist())
-            st["comb"] = ("a2a", splits)
-            return all_to_all_single(y, splits[0], splits[1], group)
-        buffer = self._get_buffer(group)
+    def combine_chunk(
+        self, y, sent_per_dst, recv_per_src, group, tag: int = 0,
+        *, route_idx=None, n_slot=None, cap=None,
+    ):
         holder = self._handles.pop(tag)
-        st["comb"] = ("deepep", holder)
-        return _DeepEPCombine.apply(y, buffer, holder["handle"])
+        holder["combine_hidden"] = int(y.shape[1])
+        if y.shape[1] > self._hidden:
+            raise ValueError(
+                f"ElasticBuffer combine width {y.shape[1]} exceeds dispatch width {self._hidden}"
+            )
+        if y.shape[1] < self._hidden:
+            padded = y.new_zeros((y.shape[0], self._hidden))
+            padded[:, :y.shape[1]] = y
+            y = padded
+        self._state.setdefault(tag, {})["comb"] = holder
+        combined = _ElasticCombine.apply(y, self._buffer, holder["handle"])
+        return combined[:, :holder["combine_hidden"]]
 
-    # ---- transpose legs for callers that schedule the backward themselves ----
     def chunk_state(self, tag: int):
-        """Take this chunk's replay state; the caller keeps it alive until its backward runs."""
+        """Take this chunk's handles for a manually scheduled backward."""
         return self._state.pop(tag, None)
 
     def dispatch_chunk_bwd(self, grad_recv, state, group):
-        kind, payload = state["disp"]
-        if kind == "a2a":
-            return a2a_raw(grad_recv, payload[1], payload[0], group)
-        # each token goes to exactly one rank, so the gather (combine) is the exact transpose
-        return self._get_buffer(group).combine(x=grad_recv.contiguous(), handle=payload["handle"])[0]
+        return self._buffer.combine(
+            x=grad_recv.contiguous(), handle=state["disp"]["handle"]
+        )[0]
 
     def combine_chunk_bwd(self, grad_comb, state, group):
-        kind, payload = state["comb"]
-        if kind == "a2a":
-            return a2a_raw(grad_comb, payload[1], payload[0], group)
-        return self._get_buffer(group).dispatch(x=grad_comb.contiguous(), handle=payload["handle"])[0]
+        hidden = int(state["comb"]["combine_hidden"])
+        if hidden < self._hidden:
+            padded = grad_comb.new_zeros((grad_comb.shape[0], self._hidden))
+            padded[:, :hidden] = grad_comb
+            grad_comb = padded
+        grad_recv = self._buffer.dispatch(
+            x=grad_comb.contiguous(), handle=state["comb"]["handle"],
+            do_cpu_sync=False, do_expand=False,
+        )[0]
+        return grad_recv[:, :hidden]
 
 
 # ============================ Routing & grouping helpers ============================
@@ -429,6 +457,7 @@ def _make_materialize_and_compute(
     hosted: torch.Tensor,
     recv_slot: torch.Tensor,
     group_sizes: torch.Tensor,
+    valid_mask: Optional[torch.Tensor],
     batched_mlp_fn: Callable,
     cap: int,
     n_slot: int,
@@ -481,7 +510,8 @@ def _make_materialize_and_compute(
                 buf.index_copy_(0, tgt, We[e][j].to(dtype).unsqueeze(0))
             w_stacked.append(buf[:n_slot])
         out_units_recv = grouped_expert_mlp(
-            recv_tokens, recv_slot, group_sizes, tuple(w_stacked), batched_mlp_fn, cap
+            recv_tokens, recv_slot, group_sizes, tuple(w_stacked), batched_mlp_fn, cap,
+            valid_mask=valid_mask,
         )
         # keepalive: make output depend on every broadcast so all ranks hit the matching reduce in backward
         keep = recv_tokens.sum() * 0.0
@@ -641,7 +671,10 @@ def _moe_forward_two_chunks(
         m[:, 0] = phys_c.to(dtype)                                       # phys id carried through the token dtype
         payload_c = torch.cat([send_tokens_c, m], dim=1)
         recv_c = _exchange_recv_counts(sent_c, group) if adapter.needs_recv_counts() else sent_c
-        prep.append({"sent": sent_c, "recv": recv_c, "payload": payload_c, "utok": utok_c, "prob": prob_c})
+        prep.append({
+            "sent": sent_c, "recv": recv_c, "payload": payload_c, "route": phys_c,
+            "utok": utok_c, "prob": prob_c,
+        })
 
     nc = len(prep)
 
@@ -650,6 +683,7 @@ def _moe_forward_two_chunks(
         # hides behind dispatch(c1) and the backward's reduce-to-main overlaps the last dispatch^-1.
         comb = block.run(
             [p["payload"] for p in prep], [p["sent"] for p in prep], [p["recv"] for p in prep],
+            [p["route"] for p in prep],
             adapter=adapter, group=group, cap=cap, n_slot=n_slot, H=H, pad_cols=pad_cols,
             my_rank=my_rank,
         )
@@ -667,7 +701,10 @@ def _moe_forward_two_chunks(
         cs.wait_stream(ms)
     with _sctx(cs):
         for k in range(nc):
-            recv[k] = adapter.dispatch_chunk(prep[k]["payload"], prep[k]["sent"], prep[k]["recv"], group, tag=k)
+            recv[k] = adapter.dispatch_chunk(
+                prep[k]["payload"], prep[k]["sent"], prep[k]["recv"], group, tag=k,
+                route_idx=prep[k]["route"], n_slot=n_slot, cap=cap,
+            )
             if on_cuda:
                 _rec(recv[k], ms)
                 disp_evt[k] = torch.cuda.Event()
@@ -682,16 +719,21 @@ def _moe_forward_two_chunks(
             ms.wait_event(disp_evt[k])
         rp = recv[k]
         recv_tokens_k = rp[:, :H].contiguous()
-        recv_phys_k = rp[:, H].round().to(torch.int64)
-        recv_slot_k = recv_phys_k - my_rank * n_slot                     # local slot in [0, n_slot)
-        group_sizes_k = torch.bincount(
-            recv_slot_k.clamp(min=0, max=n_slot - 1), minlength=n_slot
-        ).to(torch.int64)
+        valid_k = None
+        if adapter.uses_padded_layout():
+            recv_slot_k, valid_k, group_sizes_k = adapter.recv_layout(k)
+        else:
+            recv_phys_k = rp[:, H].round().to(torch.int64)
+            recv_slot_k = recv_phys_k - my_rank * n_slot
+            group_sizes_k = torch.bincount(
+                recv_slot_k.clamp(min=0, max=n_slot - 1), minlength=n_slot
+            ).to(torch.int64)
         if experts is not None:
-            y_k = experts.chunk(recv_tokens_k, recv_slot_k, group_sizes_k, cap)
+            y_k = experts.chunk(recv_tokens_k, recv_slot_k, group_sizes_k, cap, valid_k)
         else:
             y_k = grouped_expert_mlp(
-                recv_tokens_k, recv_slot_k, group_sizes_k, w_stacked, batched_mlp_fn, cap
+                recv_tokens_k, recv_slot_k, group_sizes_k, w_stacked, batched_mlp_fn, cap,
+                valid_mask=valid_k,
             )
         if on_cuda:
             comp_evt = torch.cuda.Event()
@@ -701,6 +743,7 @@ def _moe_forward_two_chunks(
             if on_cuda:
                 cs.wait_event(comp_evt)
             comb[k] = adapter.combine_chunk(y_k, prep[k]["sent"], prep[k]["recv"], group, tag=k)
+            adapter.chunk_state(k)
             if on_cuda:
                 _rec(comb[k], ms)
 
@@ -760,9 +803,7 @@ def sync_free_moe_forward(
         weights_local: ``{e: weight_tuple}`` for experts whose ``main(e)`` is this rank.
         weight_shapes: Shape of each weight tensor in an expert's tuple.
         batched_mlp_fn: ``(x[S, cap, H], stacked_weights) -> y[S, cap, H]`` batched expert forward.
-        cap: Per-slot capacity (host-static). If None, derived as this rank's received-token count
-            (safe upper bound for the all-to-all fallback; a DeepEP adapter would pass a static value).
-            Required to be host-static (pass ``cap`` or set ``EPLB_CAP``) when ``EPLB_DEEPEP_STATIC=1``.
+        cap: Per-slot capacity. ElasticBuffer requires a host-static value or ``EPLB_CAP``.
         group: EP process group.
         adapter: Transport backend (defaults to :class:`AllToAllAdapter`).
         rematerialize: ``dist.broadcast`` path only: if True, checkpoint the replication + expert GEMM
@@ -796,12 +837,10 @@ def sync_free_moe_forward(
 
     if cap is None and os.environ.get("EPLB_CAP"):
         cap = int(os.environ["EPLB_CAP"])
-    # EPLB_DEEPEP_STATIC statically sizes the DeepEP recv buffer (num_worst_tokens = n_slot * cap) so the
-    # token channel does no recv-count D2H and stays CUDA-graph capturable. That needs a cap identical on
-    # every step, which the plan-derived fallback below is not -- so it has to be pinned explicitly.
-    if cap is None and _env_truthy("EPLB_DEEPEP_STATIC"):
+    elastic = adapter.uses_padded_layout()
+    if cap is None and elastic:
         raise ValueError(
-            "EPLB_DEEPEP_STATIC needs a host-static per-slot cap: pass cap=... or set EPLB_CAP"
+            "ElasticBuffer needs a host-static per-slot cap: pass cap=... or set EPLB_CAP"
         )
 
     # Control plane for the replica broadcasts. `dist.broadcast` needs a host-side `src`, so the set of
@@ -830,9 +869,6 @@ def sync_free_moe_forward(
             cap = max(flat[-1], 1)
     elif cap is None:
         cap = max(int(group_sizes.max()), 1)
-
-    if _env_truthy("EPLB_DEEPEP_STATIC") and hasattr(adapter, "set_max_recv_tokens"):
-        adapter.set_max_recv_tokens(n_slot * cap)
 
     # --- STAGE 1: ROUTE each unit -> (physical id, dst rank); order by dst; split sizes ------
     # Physical assignment must see ALL units (it distributes them by the quota plan.q), so STAGE 1
@@ -891,13 +927,20 @@ def sync_free_moe_forward(
     meta[:, 0] = send_phys.to(dtype)                             # phys carried (rounded) through the token dtype
     send_payload = torch.cat([send_tokens, meta], dim=1)
     with profiling.record("apply/dispatch", time_it=True, device=device):
-        recv_payload = adapter.all_to_all(send_payload, recv_per_src, sent_per_dst, group)
+        recv_payload = adapter.dispatch_chunk(
+            send_payload, sent_per_dst, recv_per_src, group, tag=0,
+            route_idx=send_phys, n_slot=n_slot, cap=cap,
+        )
     recv_tokens = recv_payload[:, :H].contiguous()
-    recv_phys = recv_payload[:, H].round().to(torch.int64)
 
     # --- STAGE 3: GROUP received tokens by local physical slot -------------------------------
     # `slot_to_e` / `slot_of_e` / `hosted` / `group_sizes` are plan-derived and already built above.
-    recv_slot = recv_phys - my_rank * n_slot                          # local slot in [0, n_slot)
+    valid_mask = None
+    if elastic:
+        recv_slot, valid_mask, group_sizes = adapter.recv_layout(0)
+    else:
+        recv_phys = recv_payload[:, H].round().to(torch.int64)
+        recv_slot = recv_phys - my_rank * n_slot
 
     # --- STAGE 4: COMPUTE (replicate weights + batched expert MLP) ---------------------------
     # This region's per-rank latency is the straggler signal: a synchronous EP step is paced by the
@@ -919,12 +962,15 @@ def sync_free_moe_forward(
                 transpose_w=transpose_w, my_rank=my_rank, n_slot=n_slot, dtype=dtype,
                 device=device, group=group, transport=transport,
             )
-            out_units_recv = experts.chunk(recv_tokens, recv_slot, group_sizes, cap)
+            out_units_recv = experts.chunk(
+                recv_tokens, recv_slot, group_sizes, cap, valid_mask
+            )
         else:
             compute = _make_materialize_and_compute(
                 replicated=replicated, replicated_main=replicated_main, weights_local=weights_local,
                 weight_shapes=weight_shapes, slot_of_e=slot_of_e, hosted=hosted, recv_slot=recv_slot,
-                group_sizes=group_sizes, batched_mlp_fn=batched_mlp_fn, cap=cap,
+                group_sizes=group_sizes, valid_mask=valid_mask,
+                batched_mlp_fn=batched_mlp_fn, cap=cap,
                 n_slot=n_slot, dtype=dtype, device=device, group=group,
             )
             if rematerialize:  # Level A: recompute the broadcasts in backward instead of holding them
@@ -934,7 +980,11 @@ def sync_free_moe_forward(
 
     # --- STAGE 5: COMBINE outputs back, invert the permutation, gate-weight, scatter ---------
     with profiling.record("apply/combine", time_it=True, device=device):
-        combined_back = adapter.all_to_all(out_units_recv, sent_per_dst, recv_per_src, group)
+        combined_back = adapter.combine_chunk(
+            out_units_recv, sent_per_dst, recv_per_src, group, tag=0,
+            route_idx=send_phys, n_slot=n_slot, cap=cap,
+        )
+    adapter.chunk_state(0)
     out_per_unit = combined_back[torch.argsort(perm)]
     result = torch.zeros((tokens.shape[0], H), dtype=out_per_unit.dtype, device=device)
     result = result.index_add(

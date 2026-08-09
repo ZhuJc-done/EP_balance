@@ -105,8 +105,9 @@ fi
 # EPLB_PROFILE_EVERY=<n>    summary cadence; EPLB_PROFILE_RESET_AT=<n> resets peak memory after warmup.
 #
 # apply-mode backends (ignored in off/observe, which use Megatron's own dispatcher):
-# EPLB_ADAPTER=deepep       token dispatch/combine through DeepEP (default `alltoall`).
-# EPLB_DEEPEP_ALLOW_MNNVL=1 use CUDA fabric handles for EP groups spanning a GB200 NVLink fabric.
+# EPLB_ADAPTER=deepep       token dispatch/combine through ElasticBuffer (default `alltoall`).
+# EPLB_DEEPEP_HYBRID=1     use ElasticBuffer's NVLink-intra/GIN-inter hybrid path (default 1).
+# EPLB_DEEPEP_MAX_TOKENS_PER_RANK=<int> optional static routing-unit bound per chunk.
 # EPLB_WEIGHT_COMM=gin      replica expert weights AND their grad reduce-to-main over the in-tree
 #                           nccl_gin backend, both directions device-initiated (default:
 #                           host-driven dist.broadcast). Independent of the token transport.
@@ -120,14 +121,8 @@ fi
 #                           memory is mapped here. Default is to move those over NVLink with
 #                           load/store; with the EP group inside a node that is the whole weight
 #                           channel, so this is for A/B measurement only.
-# EPLB_DEEPEP_STATIC=1      reserved; the pinned DeepEP static path also requires top-k metadata
-#                           and padded-row handling that this adapter does not yet provide.
 # EPLB_CAP=<int>            pin the per-slot capacity (sizes the padded expert-GEMM batch and the
-#                           static DeepEP recv buffer -- a token/compute-side quantity, unrelated
-#                           to the weight channel). Unset derives it from the plan's exact per-slot
-#                           counts at the cost of one scalar D2H, which the broadcast path absorbs
-#                           into a control-plane read it makes anyway but GIN does not.
-#                           Pinning BELOW the true per-slot max silently drops tokens.
+#                           Elastic compute layout). Required for Elastic; overflow fails asynchronously.
 # EPLB_CHUNKS=2             split this rank's routing units in two and pipeline dispatch/compute/
 #                           combine across a compute and a comm stream, so dispatch(c2) hides behind
 #                           compute(c1) and combine(c1) behind compute(c2); only the first dispatch
@@ -143,31 +138,50 @@ fi
 # EPLB_REMATERIALIZE=1      dist.broadcast transport only: free replica weights after forward and
 #                           re-broadcast them in backward.
 for _knob in EPLB_N_SLOT EPLB_PROFILE EPLB_PROFILE_ALL_RANKS EPLB_PROFILE_EVERY EPLB_PROFILE_RESET_AT \
-             EPLB_ADAPTER EPLB_DEEPEP_ALLOW_MNNVL EPLB_WEIGHT_COMM EPLB_GIN_FENCE EPLB_GIN_LSA EPLB_DEEPEP_STATIC EPLB_CAP \
+             EPLB_ADAPTER EPLB_DEEPEP_HYBRID EPLB_DEEPEP_MAX_TOKENS_PER_RANK \
+             EPLB_WEIGHT_COMM EPLB_GIN_FENCE EPLB_GIN_LSA EPLB_CAP \
              EPLB_CHUNKS EPLB_MANUAL_BWD EPLB_OVERLAP EPLB_REMATERIALIZE; do
   if [[ -n "${!_knob:-}" ]]; then export "${_knob}"; fi
 done
-if [[ "${EPLB_DEEPEP_STATIC:-0}" == "1" ]]; then
-  echo "EPLB_DEEPEP_STATIC=1 is not supported by the pinned DeepEP adapter; use the default dynamic path" >&2
-  exit 1
-fi
 if [[ -n "${EPLB_N_SLOT:-}" ]]; then echo "[run_real_moe] EPLB_N_SLOT=${EPLB_N_SLOT} (slot budget override)"; fi
 if [[ "${EPLB_MODE}" == "apply" ]]; then
   echo "[run_real_moe] apply backends: adapter=${EPLB_ADAPTER:-alltoall} weight_comm=${EPLB_WEIGHT_COMM:-broadcast}" \
        "cap=${EPLB_CAP:-<from plan>} chunks=${EPLB_CHUNKS:-1} manual_bwd=${EPLB_MANUAL_BWD:-1}" \
        "overlap=${EPLB_OVERLAP:-0} remat=${EPLB_REMATERIALIZE:-0}"
-  if [[ "${EPLB_WEIGHT_COMM:-}" == "gin" && "${EPLB_GIN_FENCE:-barrier}" != "signal" ]]; then
-    echo "[run_real_moe] WARNING: EPLB_GIN_FENCE=${EPLB_GIN_FENCE:-barrier} is a host dist.barrier," \
-         "so the backward replica re-pull cannot overlap Wgrad. Set EPLB_GIN_FENCE=signal."
-  fi
   if [[ "${EPLB_WEIGHT_COMM:-}" == "gin" && "${EPLB_GIN_LSA:-1}" == "0" ]]; then
     echo "[run_real_moe] WARNING: EPLB_GIN_LSA=0 sends intra-node replica traffic to the NIC" \
          "instead of over NVLink. Only do this to measure the difference."
   fi
-  # GIN's replica schedule is fully device-resident, so it does not make the control-plane host read
-  # the broadcast path folds the cap derivation into -- pin EPLB_CAP to keep this block sync-free.
-  if [[ -n "${EPLB_WEIGHT_COMM:-}" && -z "${EPLB_CAP:-}" ]]; then
-    echo "[run_real_moe] note: EPLB_WEIGHT_COMM set without EPLB_CAP -> one scalar D2H per layer to derive the cap"
+  if [[ "${EPLB_ADAPTER:-alltoall}" == "deepep" ]]; then
+    for _legacy in EPLB_DEEPEP_STATIC EPLB_DEEPEP_ALLOW_MNNVL EPLB_DEEPEP_NVL_BYTES \
+                   EPLB_DEEPEP_RDMA_BYTES EPLB_DEEPEP_MAX_RECV; do
+      if [[ -v "${_legacy}" ]]; then
+        echo "${_legacy} is a removed legacy Buffer setting; ElasticBuffer configures transport itself" >&2
+        exit 1
+      fi
+    done
+    [[ -n "${EPLB_CAP:-}" && "${EPLB_CAP}" -gt 0 ]] || {
+      echo "EPLB_ADAPTER=deepep requires EPLB_CAP=<positive static bound>" >&2; exit 1;
+    }
+    [[ "${EPLB_WEIGHT_COMM:-}" == "gin" ]] || {
+      echo "zero-sync Elastic mode requires EPLB_WEIGHT_COMM=gin" >&2; exit 1;
+    }
+    [[ "${EPLB_GIN_FENCE:-}" == "signal" ]] || {
+      echo "zero-sync Elastic mode requires EPLB_GIN_FENCE=signal" >&2; exit 1;
+    }
+    [[ "${EPLB_PROFILE:-0}" == "0" && "${PROFILE_TRACE:-0}" == "0" ]] || {
+      echo "zero-sync Elastic mode requires EPLB_PROFILE=0 PROFILE_TRACE=0" >&2; exit 1;
+    }
+    python - <<'PY'
+import deep_ep
+import nccl_gin
+import torch
+assert hasattr(deep_ep, "ElasticBuffer"), "DeepEP ElasticBuffer is unavailable"
+v = torch.cuda.nccl.version()
+if isinstance(v, tuple):
+    assert v >= (2, 30, 4), f"NCCL 2.30.4+ required, got {v}"
+print(f"[run_real_moe] ElasticBuffer hybrid={__import__('os').environ.get('EPLB_DEEPEP_HYBRID', '1')} NCCL={v}")
+PY
   fi
 fi
 

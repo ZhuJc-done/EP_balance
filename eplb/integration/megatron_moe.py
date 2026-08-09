@@ -21,15 +21,30 @@ def _env_flag(name: str) -> bool:
 
 
 def _make_adapter():
-    """Select the sync-free transport backend from ``EPLB_ADAPTER`` (``alltoall`` default | ``deepep``).
-
-    ``EPLB_DEEPEP_STATIC=1`` forces the DeepEP backend (static ``num_worst_tokens`` recv sizing is then
-    applied inside :func:`sync_free_moe_forward`), regardless of ``EPLB_ADAPTER``.
-    """
-    if _env_flag("EPLB_DEEPEP_STATIC"):
-        return DeepEPAdapter()
+    """Select ``alltoall`` or the strict ElasticBuffer-backed ``deepep`` transport."""
     name = os.environ.get("EPLB_ADAPTER", "alltoall").strip().lower()
     if name in ("deepep", "deep_ep"):
+        legacy = [
+            key for key in (
+                "EPLB_DEEPEP_STATIC", "EPLB_DEEPEP_ALLOW_MNNVL",
+                "EPLB_DEEPEP_NVL_BYTES", "EPLB_DEEPEP_RDMA_BYTES", "EPLB_DEEPEP_MAX_RECV",
+            )
+            if key in os.environ
+        ]
+        if legacy:
+            raise ValueError(
+                "legacy DeepEP Buffer settings are not supported by ElasticBuffer: "
+                + ", ".join(legacy)
+            )
+        cap = int(os.environ.get("EPLB_CAP", "0") or "0")
+        if cap <= 0:
+            raise ValueError("EPLB_ADAPTER=deepep requires a positive host-static EPLB_CAP")
+        if os.environ.get("EPLB_WEIGHT_COMM", "").strip().lower() != "gin":
+            raise ValueError("zero-sync ElasticBuffer mode requires EPLB_WEIGHT_COMM=gin")
+        if os.environ.get("EPLB_GIN_FENCE", "").strip().lower() != "signal":
+            raise ValueError("zero-sync ElasticBuffer mode requires EPLB_GIN_FENCE=signal")
+        if _env_flag("EPLB_PROFILE") or _env_flag("PROFILE_TRACE"):
+            raise ValueError("zero-sync ElasticBuffer mode requires EPLB_PROFILE=0 and PROFILE_TRACE=0")
         return DeepEPAdapter()
     if name in ("", "alltoall", "all_to_all", "a2a"):
         return AllToAllAdapter()
@@ -120,6 +135,8 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
 
     in_shape = hidden_states.shape
     tokens = hidden_states.reshape(-1, in_shape[-1])
+    if isinstance(cfg["adapter"], DeepEPAdapter) and tokens.dtype != torch.bfloat16:
+        raise TypeError(f"ElasticBuffer apply mode requires BF16 hidden states, got {tokens.dtype}")
 
     with profiling.record("apply/route", time_it=True, device=tokens.device):
         probs, routing_map = self.router(hidden_states)
@@ -146,7 +163,8 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
         unit_expert=unit_expert,
         unit_prob=unit_prob.to(tokens.dtype),
         plan=plan, spec=spec, weights_local=weights_local,
-        weight_shapes=weight_shapes, batched_mlp_fn=cfg["batched_mlp_fn"], cap=None,
+        weight_shapes=weight_shapes, batched_mlp_fn=cfg["batched_mlp_fn"],
+        cap=int(os.environ["EPLB_CAP"]) if isinstance(cfg["adapter"], DeepEPAdapter) else None,
         group=group, adapter=cfg["adapter"],
         rematerialize=cfg["rematerialize"], overlap=cfg["overlap"],
         gated=cfg["gated"], act=cfg["act"], transpose_w=True,
@@ -166,6 +184,11 @@ def bind_eplb_to_moe_layer(moe_layer, rebalancer, ep_group, layer_id: int = 0) -
         layer_id: Stable id used as the rebalancer's ring-buffer key.
     """
     config = moe_layer.config
+    adapter = _make_adapter()
+    if isinstance(adapter, DeepEPAdapter):
+        topk = getattr(config, "moe_router_topk", None)
+        if topk is None or int(topk) <= 0:
+            raise ValueError("ElasticBuffer apply mode requires a fixed positive moe_router_topk")
     gated = bool(getattr(config, "gated_linear_unit", False))
     act = getattr(config, "activation_func", torch.nn.functional.gelu)
     moe_layer._eplb = {
@@ -176,7 +199,7 @@ def bind_eplb_to_moe_layer(moe_layer, rebalancer, ep_group, layer_id: int = 0) -
         "gated": gated,
         "act": act,
         "batched_mlp_fn": make_batched_gated_mlp(gated, act),
-        "adapter": _make_adapter(),
+        "adapter": adapter,
         "rematerialize": _env_flag("EPLB_REMATERIALIZE"),
         "overlap": _env_flag("EPLB_OVERLAP"),
     }
