@@ -168,13 +168,14 @@ class _ElasticDispatch(torch.autograd.Function):
     """ElasticBuffer dispatch whose transpose is combine."""
 
     @staticmethod
-    def forward(ctx, inp, buffer, topk_idx, num_experts, max_tokens, holder):
+    def forward(ctx, inp, buffer, topk_idx, num_experts, max_tokens, num_sms, holder):
         recv, recv_topk_idx, _, handle, _ = buffer.dispatch(
             x=inp.contiguous(),
             topk_idx=topk_idx,
             num_experts=int(num_experts),
             num_max_tokens_per_rank=int(max_tokens),
             expert_alignment=1,
+            num_sms=int(num_sms),
             do_handle_copy=True,
             do_cpu_sync=False,
             do_expand=False,
@@ -183,24 +184,28 @@ class _ElasticDispatch(torch.autograd.Function):
             raise RuntimeError("ElasticBuffer non-expand dispatch did not return expert indices")
         ctx.buffer = buffer
         ctx.handle = handle
+        ctx.num_sms = int(num_sms)
         holder["handle"] = handle
         holder["recv_topk_idx"] = recv_topk_idx
         return recv
 
     @staticmethod
     def backward(ctx, grad_recv):
-        grad_in, _, _ = ctx.buffer.combine(x=grad_recv.contiguous(), handle=ctx.handle)
-        return grad_in, None, None, None, None, None
+        grad_in, _, _ = ctx.buffer.combine(
+            x=grad_recv.contiguous(), handle=ctx.handle, num_sms=ctx.num_sms
+        )
+        return grad_in, None, None, None, None, None, None
 
 
 class _ElasticCombine(torch.autograd.Function):
     """ElasticBuffer combine whose transpose is cached non-expand dispatch."""
 
     @staticmethod
-    def forward(ctx, inp, buffer, handle):
-        out, _, _ = buffer.combine(x=inp.contiguous(), handle=handle)
+    def forward(ctx, inp, buffer, handle, num_sms):
+        out, _, _ = buffer.combine(x=inp.contiguous(), handle=handle, num_sms=int(num_sms))
         ctx.buffer = buffer
         ctx.handle = handle
+        ctx.num_sms = int(num_sms)
         return out
 
     @staticmethod
@@ -208,15 +213,20 @@ class _ElasticCombine(torch.autograd.Function):
         grad_in, _, _, _, _ = ctx.buffer.dispatch(
             x=grad_out.contiguous(), handle=ctx.handle,
             num_experts=ctx.handle.num_experts,
+            num_sms=ctx.num_sms,
             do_cpu_sync=False, do_expand=False,
         )
-        return grad_in, None, None
+        return grad_in, None, None, None
 
 
 class DeepEPAdapter:
     """Zero-sync token transport over DeepEP V2 ``ElasticBuffer``."""
 
-    def __init__(self, max_tokens_per_rank: Optional[int] = None):
+    def __init__(
+        self,
+        max_tokens_per_rank: Optional[int] = None,
+        num_sms: Optional[int] = None,
+    ):
         try:
             import deep_ep
         except Exception as e:  # pragma: no cover - environment-dependent
@@ -241,6 +251,10 @@ class DeepEPAdapter:
         )
         if self._requested_max_tokens < 0:
             raise ValueError("EPLB_DEEPEP_MAX_TOKENS_PER_RANK must be non-negative")
+        env_num_sms = os.environ.get("EPLB_DEEPEP_NUM_SMS", "16")
+        self._num_sms = int(num_sms if num_sms is not None else env_num_sms)
+        if self._num_sms < 0:
+            raise ValueError("EPLB_DEEPEP_NUM_SMS must be non-negative (0 enables auto estimation)")
         self._allow_hybrid = _env_truthy("EPLB_DEEPEP_HYBRID", "1")
         self._buffer = None
         self._group = None
@@ -332,6 +346,7 @@ class DeepEPAdapter:
             topk_idx,
             num_experts,
             self._max_tokens,
+            self._num_sms,
             holder,
         )
 
@@ -400,7 +415,7 @@ class DeepEPAdapter:
             padded[:, :y.shape[1]] = y
             y = padded
         self._state.setdefault(tag, {})["comb"] = holder
-        combined = _ElasticCombine.apply(y, self._buffer, holder["handle"])
+        combined = _ElasticCombine.apply(y, self._buffer, holder["handle"], self._num_sms)
         return combined[:, :holder["combine_hidden"]]
 
     def chunk_state(self, tag: int):
@@ -409,7 +424,7 @@ class DeepEPAdapter:
 
     def dispatch_chunk_bwd(self, grad_recv, state, group):
         return self._buffer.combine(
-            x=grad_recv.contiguous(), handle=state["disp"]["handle"]
+            x=grad_recv.contiguous(), handle=state["disp"]["handle"], num_sms=self._num_sms
         )[0]
 
     def combine_chunk_bwd(self, grad_comb, state, group):
@@ -421,6 +436,7 @@ class DeepEPAdapter:
         grad_recv = self._buffer.dispatch(
             x=grad_comb.contiguous(), handle=state["comb"]["handle"],
             num_experts=state["comb"]["handle"].num_experts,
+            num_sms=self._num_sms,
             do_cpu_sync=False, do_expand=False,
         )[0]
         return grad_recv[:, :hidden]

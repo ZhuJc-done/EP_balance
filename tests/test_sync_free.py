@@ -316,11 +316,13 @@ def test_elastic_buffer_is_shared_and_uses_static_shape(monkeypatch):
     fake_deep_ep.topk_idx_t = torch.int64
     monkeypatch.setitem(sys.modules, "deep_ep", fake_deep_ep)
     monkeypatch.setenv("EPLB_DEEPEP_HYBRID", "1")
+    monkeypatch.delenv("EPLB_DEEPEP_NUM_SMS", raising=False)
     manager._ELASTIC_BUFFERS.clear()
     group = object()
     payload = torch.zeros((4, 16), dtype=torch.bfloat16)
     a0 = manager.DeepEPAdapter(max_tokens_per_rank=8)
     a1 = manager.DeepEPAdapter(max_tokens_per_rank=8)
+    assert a0._num_sms == a1._num_sms == 16
     assert a0._get_buffer(group, payload) is a1._get_buffer(group, payload)
     assert len(calls) == 1
     assert calls[0][0] == (group,)
@@ -407,6 +409,7 @@ def test_elastic_dispatch_uses_synthetic_experts_padding_and_no_sync(monkeypatch
     fake_deep_ep.ElasticBuffer = FakeElastic
     fake_deep_ep.topk_idx_t = torch.int64
     monkeypatch.setitem(sys.modules, "deep_ep", fake_deep_ep)
+    monkeypatch.setenv("EPLB_DEEPEP_NUM_SMS", "8")
     manager._ELASTIC_BUFFERS.clear()
 
     adapter = manager.DeepEPAdapter(max_tokens_per_rank=4)
@@ -437,6 +440,7 @@ def test_elastic_dispatch_uses_synthetic_experts_padding_and_no_sync(monkeypatch
     assert first[1]["expert_alignment"] == 1
     assert first[1]["do_cpu_sync"] is False
     assert first[1]["do_expand"] is False
+    assert all(call[1]["num_sms"] == 8 for call in calls)
     cached = [c for c in calls if c[0] == "dispatch" and c[3] is not None]
     assert cached and cached[0][1]["do_cpu_sync"] is False
     assert cached[0][1]["do_expand"] is False
