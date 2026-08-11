@@ -140,7 +140,11 @@ def model_provider(
     elif mode == "apply":
         ep_group = mpu.get_expert_model_parallel_group()
         ep_size = mpu.get_expert_model_parallel_world_size()
-        device = next(model.parameters()).device
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else next(model.parameters()).device
+        )
         gpn = p["gpus_per_node"] if ep_size % p["gpus_per_node"] == 0 else ep_size
         topo = Topology.from_nvlink_rdma(ep_size // gpn, gpn, 1, 8, device=device)
         for layer_id, moe in enumerate(find_moe_layers(model)):
