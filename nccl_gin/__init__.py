@@ -6,10 +6,12 @@ memory (ncclMemAlloc + ncclCommWindowRegister) and peer device pointers.
 Works on NVLink P2P without requiring NCCL_P2P_DISABLE or NCCL_SHM_DISABLE.
 
 The batched entry points pick their transport per descriptor: peers inside the
-local LSA team (NVLink / P2P mapped) are moved with load/store, everyone else
-over GIN's network RDMA. One window registration covers both. Set
+local LSA team (NVLink / P2P mapped) are moved with an SM90+ TMA-staged copy,
+everyone else over GIN's network RDMA. One window registration covers both. Set
 ``EPLB_GIN_LSA=0`` to force the network path for every peer, which is only
 useful for A/B measurement -- it sends intra-node traffic out to the NIC.
+``EPLB_GIN_LSA_TMA=0`` keeps LSA routing but restores the vector load/store
+copy for TMA-versus-vector benchmarking and emergency fallback.
 
 Usage:
     import nccl_gin
@@ -272,7 +274,7 @@ def get_batched(
     device, so empty / local entries need no host branch. Both buffers must be symmetric
     (:func:`create_tensor`). The transfer completes on ``stream`` (GIN kernels flush).
 
-    Descriptors whose peer is in the local LSA team are read over NVLink with load/store
+    Descriptors whose peer is in the local LSA team are pulled over NVLink with TMA
     rather than through the NIC; pass ``use_lsa=False`` (or ``EPLB_GIN_LSA=0``) to disable.
     """
     _ensure_loaded()
@@ -303,8 +305,8 @@ def put_batched(
 
     Mirror of :func:`get_batched`; ``peers`` holds destination ranks and each transfer
     pushes ``src_buffer[src_off[i]:]`` into ``dst_buffer[dst_off[i]:]`` on ``peers[i]``.
-    LSA-team peers are written over NVLink with load/store; the kernel issues a system-scope
-    fence before it exits so the caller's ordering fence covers those stores too.
+    LSA-team peers are written over NVLink with TMA; the kernel issues a system-scope fence
+    before it exits so the caller's ordering fence covers those stores too.
     """
     _ensure_loaded()
     if k is None:

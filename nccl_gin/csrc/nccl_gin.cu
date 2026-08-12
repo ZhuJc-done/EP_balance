@@ -42,6 +42,16 @@ static constexpr int BARRIER_COUNT = 16;
 static constexpr int GIN_SIGNAL_COUNT = 64;
 static constexpr size_t GIN_TILE_BYTES = 1ULL << 25; // 32 MB
 static constexpr size_t GIN_MIN_BYTES_PER_CTX = 1ULL << 15; // 32 KB
+static constexpr size_t LSA_TMA_ALIGN_BYTES = 16;
+static constexpr int LSA_TMA_COPY_WARPS = 4;
+static constexpr int LSA_TMA_STAGES = 2;
+static constexpr size_t LSA_TMA_STAGE_BYTES = 1ULL << 12; // 4 KB
+static constexpr size_t LSA_TMA_MIN_BYTES = LSA_TMA_STAGE_BYTES;
+static constexpr size_t LSA_TMA_WARP_SMEM_BYTES =
+    LSA_TMA_STAGES * LSA_TMA_STAGE_BYTES +
+    LSA_TMA_STAGES * sizeof(uint64_t);
+static constexpr size_t LSA_TMA_SMEM_BYTES =
+    LSA_TMA_COPY_WARPS * LSA_TMA_WARP_SMEM_BYTES;
 
 struct WindowInfo {
   ncclWindow_t win;
@@ -82,6 +92,18 @@ static int read_positive_int_env_or_default(const char* name, int default_value)
   }
   if (value <= 0) return default_value;
   return static_cast<int>(value);
+}
+
+static bool read_bool_env_or_default(const char* name, bool default_value) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') return default_value;
+  if (std::strcmp(raw, "1") == 0 || std::strcmp(raw, "true") == 0 ||
+      std::strcmp(raw, "yes") == 0 || std::strcmp(raw, "on") == 0)
+    return true;
+  if (std::strcmp(raw, "0") == 0 || std::strcmp(raw, "false") == 0 ||
+      std::strcmp(raw, "no") == 0 || std::strcmp(raw, "off") == 0)
+    return false;
+  throw std::runtime_error(std::string("Invalid boolean env ") + name + "=" + raw);
 }
 
 static void configure_gin_requirements(ncclDevCommRequirements* reqs,
@@ -429,11 +451,11 @@ __global__ void GinGetKernelMultiBlock(ncclWindow_t remoteWin, size_t remoteOffs
 // branch. Offsets are window-relative bytes; *Base folds in any view/data_ptr delta.
 //
 // Transport is chosen per descriptor. GIN is the network path (InfiniBand / RoCE); peers
-// inside this rank's LSA team are reachable by plain load/store over NVLink through the same
+// inside this rank's LSA team are reachable by TMA copies over NVLink through the same
 // window registration, which is one collective registration covering both -- ncclGinRegister
 // for the RDMA side, cuMemMap + cuMemSetAccess for the LSA side. Routing an intra-node peer
 // through gin.put() would send it out to the NIC and back, so those descriptors take the
-// load/store path instead, the same split NCCL's own hybrid all-to-all example makes.
+// TMA path instead, the same split NCCL's own hybrid all-to-all example makes.
 // ---------------------------------------------------------------------------
 
 // True when `peer` (a world rank of the GIN communicator) sits in this rank's LSA team, i.e. its
@@ -446,8 +468,8 @@ __device__ __forceinline__ bool peer_is_lsa(const ncclDevComm& devComm, int peer
          ncclTeamRankIsMember(ncclTeamLsa(devComm), ncclTeamWorld(devComm), peer);
 }
 
-// Block-cooperative copy between two locally addressable pointers (one of which is a peer's
-// mapped window). 16B vector path when both ends and the length allow it, bytes otherwise.
+// Fallback copy for a small or misaligned LSA range. The normal aligned path below uses
+// Hopper/Blackwell TMA to move peer global -> shared -> local global for get, and the reverse for put.
 __device__ __forceinline__ void lsa_copy_bytes(char* __restrict__ dst,
                                                const char* __restrict__ src,
                                                size_t numBytes) {
@@ -461,6 +483,174 @@ __device__ __forceinline__ void lsa_copy_bytes(char* __restrict__ dst,
   } else {
     for (size_t i = tid; i < numBytes; i += nthr) dst[i] = src[i];
   }
+}
+
+// Minimal SM90+ TMA wrappers. The extension is built only for sm_90/sm_100; keeping the PTX local
+// avoids taking a build-time dependency on DeepEP while matching its 1-D cp.async.bulk path.
+__device__ __forceinline__ bool lsa_tma_elect_one_sync() {
+  int pred = 0;
+  asm volatile(
+      "{\n"
+      ".reg .b32 %%rx;\n"
+      ".reg .pred %%px;\n"
+      "elect.sync %%rx|%%px, %1;\n"
+      "@%%px mov.s32 %0, 1;\n"
+      "}\n"
+      : "+r"(pred)
+      : "r"(0xffffffff));
+  return pred != 0;
+}
+
+__device__ __forceinline__ uint32_t lsa_tma_smem_addr(const void* ptr) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+}
+
+__device__ __forceinline__ void lsa_tma_mbarrier_init(uint64_t* ptr) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%1], %0;" ::
+               "r"(1), "r"(lsa_tma_smem_addr(ptr)));
+  asm volatile("fence.mbarrier_init.release.cluster;" ::);
+}
+
+__device__ __forceinline__ void lsa_tma_mbarrier_arrive_expect_tx(
+    uint64_t* ptr, int numBytes) {
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0;" ::
+               "r"(numBytes), "r"(lsa_tma_smem_addr(ptr)));
+}
+
+__device__ __forceinline__ void lsa_tma_mbarrier_wait(uint64_t* ptr,
+                                                       uint32_t* phase) {
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1;\n\t"
+      "LSA_TMA_WAIT:\n\t"
+      "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1, %2;\n\t"
+      "@P1 bra LSA_TMA_DONE;\n\t"
+      "bra LSA_TMA_WAIT;\n\t"
+      "LSA_TMA_DONE:\n\t"
+      "}" ::
+      "r"(lsa_tma_smem_addr(ptr)), "r"(*phase), "r"(0x989680));
+  *phase ^= 1;
+}
+
+static constexpr uint64_t LSA_TMA_EVICT_FIRST = 0x12f0000000000000ULL;
+static constexpr uint64_t LSA_TMA_EVICT_NORMAL = 0x1000000000000000ULL;
+
+__device__ __forceinline__ void lsa_tma_load(void* smemDst,
+                                             const void* globalSrc,
+                                             uint64_t* barrier,
+                                             int numBytes) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+      ".L2::cache_hint [%0], [%1], %2, [%3], %4;" ::
+      "r"(lsa_tma_smem_addr(smemDst)), "l"(globalSrc), "r"(numBytes),
+      "r"(lsa_tma_smem_addr(barrier)), "l"(LSA_TMA_EVICT_FIRST)
+      : "memory");
+}
+
+__device__ __forceinline__ void lsa_tma_store(void* globalDst,
+                                              const void* smemSrc,
+                                              int numBytes) {
+  asm volatile(
+      "cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint "
+      "[%0], [%1], %2, %3;" ::
+      "l"(globalDst), "r"(lsa_tma_smem_addr(smemSrc)), "r"(numBytes),
+      "l"(LSA_TMA_EVICT_NORMAL)
+      : "memory");
+}
+
+__device__ __forceinline__ void lsa_tma_store_commit() {
+  asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+}
+
+template <int Remaining>
+__device__ __forceinline__ void lsa_tma_store_wait() {
+  asm volatile("cp.async.bulk.wait_group %0;" :: "n"(Remaining) : "memory");
+}
+
+// One elected lane owns a two-stage TMA pipeline for its aligned warp subrange. Loads for the next
+// use of a stage are issued only after the oldest store group has finished reading that stage.
+__device__ __forceinline__ void lsa_tma_copy_aligned(
+    char* __restrict__ dst, const char* __restrict__ src, size_t numBytes,
+    unsigned char* warpSmem) {
+  auto* barriers = reinterpret_cast<uint64_t*>(
+      warpSmem + LSA_TMA_STAGES * LSA_TMA_STAGE_BYTES);
+  uint32_t phases[LSA_TMA_STAGES] = {0, 0};
+  #pragma unroll
+  for (int s = 0; s < LSA_TMA_STAGES; ++s)
+    lsa_tma_mbarrier_init(barriers + s);
+
+  const size_t numIters =
+      (numBytes + LSA_TMA_STAGE_BYTES - 1) / LSA_TMA_STAGE_BYTES;
+  const size_t preload = min(numIters, (size_t)LSA_TMA_STAGES);
+  for (size_t i = 0; i < preload; ++i) {
+    const int stage = static_cast<int>(i % LSA_TMA_STAGES);
+    const size_t off = i * LSA_TMA_STAGE_BYTES;
+    const int bytes = static_cast<int>(
+        min(LSA_TMA_STAGE_BYTES, numBytes - off));
+    lsa_tma_load(warpSmem + stage * LSA_TMA_STAGE_BYTES,
+                 src + off, barriers + stage, bytes);
+    lsa_tma_mbarrier_arrive_expect_tx(barriers + stage, bytes);
+  }
+
+  for (size_t i = 0; i < numIters; ++i) {
+    const int stage = static_cast<int>(i % LSA_TMA_STAGES);
+    const size_t off = i * LSA_TMA_STAGE_BYTES;
+    const int bytes = static_cast<int>(
+        min(LSA_TMA_STAGE_BYTES, numBytes - off));
+    lsa_tma_mbarrier_wait(barriers + stage, phases + stage);
+    lsa_tma_store(dst + off, warpSmem + stage * LSA_TMA_STAGE_BYTES, bytes);
+    lsa_tma_store_commit();
+
+    const size_t next = i + 1;
+    if (next >= (size_t)LSA_TMA_STAGES && next < numIters) {
+      // At this point two stages have produced stores. Retire the oldest before reusing its buffer,
+      // while leaving the newer store in flight.
+      lsa_tma_store_wait<LSA_TMA_STAGES - 1>();
+      const int nextStage = static_cast<int>(next % LSA_TMA_STAGES);
+      const size_t nextOff = next * LSA_TMA_STAGE_BYTES;
+      const int nextBytes = static_cast<int>(
+          min(LSA_TMA_STAGE_BYTES, numBytes - nextOff));
+      lsa_tma_load(warpSmem + nextStage * LSA_TMA_STAGE_BYTES,
+                   src + nextOff, barriers + nextStage, nextBytes);
+      lsa_tma_mbarrier_arrive_expect_tx(barriers + nextStage, nextBytes);
+    }
+  }
+  lsa_tma_store_wait<0>();
+}
+
+template <bool SystemFence>
+__device__ __forceinline__ void lsa_tma_copy_bytes(
+    char* __restrict__ dst, const char* __restrict__ src, size_t numBytes,
+    unsigned char* tmaSmem) {
+  const unsigned warp = threadIdx.x / warpSize;
+  if (warp >= LSA_TMA_COPY_WARPS) return;
+  const unsigned lane = threadIdx.x % warpSize;
+
+  const size_t units = numBytes / LSA_TMA_ALIGN_BYTES;
+  const size_t chunk = units / LSA_TMA_COPY_WARPS;
+  const size_t rem = units % LSA_TMA_COPY_WARPS;
+  const size_t warpOff =
+      (chunk * warp + min((size_t)warp, rem)) * LSA_TMA_ALIGN_BYTES;
+  const size_t warpBytes =
+      (chunk + (warp < rem ? 1 : 0)) * LSA_TMA_ALIGN_BYTES;
+
+  if (warpBytes != 0) {
+    const bool elected = lsa_tma_elect_one_sync();
+    if (elected) {
+      lsa_tma_copy_aligned(
+          dst + warpOff, src + warpOff, warpBytes,
+          tmaSmem + warp * LSA_TMA_WARP_SMEM_BYTES);
+    }
+  }
+  __syncwarp();
+
+  // TMA requires a 16B-multiple transaction. Only the final copy warp owns the short tail.
+  if (warp == LSA_TMA_COPY_WARPS - 1) {
+    const size_t tailOff = units * LSA_TMA_ALIGN_BYTES;
+    for (size_t i = lane; i < numBytes - tailOff; i += warpSize)
+      dst[tailOff + i] = src[tailOff + i];
+  }
+  if constexpr (SystemFence) __threadfence_system();
 }
 
 // 16B-aligned variant of block_subrange, so the LSA sub-ranges keep the vector path.
@@ -541,7 +731,9 @@ __global__ void GinGetBatchedKernel(ncclWindow_t remoteWin, size_t remoteBase,
                                     ncclWindow_t localWin, size_t localBase,
                                     const int64_t* remoteOff, const int64_t* localOff,
                                     const int64_t* nbytes, const int* peers,
-                                    int K, int useLsa, struct ncclDevComm devComm) {
+                                    int K, int useLsa, int useTma,
+                                    struct ncclDevComm devComm) {
+  extern __shared__ __align__(LSA_TMA_ALIGN_BYTES) unsigned char lsaTmaSmem[];
   const int k = blockIdx.x;
   if (k >= K) return;
   const int peer = peers[k];
@@ -560,7 +752,13 @@ __global__ void GinGetBatchedKernel(ncclWindow_t remoteWin, size_t remoteBase,
     const char* src = (const char*)ncclGetPeerPointer(
         remoteWin, remoteBase + (size_t)remoteOff[k] + bOff, ncclTeamWorld(devComm), peer);
     char* dst = (char*)ncclGetLocalPointer(localWin, localBase + (size_t)localOff[k] + bOff);
-    lsa_copy_bytes(dst, src, bSize);
+    const uintptr_t mask =
+        reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src);
+    if (useTma && bSize >= LSA_TMA_MIN_BYTES &&
+        (mask & (LSA_TMA_ALIGN_BYTES - 1)) == 0)
+      lsa_tma_copy_bytes<false>(dst, src, bSize, lsaTmaSmem);
+    else
+      lsa_copy_bytes(dst, src, bSize);
     return;
   }
   gin_get_range(devComm, peer,
@@ -573,7 +771,9 @@ __global__ void GinPutBatchedKernel(ncclWindow_t srcWin, size_t srcBase,
                                     ncclWindow_t dstWin, size_t dstBase,
                                     const int64_t* srcOff, const int64_t* dstOff,
                                     const int64_t* nbytes, const int* peers,
-                                    int K, int useLsa, struct ncclDevComm devComm) {
+                                    int K, int useLsa, int useTma,
+                                    struct ncclDevComm devComm) {
+  extern __shared__ __align__(LSA_TMA_ALIGN_BYTES) unsigned char lsaTmaSmem[];
   const int k = blockIdx.x;
   if (k >= K) return;
   const int peer = peers[k];
@@ -590,11 +790,18 @@ __global__ void GinPutBatchedKernel(ncclWindow_t srcWin, size_t srcBase,
         dstWin, dstBase + (size_t)dstOff[k] + bOff, ncclTeamWorld(devComm), peer);
     const char* src = (const char*)ncclGetLocalPointer(
         srcWin, srcBase + (size_t)srcOff[k] + bOff);
-    lsa_copy_bytes(dst, src, bSize);
-    // These stores land in another device's memory over the fabric, where completing the
-    // kernel is not by itself enough to make them visible. The caller's fence orders the
-    // ranks; this makes sure there is nothing left in flight when it runs.
-    __threadfence_system();
+    const uintptr_t mask =
+        reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src);
+    if (useTma && bSize >= LSA_TMA_MIN_BYTES &&
+        (mask & (LSA_TMA_ALIGN_BYTES - 1)) == 0) {
+      lsa_tma_copy_bytes<true>(dst, src, bSize, lsaTmaSmem);
+    } else {
+      lsa_copy_bytes(dst, src, bSize);
+      // These stores land in another device's memory over the fabric, where completing the
+      // kernel is not by itself enough to make them visible. The caller's fence orders the
+      // ranks; this makes sure there is nothing left in flight when it runs.
+      __threadfence_system();
+    }
     return;
   }
   gin_put_range(devComm, peer,
@@ -971,11 +1178,15 @@ void get_batched(torch::Tensor remote_buffer, torch::Tensor local_buffer,
 
   int nblk = blocks_per_desc > 0 ? (int)blocks_per_desc : 1;
   dim3 grid((unsigned)K, (unsigned)nblk);
-  GinGetBatchedKernel<<<grid, 512, 0, cuda_stream>>>(
+  const bool enableLsa = use_lsa && g_state.devComm.lsaSize > 1;
+  const bool enableTma = enableLsa &&
+      read_bool_env_or_default("EPLB_GIN_LSA_TMA", true);
+  const size_t smemBytes = enableTma ? LSA_TMA_SMEM_BYTES : 0;
+  GinGetBatchedKernel<<<grid, 512, smemBytes, cuda_stream>>>(
       remoteWin, remoteBase, localWin, localBase,
       remote_off.data_ptr<int64_t>(), local_off.data_ptr<int64_t>(),
       nbytes.data_ptr<int64_t>(), peers.data_ptr<int>(),
-      (int)K, use_lsa ? 1 : 0, g_state.devComm);
+      (int)K, enableLsa ? 1 : 0, enableTma ? 1 : 0, g_state.devComm);
 }
 
 void put_batched(torch::Tensor src_buffer, torch::Tensor dst_buffer,
@@ -1004,11 +1215,15 @@ void put_batched(torch::Tensor src_buffer, torch::Tensor dst_buffer,
 
   int nblk = blocks_per_desc > 0 ? (int)blocks_per_desc : 1;
   dim3 grid((unsigned)K, (unsigned)nblk);
-  GinPutBatchedKernel<<<grid, 512, 0, cuda_stream>>>(
+  const bool enableLsa = use_lsa && g_state.devComm.lsaSize > 1;
+  const bool enableTma = enableLsa &&
+      read_bool_env_or_default("EPLB_GIN_LSA_TMA", true);
+  const size_t smemBytes = enableTma ? LSA_TMA_SMEM_BYTES : 0;
+  GinPutBatchedKernel<<<grid, 512, smemBytes, cuda_stream>>>(
       srcWin, srcBase, dstWin, dstBase,
       src_off.data_ptr<int64_t>(), dst_off.data_ptr<int64_t>(),
       nbytes.data_ptr<int64_t>(), peers.data_ptr<int>(),
-      (int)K, use_lsa ? 1 : 0, g_state.devComm);
+      (int)K, enableLsa ? 1 : 0, enableTma ? 1 : 0, g_state.devComm);
 }
 
 void put_signal(torch::Tensor src_buffer, torch::Tensor dst_buffer,

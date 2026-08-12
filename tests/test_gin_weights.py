@@ -192,6 +192,70 @@ def _gin_available() -> bool:
     return True
 
 
+def _raw_lsa_tma_worker(rank, port):
+    """Exercise the multi-stage TMA path directly, including a non-16B tail."""
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.cuda.set_device(rank)
+    dev = torch.device("cuda", rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=W)
+
+    import nccl_gin
+
+    nccl_gin.init()
+    props = nccl_gin.get_comm_properties()
+    assert int(props["lsaSize"]) > 1, "test requires an NVLink/LSA peer"
+
+    # Each block gets ~128 KiB and each of its four copy warps gets ~32 KiB, so this runs several
+    # 4 KiB TMA pipeline stages. The seven-byte suffix pins the scalar tail after the aligned bulk.
+    num_bytes = (1 << 20) + 7
+    src = nccl_gin.create_tensor(num_bytes, torch.uint8)
+    dst = nccl_gin.create_tensor(num_bytes, torch.uint8)
+    off = torch.zeros((1,), dtype=torch.int64, device=dev)
+    sizes = torch.full((1,), num_bytes, dtype=torch.int64, device=dev)
+
+    src.fill_(41 + rank)
+    dst.zero_()
+    torch.cuda.synchronize()
+    dist.barrier()
+    if rank == 1:
+        peers = torch.tensor([0], dtype=torch.int32, device=dev)
+        nccl_gin.get_batched(
+            src, dst, off, off, sizes, peers,
+            blocks_per_desc=8, use_lsa=True,
+        )
+    torch.cuda.synchronize()
+    dist.barrier()
+    if rank == 1:
+        assert bool(torch.all(dst == 41)), "TMA destination-pull corrupted the large/tail payload"
+
+    src.fill_(93 if rank == 1 else 0)
+    dst.zero_()
+    torch.cuda.synchronize()
+    dist.barrier()
+    if rank == 1:
+        peers = torch.tensor([0], dtype=torch.int32, device=dev)
+        nccl_gin.put_batched(
+            src, dst, off, off, sizes, peers,
+            blocks_per_desc=8, use_lsa=True,
+        )
+    torch.cuda.synchronize()
+    dist.barrier()
+    if rank == 0:
+        assert bool(torch.all(dst == 93)), "TMA gradient-style put corrupted the large/tail payload"
+
+    dist.barrier()
+    nccl_gin.destroy()
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not _gin_available(),
+                    reason="needs RUN_GIN_TESTS=1, >=2 GPUs with GIN-capable NCCL, and nccl_gin built")
+def test_lsa_tma_large_tail_get_put():
+    """Large aligned body uses multi-stage TMA; the non-16B suffix uses the fallback tail copy."""
+    mp.spawn(_raw_lsa_tma_worker, args=(6041,), nprocs=W, join=True)
+
+
 @pytest.mark.skipif(not _gin_available(),
                     reason="needs RUN_GIN_TESTS=1, >=2 GPUs with GIN-capable NCCL, and nccl_gin built")
 def test_gin_weights_compute_invariant():
@@ -219,7 +283,7 @@ def test_gin_weights_signal_fence_compute_invariant():
 def test_gin_weights_network_only_matches_lsa():
     """``EPLB_GIN_LSA=0``: force every peer through GIN even when its window is mapped here.
 
-    The batched kernels pick their transport per descriptor -- load/store for peers in the LSA team,
+    The batched kernels pick their transport per descriptor -- TMA for peers in the LSA team,
     GIN for the rest -- so on a single node the default path exercises almost none of the GIN code
     and this variant exercises almost none of the LSA code. Both must produce the same numbers as
     the single-device reference, which is what pins the two halves of the branch against each other:
