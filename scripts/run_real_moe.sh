@@ -118,8 +118,9 @@ fi
 #                           not stream-ordered, so the backward re-pull cannot overlap Wgrad.
 # EPLB_GIN_LSA=0            force every replica transfer onto GIN's network path even for peers whose
 #                           memory is mapped here. Default is to move those over NVLink with
-#                           load/store; with the EP group inside a node that is the whole weight
-#                           channel, so this is for A/B measurement only.
+#                           an SM90+ TMA-staged copy; with the EP group inside a node that is the
+#                           whole weight channel, so this is for A/B measurement only.
+# EPLB_GIN_LSA_TMA=0        keep LSA/NVLink routing but restore vector load/store for A/B or fallback.
 # EPLB_CAP=<int>            pin the per-slot capacity (sizes the padded expert-GEMM batch and the
 #                           Elastic compute layout). Required for Elastic; overflow fails asynchronously.
 # EPLB_CHUNKS=2             split this rank's routing units in two and pipeline dispatch/compute/

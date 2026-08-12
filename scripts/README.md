@@ -441,6 +441,7 @@ Apply mode moves two independent things across ranks, and they use different bac
 | `EPLB_WEIGHT_COMM` | host-driven `dist.broadcast` | `gin` — replica weight pull + grad reduce-to-main |
 | `EPLB_GIN_FENCE` | `barrier` (host, not stream-ordered) | `signal` — device-stream, capture-safe |
 | `EPLB_GIN_LSA` | `1` — intra-node peers over NVLink | `0` forces everything onto the network (A/B only) |
+| `EPLB_GIN_LSA_TMA` | `1` — SM90+ TMA copy | `0` keeps LSA routing but restores vector load/store (A/B/fallback) |
 | `EPLB_CAP` | derived only for alltoall | required static bound for Elastic; overflow aborts asynchronously |
 | `EPLB_DEEPEP_HYBRID` | `1` | NVLink scale-up plus GIN scale-out |
 | `EPLB_DEEPEP_MAX_TOKENS_PER_RANK` | first chunk's static size | optional larger per-chunk input bound |
@@ -461,12 +462,12 @@ synchronize once before warmup; iterations use GPU prefix counts and never read 
 One `ncclCommWindowRegister` maps the symmetric buffers for both transports at once: `ncclGinRegister`
 for the network side, `cuMemMap` + `cuMemSetAccess` for peers whose memory is load/store reachable
 (the LSA team, i.e. NVLink or PCIe P2P inside the node). The batched kernels pick per descriptor —
-LSA-team peers are read and written with vector load/store, everyone else through GIN's RDMA — so
+LSA-team peers are read and written with an SM90+ TMA-staged copy, everyone else through GIN's RDMA — so
 with the expert-parallel group inside one node the weight channel never reaches the NIC. Rank 0
 prints the split at startup:
 
 ```
-[eplb-gin] world=8 lsa_team=8 lsa_path=on -> up to 7 of 7 peers over NVLink, the rest over GIN
+[eplb-gin] world=8 lsa_team=8 lsa_path=tma -> up to 7 of 7 peers over NVLink, the rest over GIN
 ```
 
 `lsa_team=1` means no peer is mapped and everything is going over the network; check P2P

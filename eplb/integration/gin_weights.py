@@ -9,8 +9,9 @@ branch and there is **no D2H** to read the schedule. Local (``main(e) == my_rank
 with a vectorised on-device gather instead of a self-routed transfer.
 
 Transport is per peer, chosen inside the batched kernel. One ``ncclCommWindowRegister`` covers both
-paths, so a slot whose ``main(e)`` shares this node is read/written over NVLink with load/store, and
-only genuinely cross-node slots go through GIN's network RDMA. This matters at the EP sizes we run:
+paths, so a slot whose ``main(e)`` shares this node is read/written over NVLink with an SM90+ TMA
+copy, and only genuinely cross-node slots go through GIN's network RDMA. This matters at the EP
+sizes we run:
 with the expert-parallel group inside a node, routing every slot through ``gin.put`` would send the
 whole weight channel out to the NIC and back at a fraction of NVLink bandwidth. ``EPLB_GIN_LSA=0``
 forces the network path for every peer, for A/B measurement only.
@@ -161,7 +162,7 @@ class GinWeightReplicator:
     def _log_transport(self) -> None:
         """Report the LSA/network split once, from rank 0.
 
-        ``lsaSize == 1`` means no peer is load/store reachable and every replica transfer takes the
+        ``lsaSize == 1`` means no peer is TMA/LSA reachable and every replica transfer takes the
         network path -- worth seeing, because on a single-node EP group that is the whole weight
         channel going through the NIC and it costs bandwidth rather than correctness.
         """
@@ -173,8 +174,15 @@ class GinWeightReplicator:
         except Exception:
             return
         on = self.use_lsa
+        tma = os.environ.get("EPLB_GIN_LSA_TMA", "1").strip().lower() not in (
+            "0", "false", "no", "off",
+        )
+        path = (
+            ("tma" if tma else "vector (EPLB_GIN_LSA_TMA=0)")
+            if on else "off (EPLB_GIN_LSA=0)"
+        )
         print(
-            f"[eplb-gin] world={self.world} lsa_team={lsa} lsa_path={'on' if on else 'off (EPLB_GIN_LSA=0)'}"
+            f"[eplb-gin] world={self.world} lsa_team={lsa} lsa_path={path}"
             f" -> up to {lsa - 1 if on else 0} of {self.world - 1} peers over NVLink,"
             f" the rest over GIN",
             flush=True,
