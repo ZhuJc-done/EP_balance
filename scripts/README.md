@@ -18,7 +18,8 @@ Run MoE on real Megatron-LM with Scale-EPLB, in two stages selected by `EPLB_MOD
 | `run_phaseC.sh` | `torchrun` launcher, apply mode, end-to-end training. |
 | `run_gb200_4x4.sh` | Multi-node 4 nodes x 4 GB200 launcher: Slurm auto-discovery + GB200 NCCL/RDMA env; mock-data smoke test by default, `REAL=1` forwards to `run_real_moe.sh`. |
 | `sbatch_gb200_4x4.sbatch` | Slurm wrapper (`sbatch`) that `srun`s `run_gb200_4x4.sh` (1 task/node). |
-| `run_real_moe.sh` | Real-model launcher (Qwen3-30B-A3B / Mixtral); `REAL=1` from `run_gb200_4x4.sh` forwards here. `MOCK=1` = mock-data + random init; `MOCK=0 FROM_SCRATCH=1` = real data + random init; `DEEPEP=1` = native DeepEP dispatch. |
+| `run_real_moe.sh` | Real-model launcher; `REAL=1` from `run_gb200_4x4.sh` forwards here. `MOCK=1` = mock-data + random init; `MOCK=0 FROM_SCRATCH=1` = real data + random init; `DEEPEP=1` = native DeepEP dispatch. |
+| `model_recipes.sh` | Architecture presets for Mixtral, Qwen3, 160E DeepSeek-V2, and 128E GLM-4.5-Air, with launch-time depth override. |
 | `run_slot_sweep.sh` | Sweep `N_slot=1..4` with workload seed 0 and save one non-detail baseline JSON per configuration; uses a fixed LPLB Ring topology. |
 | `run_solver_scaling.sh` | Sweep the Scale-EPLB CUDA solver over logical rank and expert counts and save hot-kernel JSON results. |
 | `prepare_open_workload.py` | Download task/corpus workloads, extract model inputs, and optionally build Megatron `.bin/.idx`. |
@@ -30,6 +31,39 @@ Run MoE on real Megatron-LM with Scale-EPLB, in two stages selected by `EPLB_MOD
 > **Install** (clone + `install_megatron.sh` / `install_deepep.sh` + `pip install -e`)
 > lives in the [top-level README](../README.md#cluster-install-megatron-integration). This file is the
 > **run book**: launchers, run recipes, toggles, and troubleshooting.
+
+## Model selection
+
+Select the architecture with one environment variable:
+
+```bash
+MODEL=qwen3_30b_a3b
+MODEL=mixtral8x7b
+MODEL=deepseek_v2_160e
+MODEL=glm45_air
+```
+
+Every recipe defaults to the official layer count: Qwen3 has 48 MoE layers,
+DeepSeek-V2 has 60 layers (1 dense + 59 MoE), and GLM-4.5-Air has 46 layers
+(1 dense + 45 MoE). Set the total Transformer depth at launch with
+`NUM_LAYERS=<N>`; the mixed models preserve their dense prefix automatically:
+
+```bash
+# 1 dense + 5 MoE layers
+MODEL=deepseek_v2_160e NUM_LAYERS=6 bash scripts/run_real_moe.sh
+MODEL=glm45_air NUM_LAYERS=6 bash scripts/run_real_moe.sh
+
+# Qwen has no dense prefix, so this is 5 MoE layers
+MODEL=qwen3_30b_a3b NUM_LAYERS=5 bash scripts/run_real_moe.sh
+```
+
+Reduced random-init models can run with `MOCK=1` or `FROM_SCRATCH=1`; loading
+weights requires a Megatron-Core checkpoint converted and truncated to the
+selected `NUM_LAYERS`.
+
+Shared experts remain outside EPLB placement and are added to the routed-expert
+output in `apply` mode. Shared-expert communication overlap is deliberately
+disabled in all three modes so their step times use the same execution schedule.
 
 ## Fresh machine: install once, keep artifacts on HDFS
 

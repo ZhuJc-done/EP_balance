@@ -138,6 +138,11 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
     if isinstance(cfg["adapter"], DeepEPAdapter) and tokens.dtype != torch.bfloat16:
         raise TypeError(f"ElasticBuffer apply mode requires BF16 hidden states, got {tokens.dtype}")
 
+    shared_expert_output = None
+    if getattr(self, "use_shared_expert", False):
+        with profiling.record("apply/shared_expert", time_it=True, device=tokens.device):
+            shared_expert_output = self.shared_experts_compute(hidden_states)
+
     with profiling.record("apply/route", time_it=True, device=tokens.device):
         probs, routing_map = self.router(hidden_states)
         unit_token_idx, unit_expert, unit_prob = _routing_to_units(
@@ -171,7 +176,10 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
     )
     if profiling.enabled():
         profiling.maybe_summary(print if (ep_rank == 0 or profiling.all_ranks()) else None)
-    return out.reshape(in_shape), None
+    out = out.reshape(in_shape)
+    if shared_expert_output is not None:
+        out = out + shared_expert_output
+    return out, None
 
 
 def bind_eplb_to_moe_layer(moe_layer, rebalancer, ep_group, layer_id: int = 0) -> None:
@@ -184,6 +192,18 @@ def bind_eplb_to_moe_layer(moe_layer, rebalancer, ep_group, layer_id: int = 0) -
         layer_id: Stable id used as the rebalancer's ring-buffer key.
     """
     config = moe_layer.config
+    if getattr(moe_layer, "use_shared_expert", False):
+        if getattr(moe_layer, "shared_expert_overlap", False):
+            raise NotImplementedError(
+                "EPLB apply mode supports shared experts only with "
+                "moe_shared_expert_overlap=False; the EPLB dispatcher replaces "
+                "Megatron's token dispatcher and cannot drive its overlap state machine."
+            )
+        if not callable(getattr(moe_layer, "shared_experts_compute", None)):
+            raise NotImplementedError(
+                "this Megatron MoELayer exposes shared experts but no "
+                "shared_experts_compute method"
+            )
     adapter = _make_adapter()
     if isinstance(adapter, DeepEPAdapter):
         topk = getattr(config, "moe_router_topk", None)

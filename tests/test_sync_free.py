@@ -282,6 +282,91 @@ def test_routing_to_units():
     assert torch.allclose(p, torch.tensor([0.6, 0.4, 1.0]))
 
 
+def test_eplb_megatron_forward_adds_shared_expert_output(monkeypatch):
+    """Apply mode must preserve the native routed + shared expert sum."""
+    from types import SimpleNamespace
+
+    import eplb.integration.megatron_moe as binding
+
+    call_order = []
+    hidden = torch.randn(2, 1, 3, requires_grad=True)
+
+    def router(x):
+        call_order.append("route")
+        probs = x.new_tensor([[1.0, 0.0], [0.0, 1.0]])
+        return probs, probs.bool()
+
+    def shared_experts_compute(x):
+        call_order.append("shared")
+        return 3.0 * x
+
+    def fake_sync_free_moe_forward(**kwargs):
+        assert kwargs["plan"] == "test-plan"
+        assert kwargs["unit_expert"].tolist() == [0, 1]
+        return 2.0 * kwargs["tokens"]
+
+    class Rebalancer:
+        spec = SimpleNamespace(num_experts=2)
+
+        @staticmethod
+        def rebalance(local_row, layer_id, mb, group):
+            assert local_row.tolist() == [1, 1]
+            return SimpleNamespace(plan="test-plan")
+
+    def local_expert():
+        return SimpleNamespace(
+            linear_fc1=SimpleNamespace(weight=torch.empty(4, 3)),
+            linear_fc2=SimpleNamespace(weight=torch.empty(3, 2)),
+        )
+
+    layer = SimpleNamespace(
+        config=SimpleNamespace(moe_router_topk=1),
+        router=router,
+        experts=SimpleNamespace(local_experts=[local_expert(), local_expert()]),
+        use_shared_expert=True,
+        shared_expert_overlap=False,
+        shared_experts_compute=shared_experts_compute,
+        _eplb={
+            "reb": Rebalancer(),
+            "group": None,
+            "layer_id": 0,
+            "mb": 0,
+            "gated": True,
+            "act": torch.nn.functional.silu,
+            "batched_mlp_fn": None,
+            "adapter": object(),
+            "rematerialize": False,
+            "overlap": False,
+        },
+    )
+    monkeypatch.setattr(binding, "sync_free_moe_forward", fake_sync_free_moe_forward)
+    monkeypatch.setattr(binding.profiling, "enabled", lambda: False)
+
+    output, bias = binding.eplb_moe_forward(layer, hidden)
+    assert bias is None
+    assert call_order == ["shared", "route"]
+    assert torch.allclose(output, 5.0 * hidden)
+
+    output.sum().backward()
+    assert torch.allclose(hidden.grad, torch.full_like(hidden, 5.0))
+
+
+def test_eplb_binding_rejects_shared_expert_overlap():
+    """Megatron's dispatcher owns the shared-expert overlap state machine."""
+    from types import SimpleNamespace
+
+    from eplb.integration.megatron_moe import bind_eplb_to_moe_layer
+
+    layer = SimpleNamespace(
+        config=SimpleNamespace(moe_router_topk=2),
+        use_shared_expert=True,
+        shared_expert_overlap=True,
+        shared_experts_compute=lambda hidden: hidden,
+    )
+    with pytest.raises(NotImplementedError, match="moe_shared_expert_overlap=False"):
+        bind_eplb_to_moe_layer(layer, rebalancer=object(), ep_group=None)
+
+
 @pytest.mark.parametrize("hidden", [16, 512, 1024, 2048, 4096, 5120, 7168, 8192])
 @pytest.mark.parametrize("dtype,eligible", [(torch.bfloat16, True), (torch.float16, False)])
 def test_elastic_payload_requires_aligned_bf16(hidden, dtype, eligible):

@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Real-model launcher: train an open MoE (Mixtral-8x7B / Qwen3-30B-A3B) on real data, multi-node, EPLB_MODE off|observe|apply.
+# Real-model launcher: train a supported open-MoE recipe on real data, multi-node, EPLB_MODE off|observe|apply.
 set -euo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 # Pin runtime and JIT linkage to the validated NCCL build before Python starts.
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env_nccl_2307.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/env_nccl_2307.sh"
 
 # --- required paths / artifacts ----------------------------------------------
 MEGATRON_DIR="${MEGATRON_DIR:?set MEGATRON_DIR to the Megatron-LM repo root}"
-EPLB_DIR="${EPLB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+EPLB_DIR="${EPLB_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 # Drop regular-package Megatron forks that would override the community
 # Megatron PEP420 namespace even when MEGATRON_DIR appears first.
 _clean_pp=""
@@ -55,7 +56,8 @@ fi
 SAVE_DIR="${SAVE_DIR:-}"                    # optional: where to write new checkpoints
 
 # --- which open model (architecture recipe) ----------------------------------
-MODEL="${MODEL:-qwen3_30b_a3b}"             # qwen3_30b_a3b | mixtral8x7b
+MODEL="${MODEL:-qwen3_30b_a3b}"
+# qwen3_30b_a3b | mixtral8x7b | deepseek_v2_160e | glm45_air
 
 # --- cluster topology (4x GB200 = 4 nodes x 4 GPUs by default) ----------------
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
@@ -187,10 +189,10 @@ PY
 fi
 
 # PROFILE_TRACE=1 -> Megatron's native PyTorch profiler writes a chrome/perfetto trace per profiled
-# rank. The eplb/* record_function labels (solve, all_gather_omega, apply/route, apply/dispatch,
-# apply/expert_compute, apply/combine, apply/weight_move) appear inline, so the trace resolves where
-# EP time actually goes. Start past step ~5: the first iterations pay CUDA-solver JIT and cuBLAS
-# autotuning and are not representative.
+# rank. The eplb/* record_function labels (solve, all_gather_omega, apply/shared_expert,
+# apply/route, apply/dispatch, apply/expert_compute, apply/combine, apply/weight_move) appear
+# inline, so the trace resolves where EP time actually goes. Start past step ~5: the first
+# iterations pay CUDA-solver JIT and cuBLAS autotuning and are not representative.
 #
 # PROFILE_DIR is one output dir per run, holding tb/ and torch_profile/. Megatron derives the trace
 # path as `<tensorboard-dir>/../torch_profile`, so tb/ is nested one level down to keep the trace
@@ -216,54 +218,16 @@ if [[ "${PROFILE_TRACE:-0}" == "1" ]]; then
 fi
 
 # --- per-model architecture args (must match the checkpoint when loading) -----
-if [[ "${MODEL}" == "mixtral8x7b" ]]; then
-  MODEL_ARGS=(
-    --use-mcore-models --disable-bias-linear --untie-embeddings-and-output-weights
-    --seq-length "${SEQ_LEN:-4096}" --max-position-embeddings 32768
-    --num-layers 32 --hidden-size 4096 --ffn-hidden-size 14336
-    --num-attention-heads 32 --group-query-attention --num-query-groups 8
-    --normalization RMSNorm --position-embedding-type rope --rotary-base 1000000
-    --swiglu --no-masked-softmax-fusion --no-position-embedding
-    --attention-dropout 0.0 --hidden-dropout 0.0
-  )
-  MOE_ARGS=(
-    --num-experts 8 --moe-router-topk 2
-    --moe-router-load-balancing-type aux_loss --moe-aux-loss-coeff 1e-2
-    --moe-token-dispatcher-type alltoall
-  )
-elif [[ "${MODEL}" == "qwen3_30b_a3b" ]]; then
-  # Megatron Bridge Qwen checkpoints store this RMSNorm as
-  # `pre_mlp_layernorm.*`; the local sequential spec otherwise aliases it to
-  # the fused-linear key and leaves the norm unloaded. Set 0 for checkpoints
-  # that already use `mlp.linear_fc1.layer_norm_*`.
-  export EPLB_SEPARATE_MLP_NORM_CKPT="${EPLB_SEPARATE_MLP_NORM_CKPT:-1}"
-  MODEL_ARGS=(
-    --use-mcore-models --disable-bias-linear --untie-embeddings-and-output-weights
-    --seq-length "${SEQ_LEN:-8192}" --max-position-embeddings 8192
-    --num-layers 48 --hidden-size 2048 --ffn-hidden-size 6144
-    --num-attention-heads 32 --kv-channels 128
-    --group-query-attention --num-query-groups 4 --qk-layernorm
-    --normalization RMSNorm --norm-epsilon 1e-6
-    --position-embedding-type rope --rotary-base 1000000 --rotary-percent 1.0
-    --swiglu --no-masked-softmax-fusion --attention-softmax-in-fp32
-    --attention-dropout 0.0 --hidden-dropout 0.0
-    --padded-vocab-size 151936 --make-vocab-size-divisible-by 128
-  )
-  MOE_ARGS=(
-    --num-experts 128 --moe-router-topk 8 --moe-ffn-hidden-size 768
-    --moe-router-load-balancing-type aux_loss --moe-aux-loss-coeff 1e-3
-    --moe-token-dispatcher-type alltoall --moe-layer-freq 1
-  )
-else
-  echo "unknown MODEL=${MODEL} (expected qwen3_30b_a3b | mixtral8x7b)" >&2
-  exit 1
-fi
+source "${SCRIPT_DIR}/model_recipes.sh"
+configure_model_recipe "${MODEL}"
+echo "[run_real_moe] depth=${MODEL_NUM_LAYERS}/${MODEL_FULL_NUM_LAYERS} layers" \
+     "(dense=${MODEL_DENSE_PREFIX_LAYERS}, MoE=${MODEL_MOE_LAYERS}); override with NUM_LAYERS"
 
 # Router load balancing. ROUTER_BALANCING=none turns the aux loss off so the routing skew survives to
 # the dispatcher: aux_loss actively flattens the very imbalance an expert load balancer exists to
 # exploit, so leaving it on understates every balancer in the comparison. Appended after the per-model
 # recipe because argparse keeps the last value for a repeated flag.
-ROUTER_BALANCING="${ROUTER_BALANCING:-aux_loss}"
+ROUTER_BALANCING="${ROUTER_BALANCING:-${MODEL_DEFAULT_ROUTER_BALANCING}}"
 MOE_ARGS+=(--moe-router-load-balancing-type "${ROUTER_BALANCING}")
 if [[ "${ROUTER_BALANCING}" == "none" ]]; then
   MOE_ARGS+=(--moe-aux-loss-coeff 0.0)
