@@ -41,5 +41,5 @@ checkpoints/
 outputs/
 wandb/
 logs/
-eval/
 figs/
+eval/data/
