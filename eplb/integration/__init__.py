@@ -22,6 +22,7 @@ from .megatron_moe import (
     extract_local_expert_weights,
     find_moe_layers,
 )
+from .megatron_timing import NativeMoETimingBinding, bind_native_moe_timing
 
 __all__ = [
     "EPLBRebalancer",
@@ -42,6 +43,8 @@ __all__ = [
     "DeepEPAdapter",
     "sync_free_moe_forward",
     "bind_eplb_to_moe_layer",
+    "bind_native_moe_timing",
     "extract_local_expert_weights",
     "find_moe_layers",
+    "NativeMoETimingBinding",
 ]

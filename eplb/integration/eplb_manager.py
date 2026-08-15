@@ -12,6 +12,7 @@ Pipeline (per MoE layer, per forward). Two concerns are kept orthogonal:
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
@@ -99,6 +100,26 @@ def _payload_pad_cols(h: int, elem: int, *, elastic: bool = True) -> int:
     return pad_bytes // elem
 
 
+def _tensor_row_bytes(tensor: torch.Tensor) -> int:
+    """Bytes in one transported tensor row (payload only, excluding protocol headers)."""
+    return int(math.prod(tensor.shape[1:])) * tensor.element_size()
+
+
+def _transport_row_bytes(adapter, tensor: torch.Tensor, phase: str) -> int:
+    custom = getattr(adapter, "transfer_row_bytes", None)
+    return int(custom(tensor, phase)) if callable(custom) else _tensor_row_bytes(tensor)
+
+
+def _remote_payload_bytes(
+    sent_per_dst: torch.Tensor, my_rank: int, row_bytes: int
+) -> object:
+    """Logical payload sent to remote ranks, excluding this rank's local route."""
+    if not profiling.enabled():
+        return 0
+    remote_rows = sent_per_dst.sum() - sent_per_dst[int(my_rank)]
+    return remote_rows.to(torch.int64) * int(row_bytes)
+
+
 class CommAdapter(Protocol):
     """Differentiable all-to-all transport seam taking device-side split sizes."""
 
@@ -123,6 +144,10 @@ class AllToAllAdapter:
     def all_to_all(self, inp, out_splits, in_splits, group) -> torch.Tensor:
         # NCCL/Gloo need host-side split lists; this .tolist() is the one allowed D2H here
         return all_to_all_single(inp, out_splits.tolist(), in_splits.tolist(), group)
+
+    @staticmethod
+    def transfer_row_bytes(tensor: torch.Tensor, phase: str) -> int:
+        return _tensor_row_bytes(tensor)
 
     # ---- two-chunk pipeline hooks (symmetric: dispatch and combine are both a plain a2a) ----
     def needs_recv_counts(self) -> bool:
@@ -379,6 +404,11 @@ class DeepEPAdapter:
     def needs_recv_counts(self) -> bool:
         """ElasticBuffer derives receive counts on device."""
         return False
+
+    def transfer_row_bytes(self, tensor: torch.Tensor, phase: str) -> int:
+        # Elastic combine pads expert output back to the dispatch width before transport.
+        width = self._hidden if phase == "combine" and self._hidden else int(tensor.shape[1])
+        return width * tensor.element_size()
 
     def uses_padded_layout(self) -> bool:
         """ElasticBuffer returns a fixed worst-case row count."""
@@ -733,9 +763,20 @@ def _moe_forward_two_chunks(
         else:
             payload_c = send_tokens_c.contiguous()
         recv_c = _exchange_recv_counts(sent_c, group) if adapter.needs_recv_counts() else sent_c
+        remote_rows_c = (
+            sent_c.sum() - sent_c[my_rank] if profiling.enabled() else 0
+        )
+        dispatch_bytes_c = remote_rows_c * _transport_row_bytes(adapter, payload_c, "dispatch")
+        combine_row_bytes = (
+            _transport_row_bytes(adapter, payload_c, "dispatch")
+            if elastic
+            else H * send_tokens_c.element_size()
+        )
         prep.append({
             "sent": sent_c, "recv": recv_c, "payload": payload_c, "route": phys_c,
             "utok": utok_c, "prob": prob_c,
+            "dispatch_bytes": dispatch_bytes_c,
+            "combine_bytes": remote_rows_c * combine_row_bytes,
         })
 
     nc = len(prep)
@@ -746,6 +787,7 @@ def _moe_forward_two_chunks(
         comb = block.run(
             [p["payload"] for p in prep], [p["sent"] for p in prep], [p["recv"] for p in prep],
             [p["route"] for p in prep],
+            [p["dispatch_bytes"] for p in prep], [p["combine_bytes"] for p in prep],
             adapter=adapter, group=group, cap=cap, n_slot=n_slot, H=H, pad_cols=pad_cols,
             my_rank=my_rank,
         )
@@ -763,10 +805,17 @@ def _moe_forward_two_chunks(
         cs.wait_stream(ms)
     with _sctx(cs):
         for k in range(nc):
-            recv[k] = adapter.dispatch_chunk(
-                prep[k]["payload"], prep[k]["sent"], prep[k]["recv"], group, tag=k,
-                route_idx=prep[k]["route"], n_slot=n_slot, cap=cap,
-            )
+            with profiling.record(
+                "apply/dispatch",
+                time_it=True,
+                device=device,
+                stream=cs,
+                payload_bytes=prep[k]["dispatch_bytes"],
+            ):
+                recv[k] = adapter.dispatch_chunk(
+                    prep[k]["payload"], prep[k]["sent"], prep[k]["recv"], group, tag=k,
+                    route_idx=prep[k]["route"], n_slot=n_slot, cap=cap,
+                )
             if on_cuda:
                 _rec(recv[k], ms)
                 disp_evt[k] = torch.cuda.Event()
@@ -804,7 +853,16 @@ def _moe_forward_two_chunks(
         with _sctx(cs):
             if on_cuda:
                 cs.wait_event(comp_evt)
-            comb[k] = adapter.combine_chunk(y_k, prep[k]["sent"], prep[k]["recv"], group, tag=k)
+            with profiling.record(
+                "apply/combine",
+                time_it=True,
+                device=device,
+                stream=cs,
+                payload_bytes=prep[k]["combine_bytes"],
+            ):
+                comb[k] = adapter.combine_chunk(
+                    y_k, prep[k]["sent"], prep[k]["recv"], group, tag=k
+                )
             adapter.chunk_state(k)
             if on_cuda:
                 _rec(comb[k], ms)
@@ -943,26 +1001,27 @@ def sync_free_moe_forward(
     num_chunks = int(os.environ.get("EPLB_CHUNKS", "1") or "1")
     if num_chunks >= 2:
         w_stacked = keepalive = experts = block = None
-        with profiling.record("apply/weight_move", time_it=True, device=device):
-            if overlap or gin_enabled():
-                # The weight stacks are acquired once per layer and shared by every chunk, in both
-                # directions, so chunking costs nothing extra on the weight channel and the
-                # reduce-to-main still happens once per layer.
-                transport = None
-                if gin_enabled():
-                    replicator = _get_gin_replicator(group, spec, weight_shapes, dtype, device)
-                    transport = GinReplicaTransport(replicator, plan.x)
-                kw = dict(
-                    weights_local=weights_local, slot_to_e=slot_to_e, main_rank=spec.main_rank,
-                    replicated=replicated, weight_shapes=weight_shapes, gated=gated, act=act,
-                    transpose_w=transpose_w, my_rank=my_rank, n_slot=n_slot, dtype=dtype,
-                    device=device, group=group, transport=transport,
-                )
-                if _env_truthy("EPLB_MANUAL_BWD", "1"):
-                    block = ManualMoEBlock(**kw)
-                else:
-                    experts = OverlappedExperts(**kw)
+        if overlap or gin_enabled():
+            # The weight stacks are acquired once per layer and shared by every chunk, in both
+            # directions, so chunking costs nothing extra on the weight channel and the
+            # reduce-to-main still happens once per layer. The concrete acquisition path owns the
+            # weight-move timing because the manual schedule launches it later on a side stream.
+            transport = None
+            if gin_enabled():
+                replicator = _get_gin_replicator(group, spec, weight_shapes, dtype, device)
+                transport = GinReplicaTransport(replicator, plan.x)
+            kw = dict(
+                weights_local=weights_local, slot_to_e=slot_to_e, main_rank=spec.main_rank,
+                replicated=replicated, weight_shapes=weight_shapes, gated=gated, act=act,
+                transpose_w=transpose_w, my_rank=my_rank, n_slot=n_slot, dtype=dtype,
+                device=device, group=group, transport=transport,
+            )
+            if _env_truthy("EPLB_MANUAL_BWD", "1"):
+                block = ManualMoEBlock(**kw)
             else:
+                experts = OverlappedExperts(**kw)
+        else:
+            with profiling.record("apply/weight_move", time_it=True, device=device):
                 w_stacked, keepalive = _materialize_w_stacked(
                     replicated=replicated, replicated_main=replicated_main, weights_local=weights_local,
                     weight_shapes=weight_shapes, slot_of_e=slot_of_e, hosted=hosted,
@@ -992,7 +1051,17 @@ def sync_free_moe_forward(
         send_payload = torch.cat([send_tokens, meta], dim=1)
     else:
         send_payload = send_tokens.contiguous()
-    with profiling.record("apply/dispatch", time_it=True, device=device):
+    dispatch_bytes = _remote_payload_bytes(
+        sent_per_dst,
+        my_rank,
+        _transport_row_bytes(adapter, send_payload, "dispatch"),
+    )
+    with profiling.record(
+        "apply/dispatch",
+        time_it=True,
+        device=device,
+        payload_bytes=dispatch_bytes,
+    ):
         recv_payload = adapter.dispatch_chunk(
             send_payload, sent_per_dst, recv_per_src, group, tag=0,
             route_idx=send_phys, n_slot=n_slot, cap=cap,
@@ -1045,7 +1114,17 @@ def sync_free_moe_forward(
                 out_units_recv = compute(recv_tokens)
 
     # --- STAGE 5: COMBINE outputs back, invert the permutation, gate-weight, scatter ---------
-    with profiling.record("apply/combine", time_it=True, device=device):
+    combine_bytes = _remote_payload_bytes(
+        sent_per_dst,
+        my_rank,
+        _transport_row_bytes(adapter, out_units_recv, "combine"),
+    )
+    with profiling.record(
+        "apply/combine",
+        time_it=True,
+        device=device,
+        payload_bytes=combine_bytes,
+    ):
         combined_back = adapter.combine_chunk(
             out_units_recv, sent_per_dst, recv_per_src, group, tag=0,
             route_idx=send_phys, n_slot=n_slot, cap=cap,

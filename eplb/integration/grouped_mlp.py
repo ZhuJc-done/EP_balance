@@ -6,6 +6,8 @@ from typing import Callable, Tuple
 
 import torch
 
+from . import profiling
+
 
 def make_batched_gated_mlp(gated: bool, act: Callable) -> Callable:
     """Batched expert MLP matching Megatron's ``Linear`` ``[out, in]`` weights (compute ``x @ W.t()``).
@@ -91,7 +93,8 @@ def grouped_expert_mlp(
     # The extra row absorbs all invalid writes and is sliced away before expert compute.
     x_ext = recv_tokens.new_zeros((S * cap + 1, H))
     x_ext = x_ext.index_copy(0, flat_idx, recv_tokens[order])
-    y_pad = batched_mlp_fn(x_ext[:overflow].view(S, cap, H), weights)  # [S, cap, H']
+    with profiling.record("apply/expert_gemm", time_it=True, device=device):
+        y_pad = batched_mlp_fn(x_ext[:overflow].view(S, cap, H), weights)  # [S, cap, H']
     Hout = y_pad.shape[-1]
     gather_idx = flat_idx.clamp(max=overflow - 1)
     out_sorted = y_pad.reshape(S * cap, Hout)[gather_idx]

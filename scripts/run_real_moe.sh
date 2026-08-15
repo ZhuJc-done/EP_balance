@@ -104,6 +104,12 @@ fi
 #                           resolved in one batch, so this adds no per-region host sync.
 # EPLB_PROFILE_ALL_RANKS=1  every rank prints its own summary (required for max-vs-mean straggler analysis).
 # EPLB_PROFILE_EVERY=<n>    summary cadence; EPLB_PROFILE_RESET_AT=<n> resets peak memory after warmup.
+# EPLB_DEBUG_TIMING=1       print one compact forward timing line per MoE invocation in every mode.
+#                           off: native router/dispatch/GEMM/combine; observe: native stages + solver;
+#                           apply: Scale-EPLB stages + expert transfer, remote payload MiB and effective
+#                           payload GB/s; backward GIN re-pull/grad-reduce are reported separately.
+#                           Invocation-boundary sync makes this diagnostic only: never quote the
+#                           instrumented end-to-end step time. Use ALL_RANKS for cluster bandwidth.
 #
 # apply-mode backends (ignored in off/observe, which use Megatron's own dispatcher):
 # EPLB_ADAPTER=deepep       token dispatch/combine through ElasticBuffer (default `alltoall`).
@@ -140,12 +146,16 @@ fi
 # EPLB_REMATERIALIZE=1      dist.broadcast transport only: free replica weights after forward and
 #                           re-broadcast them in backward.
 for _knob in EPLB_N_SLOT EPLB_PROFILE EPLB_PROFILE_ALL_RANKS EPLB_PROFILE_EVERY EPLB_PROFILE_RESET_AT \
+             EPLB_DEBUG_TIMING \
              EPLB_ADAPTER EPLB_DEEPEP_HYBRID EPLB_DEEPEP_MAX_TOKENS_PER_RANK \
              EPLB_WEIGHT_COMM EPLB_GIN_FENCE EPLB_GIN_LSA EPLB_CAP \
              EPLB_CHUNKS EPLB_MANUAL_BWD EPLB_OVERLAP EPLB_REMATERIALIZE; do
   if [[ -n "${!_knob:-}" ]]; then export "${_knob}"; fi
 done
 if [[ -n "${EPLB_N_SLOT:-}" ]]; then echo "[run_real_moe] EPLB_N_SLOT=${EPLB_N_SLOT} (slot budget override)"; fi
+if [[ "${EPLB_DEBUG_TIMING:-0}" != "0" ]]; then
+  echo "[run_real_moe] EPLB_DEBUG_TIMING=1 -> per-MoE forward breakdown; throughput is perturbed"
+fi
 if [[ "${EPLB_MODE}" == "apply" ]]; then
   echo "[run_real_moe] apply backends: adapter=${EPLB_ADAPTER:-alltoall} weight_comm=${EPLB_WEIGHT_COMM:-broadcast}" \
        "cap=${EPLB_CAP:-<from plan>} chunks=${EPLB_CHUNKS:-1} manual_bwd=${EPLB_MANUAL_BWD:-1}" \
@@ -174,6 +184,10 @@ if [[ "${EPLB_MODE}" == "apply" ]]; then
     [[ "${EPLB_PROFILE:-0}" == "0" && "${PROFILE_TRACE:-0}" == "0" ]] || {
       echo "zero-sync Elastic mode requires EPLB_PROFILE=0 PROFILE_TRACE=0" >&2; exit 1;
     }
+    if [[ "${EPLB_DEBUG_TIMING:-0}" != "0" ]]; then
+      echo "[run_real_moe] WARNING: EPLB_DEBUG_TIMING synchronizes each MoE invocation;" \
+           "phase times are diagnostic, and this run is not a zero-sync throughput measurement."
+    fi
     python - <<'PY'
 import deep_ep
 import nccl_gin
@@ -189,9 +203,9 @@ PY
 fi
 
 # PROFILE_TRACE=1 -> Megatron's native PyTorch profiler writes a chrome/perfetto trace per profiled
-# rank. The eplb/* record_function labels (solve, all_gather_omega, apply/shared_expert,
-# apply/route, apply/dispatch, apply/expert_compute, apply/combine, apply/weight_move) appear
-# inline, so the trace resolves where EP time actually goes. Start past step ~5: the first
+# rank. The eplb/* record_function labels include native/{route,dispatch,expert_gemm,combine}
+# in off/observe and apply/{route,dispatch,expert_compute,expert_gemm,combine,weight_move}
+# in apply; observe additionally includes solve and all_gather_omega. Start past step ~5: the first
 # iterations pay CUDA-solver JIT and cuBLAS autotuning and are not representative.
 #
 # PROFILE_DIR is one output dir per run, holding tb/ and torch_profile/. Megatron derives the trace

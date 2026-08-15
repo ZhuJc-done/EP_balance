@@ -435,7 +435,7 @@ def test_elastic_adapter_configuration_is_strict(monkeypatch):
     monkeypatch.setenv("EPLB_ADAPTER", "deepep")
     for key in (
         "EPLB_CAP", "EPLB_WEIGHT_COMM", "EPLB_GIN_FENCE", "EPLB_PROFILE",
-        "PROFILE_TRACE", "EPLB_DEEPEP_ALLOW_MNNVL",
+        "EPLB_DEBUG_TIMING", "PROFILE_TRACE", "EPLB_DEEPEP_ALLOW_MNNVL",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -449,6 +449,14 @@ def test_elastic_adapter_configuration_is_strict(monkeypatch):
         _make_adapter()
     monkeypatch.setenv("EPLB_GIN_FENCE", "signal")
     assert _make_adapter().uses_padded_layout()
+    monkeypatch.setenv("EPLB_DEBUG_TIMING", "1")
+    with pytest.warns(RuntimeWarning, match="synchronizes once per MoE invocation"):
+        assert _make_adapter().uses_padded_layout()
+    monkeypatch.setenv("EPLB_PROFILE", "1")
+    with pytest.raises(ValueError, match="EPLB_PROFILE=0"):
+        _make_adapter()
+    monkeypatch.delenv("EPLB_PROFILE")
+    monkeypatch.delenv("EPLB_DEBUG_TIMING")
     monkeypatch.setenv("EPLB_DEEPEP_ALLOW_MNNVL", "1")
     with pytest.raises(ValueError, match="legacy"):
         _make_adapter()

@@ -39,6 +39,7 @@ from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 import torch
 import torch.distributed as dist
 
+from . import profiling
 from .comm import global_rank
 
 
@@ -220,6 +221,11 @@ class BroadcastReplicaTransport:
         return grads
 
 
+def _remote_transfer_bytes(meta):
+    """Remote replica payload bytes for one pull/reduce (zero for unaccounted backends)."""
+    return meta.get("remote_payload_bytes", 0)
+
+
 def _acquire_stacks(meta, main_w, dtype, device, cs):
     """Build the per-slot effective weight stacks: main slots locally, replica slots over the transport.
 
@@ -265,7 +271,16 @@ class _ReplicaLease:
         if self._stacks is not None:
             return
         self._cs = _weight_stream(self.device)
-        self._stacks = _acquire_stacks(self.meta, self.main_w, self.dtype, self.device, self._cs)
+        with profiling.record(
+            "apply/weight_repull",
+            time_it=True,
+            device=self.device,
+            stream=self._cs,
+            payload_bytes=_remote_transfer_bytes(self.meta),
+        ):
+            self._stacks = _acquire_stacks(
+                self.meta, self.main_w, self.dtype, self.device, self._cs
+            )
         self._waited = False
 
     def wait(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -312,7 +327,13 @@ class _ReplicaWeights(torch.autograd.Function):
     @staticmethod
     def forward(ctx, meta, dtype, device, *main_w):
         ctx.meta = meta
-        return _acquire_stacks(meta, main_w, dtype, device, cs=None)
+        with profiling.record(
+            "apply/weight_move",
+            time_it=True,
+            device=device,
+            payload_bytes=_remote_transfer_bytes(meta),
+        ):
+            return _acquire_stacks(meta, main_w, dtype, device, cs=None)
 
     @staticmethod
     def backward(ctx, grad_w1_eff, grad_w2_eff):
@@ -321,9 +342,15 @@ class _ReplicaWeights(torch.autograd.Function):
         # back to per-expert parameter layout
         grad_w1_slot = grad_w1_eff.transpose(1, 2) if transpose_w else grad_w1_eff  # [S, *w1_shape]
         grad_w2_slot = grad_w2_eff.transpose(1, 2) if transpose_w else grad_w2_eff  # [S, *w2_shape]
-        grads = meta["transport"].reduce_grads(
-            meta, grad_w1_slot, grad_w2_slot, grad_w1_eff.dtype, grad_w1_eff.device
-        )
+        with profiling.record(
+            "apply/grad_move",
+            time_it=True,
+            device=grad_w1_eff.device,
+            payload_bytes=_remote_transfer_bytes(meta),
+        ):
+            grads = meta["transport"].reduce_grads(
+                meta, grad_w1_slot, grad_w2_slot, grad_w1_eff.dtype, grad_w1_eff.device
+            )
         return (None, None, None, *grads)
 
 
@@ -337,9 +364,10 @@ class _ChunkExperts(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x_pad, w1_eff, w2_eff, meta, lease):  # x_pad: [S, cap, H]
-        h_pre = torch.bmm(x_pad, w1_eff)
-        a = _activation(meta, h_pre)
-        y = torch.bmm(a, w2_eff)
+        with profiling.record("apply/expert_gemm", time_it=True, device=x_pad.device):
+            h_pre = torch.bmm(x_pad, w1_eff)
+            a = _activation(meta, h_pre)
+            y = torch.bmm(a, w2_eff)
         ctx.meta, ctx.lease = meta, lease
         ctx.save_for_backward(x_pad, h_pre)
         return y
@@ -391,6 +419,10 @@ def build_meta(
     experts in ascending id -- the order every consumer uses to line grads back up with parameters.
     """
     transport = transport or BroadcastReplicaTransport(pool)
+    remote_bytes_fn = getattr(transport, "remote_payload_bytes", None)
+    remote_payload_bytes = (
+        remote_bytes_fn() if profiling.enabled() and callable(remote_bytes_fn) else 0
+    )
     w1_shape = tuple(weight_shapes[0])
     w2_shape = tuple(weight_shapes[1])
     # slot_to_e/main_rank host lists + root_global drive the broadcast transport's host-side main-slot
@@ -419,6 +451,7 @@ def build_meta(
         "group": group,
         "pool": pool,
         "transport": transport,
+        "remote_payload_bytes": remote_payload_bytes,
     }
     main_w: List[torch.Tensor] = []
     for e in meta["main_experts"]:

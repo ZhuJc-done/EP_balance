@@ -35,12 +35,14 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from . import profiling
 from .overlap import (
     _PrefetchOnBackward,
     _ReplicaLease,
     _acquire_stacks,
     _activation,
     _comm_stream,
+    _remote_transfer_bytes,
     _weight_stream,
     build_meta,
 )
@@ -112,6 +114,7 @@ class _ManualExpertPipeline(torch.autograd.Function):
         my_rank, sent, recv, routes = (
             int(cfg["my_rank"]), cfg["sent"], cfg["recv"], cfg["routes"]
         )
+        dispatch_bytes, combine_bytes = cfg["dispatch_bytes"], cfg["combine_bytes"]
         device, dtype = payloads[0].device, payloads[0].dtype
 
         cs, ws = _comm_stream(device), _weight_stream(device)
@@ -120,7 +123,14 @@ class _ManualExpertPipeline(torch.autograd.Function):
 
         # Weight pull first, on the weight stream: it now hides behind chunk 1's dispatch below rather
         # than being an exposed prologue to the layer.
-        w1_eff, w2_eff = _acquire_stacks(meta, main_w, dtype, device, ws)
+        with profiling.record(
+            "apply/weight_move",
+            time_it=True,
+            device=device,
+            stream=ws,
+            payload_bytes=_remote_transfer_bytes(meta),
+        ):
+            w1_eff, w2_eff = _acquire_stacks(meta, main_w, dtype, device, ws)
 
         if on_cuda:
             cs.wait_stream(ms)                      # payloads were written on the compute stream
@@ -128,10 +138,17 @@ class _ManualExpertPipeline(torch.autograd.Function):
         disp_evt: List[Optional[torch.cuda.Event]] = [None] * nc
         with _sctx(cs):
             for k in range(nc):
-                recv_pl[k] = adapter.dispatch_chunk(
-                    payloads[k], sent[k], recv[k], group, tag=k,
-                    route_idx=routes[k], n_slot=n_slot, cap=cap,
-                )
+                with profiling.record(
+                    "apply/dispatch",
+                    time_it=True,
+                    device=device,
+                    stream=cs,
+                    payload_bytes=dispatch_bytes[k],
+                ):
+                    recv_pl[k] = adapter.dispatch_chunk(
+                        payloads[k], sent[k], recv[k], group, tag=k,
+                        route_idx=routes[k], n_slot=n_slot, cap=cap,
+                    )
                 if on_cuda:
                     _rec(recv_pl[k], ms)
                     disp_evt[k] = _event(on_cuda, cs)
@@ -163,8 +180,9 @@ class _ManualExpertPipeline(torch.autograd.Function):
             x_ext = recv_tokens.new_zeros((overflow + 1, H))
             x_ext.index_copy_(0, flat, recv_tokens[order])
             x_pad = x_ext[:overflow].view(n_slot, cap, H)
-            h_pre = torch.bmm(x_pad, w1_eff)
-            y_pad = torch.bmm(_activation(meta, h_pre), w2_eff)
+            with profiling.record("apply/expert_gemm", time_it=True, device=device):
+                h_pre = torch.bmm(x_pad, w1_eff)
+                y_pad = torch.bmm(_activation(meta, h_pre), w2_eff)
             y_sorted = y_pad.reshape(overflow, H)[flat.clamp(max=overflow - 1)]
             y_sorted = y_sorted * valid_sorted.unsqueeze(1).to(y_sorted.dtype)
             y = y_sorted.new_empty((T, H))
@@ -178,7 +196,14 @@ class _ManualExpertPipeline(torch.autograd.Function):
             with _sctx(cs):
                 if on_cuda:
                     cs.wait_event(comp_evt)
-                comb[k] = adapter.combine_chunk(y, sent[k], recv[k], group, tag=k)
+                with profiling.record(
+                    "apply/combine",
+                    time_it=True,
+                    device=device,
+                    stream=cs,
+                    payload_bytes=combine_bytes[k],
+                ):
+                    comb[k] = adapter.combine_chunk(y, sent[k], recv[k], group, tag=k)
                 if on_cuda:
                     _rec(comb[k], ms)
             cfg["state"].append(adapter.chunk_state(k))   # replay info for this chunk's transpose legs
@@ -284,7 +309,14 @@ class _ManualExpertPipeline(torch.autograd.Function):
             _rec(gw1, ws)
             _rec(gw2, ws)
         with _sctx(ws):
-            grads = meta["transport"].reduce_grads(meta, gw1, gw2, dtype, device)
+            with profiling.record(
+                "apply/grad_move",
+                time_it=True,
+                device=device,
+                stream=ws,
+                payload_bytes=_remote_transfer_bytes(meta),
+            ):
+                grads = meta["transport"].reduce_grads(meta, gw1, gw2, dtype, device)
             if on_cuda:
                 for g in grads:
                     _rec(g, ms)
@@ -335,6 +367,8 @@ class ManualMoEBlock:
         sent: Sequence[torch.Tensor],
         recv: Sequence[torch.Tensor],
         routes: Sequence[torch.Tensor],
+        dispatch_bytes: Sequence[torch.Tensor],
+        combine_bytes: Sequence[torch.Tensor],
         *,
         adapter,
         group,
@@ -348,6 +382,7 @@ class ManualMoEBlock:
             "nc": len(payloads), "meta": self.meta, "adapter": adapter, "group": group,
             "cap": cap, "n_slot": n_slot, "H": H, "pad_cols": pad_cols, "my_rank": my_rank,
             "sent": list(sent), "recv": list(recv), "routes": list(routes),
+            "dispatch_bytes": list(dispatch_bytes), "combine_bytes": list(combine_bytes),
             "lease": self.lease, "state": [],
         }
         # one consumer for the lease: the single node now owns every chunk's backward

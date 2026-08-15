@@ -1,7 +1,9 @@
 # Scale-EPLB cluster scripts
 
-Run MoE on real Megatron-LM with Scale-EPLB, in two stages selected by `EPLB_MODE`:
+Run MoE on real Megatron-LM with three behaviors selected by `EPLB_MODE`:
 
+- **Baseline (`off`)** — execute Megatron's native MoE path unchanged; optional timing wrappers
+  observe its router, token dispatch, experts, and combine methods.
 - **Phase B (`observe`)** — attach forward-hook observers to capture real routing,
   solve, and log/verify each forward; **dispatch unchanged**, no Megatron source
   edits. Validates solver latency (E2) and bit-identical plans (E3) on real routing.
@@ -239,6 +241,80 @@ python eval/plot_solver_scaling.py --input-dir logs/solver_scaling_patience_all
 Use an idle GPU for timing; unrelated kernels contaminate CUDA-event latency.
 Select the benchmark device with `CUDA_DEVICE=<id>`.
 
+For a compact forward-path breakdown of each MoE invocation, enable debug timing in any mode:
+
+```bash
+# Pure Megatron baseline: native router / dispatcher / experts remain unchanged.
+EPLB_MODE=off EPLB_DEBUG_TIMING=1 \
+  bash scripts/run_real_moe.sh
+# [EPLB-debug r0] mode=off layer=0 mb=0 solver=n/a omega_gather=n/a \
+#   router=0.391ms expert_transfer=n/a dispatch=2.107ms \
+#   expert_gemm=4.936ms combine=1.988ms
+
+# Native Megatron execution plus Ω collection and the EPLB solver; plan is not applied.
+EPLB_MODE=observe EPLB_DEBUG_TIMING=1 \
+  bash scripts/run_real_moe.sh
+
+# Scale-EPLB dispatcher.
+EPLB_MODE=apply EPLB_DEBUG_TIMING=1 \
+  bash scripts/run_real_moe.sh
+# [EPLB-debug r0] mode=apply layer=0 mb=0 ... \
+#   expert_transfer=1.824ms/512.00MiB/294.36GB/s \
+#   dispatch=2.107ms/64.00MiB/31.86GB/s ... \
+#   combine=1.988ms/64.00MiB/33.75GB/s
+# [EPLB-debug r0] mode=apply direction=backward \
+#   expert_repull=1.791ms/512.00MiB/299.71GB/s \
+#   expert_grad_reduce=2.031ms/512.00MiB/264.30GB/s
+```
+
+`EPLB_DEBUG_TIMING=1` synchronizes at each invocation boundary so that one line contains only
+that layer/micro-batch. It is for diagnosis; do not quote the instrumented run's end-to-end step
+time. `off` and `observe` wrap the native Megatron leaf methods without replacing
+`MoELayer.forward`; `expert_transfer=n/a` is expected because native Megatron does not replicate
+expert weights. `off` also reports `solver=n/a` and `omega_gather=n/a`. Launch through
+`run_real_moe.sh` (or `pretrain_eplb_moe.py`): invoking Megatron's unmodified `pretrain_gpt.py`
+directly does not install these wrappers.
+
+Set `EPLB_PROFILE_ALL_RANKS=1` to print one line per rank. Under `EPLB_CHUNKS>=2`, an `(xN)`
+suffix means the displayed value is the sum of the `N` chunk events. Dispatch, expert GEMM,
+combine, and expert transfer can overlap in the apply pipeline, so their values are not additive.
+Backward GIN re-pull and gradient-reduce samples are emitted at the next forward boundary (and
+flushed at process exit), because they occur after that layer's forward line.
+
+Transfer fields also report logical remote payload and effective payload bandwidth:
+
+```text
+GB/s = payload_bytes / (elapsed_ms * 1e6)
+```
+
+For GIN/TMA, payload is the sum of `W1 + W2` bytes for this rank's remote replica slots; local
+main-owned slots are excluded. `expert_transfer` is the forward pull, `expert_repull` is the
+backward pull, and `expert_grad_reduce` is the gradient put/reduce-to-main. Their elapsed times
+cover the complete runtime operation (fences, staging and local reduction where applicable), so
+the result is end-to-end effective bandwidth rather than a raw copy-engine peak.
+
+For token transport, payload counts only routing units whose destination is another rank.
+Dispatch includes the transported row's metadata/alignment padding; DeepEP combine includes its
+aligned row width. DeepEP protocol headers and the separately transported top-k index are not
+counted. Therefore the printed number is **effective tensor-payload bandwidth**, not physical
+NVLink/InfiniBand wire bandwidth. Obtain the latter from NVLink/NIC performance counters.
+
+In a hybrid run, TMA/LSA and GIN descriptors execute inside the same batched kernel, so one elapsed
+time cannot identify separate TMA and GIN bandwidths. Benchmark them independently:
+
+```bash
+# All remote peers in one LSA team: TMA/NVLink weight path.
+EPLB_MODE=apply EPLB_WEIGHT_COMM=gin EPLB_GIN_LSA=1 EPLB_DEBUG_TIMING=1 \
+  bash scripts/run_real_moe.sh
+
+# Force every remote descriptor through network GIN.
+EPLB_MODE=apply EPLB_WEIGHT_COMM=gin EPLB_GIN_LSA=0 EPLB_DEBUG_TIMING=1 \
+  bash scripts/run_real_moe.sh
+```
+
+For a distributed aggregate, collect every rank and compute
+`sum(payload_bytes across ranks) / max(elapsed time across ranks)`. Do not sum per-rank GB/s.
+
 `EPLB_PROFILE=1` emits a periodic per-region summary. CUDA events are **queued** and
 resolved in one batch, so timing injects no per-region host sync — an instrumented run
 and an undisturbed end-to-end step time can come from the same job.
@@ -250,8 +326,16 @@ and an undisturbed end-to-end step time can come from the same job.
 | `apply/route` | router, plus flattening top-k selections into routing units |
 | `apply/dispatch` | Stage 2 token all-to-all |
 | `apply/expert_compute` | Stage 4 replica materialisation + batched expert MLP |
+| `apply/expert_gemm` | only the two batched expert GEMMs and activation |
 | `apply/combine` | Stage 5 output all-to-all |
-| `apply/weight_move` | replica weight broadcast / GIN pull (nested inside expert compute) |
+| `apply/weight_move` | replica weight broadcast / GIN pull; may overlap token communication |
+| `apply/weight_repull` | backward replica-weight re-pull on the weight stream |
+| `apply/grad_move` | replica gradient put/reduce-to-main |
+| `native/route` | Megatron router forward (`off` / `observe`) |
+| `native/dispatch` | Megatron `token_dispatch` communication |
+| `native/expert_gemm` | Megatron native experts module |
+| `native/combine` | Megatron `token_combine` communication |
+| `native/shared_expert` | native shared-expert module when it executes serially |
 
 A synchronous EP step is paced by its slowest rank, so straggler analysis needs
 **every** rank to report, not just rank 0:
@@ -277,6 +361,11 @@ grep 'peak memory' logs/nslot_*.log
 the launcher fails fast with an explicit error. Under Level A (`EPLB_REMATERIALIZE=1`)
 the `apply/weight_move` count includes the backward recompute — that doubling is exactly
 what re-materialisation trades for memory.
+
+Elastic/GIN runs normally require `EPLB_PROFILE=0 PROFILE_TRACE=0` to preserve the zero-sync
+contract. `EPLB_DEBUG_TIMING=1` is the explicit diagnostic exception: it is accepted and prints
+the same breakdown, but the launcher warns that the run is no longer a zero-sync throughput
+measurement.
 
 ### Apply-mode memory: what actually allocates
 
@@ -339,10 +428,11 @@ for Python/CPU call stacks, `PROFILE_SHAPES=1` for tensor shapes. The launcher e
 resolved trace path. **Set `PROFILE_DIR` per run** when comparing modes or sweeping: the file is
 named only by rank, so two runs sharing a `PROFILE_DIR` overwrite each other.
 
-Only the `apply` trace shows the EP path Scale-EPLB replaces (`apply/dispatch`,
-`apply/expert_compute`, `apply/combine`, `apply/weight_move`). An `observe` trace has just
-`eplb/solve` and `eplb/all_gather_omega` laid over Megatron's own dispatcher, which is the
-right picture for costing the solver but not for the end-to-end breakdown.
+The `off` and `observe` traces expose Megatron's unchanged native path as `native/route`,
+`native/dispatch`, `native/expert_gemm`, and `native/combine`; `observe` additionally shows
+`solve` and `all_gather_omega`. The `apply` trace exposes the replacement path as
+`apply/dispatch`, `apply/expert_compute`, `apply/expert_gemm`, `apply/combine`, and
+`apply/weight_move`.
 
 Keep the window short (2–3 steps) and start it past step ~5: the first iterations pay CUDA-solver
 JIT and cuBLAS autotuning, and `PROFILE_STACK=1` inflates the trace enough to distort the step

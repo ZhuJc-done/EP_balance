@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import types
+import warnings
 from typing import Dict, List, Tuple
 
 import torch
@@ -45,6 +46,13 @@ def _make_adapter():
             raise ValueError("zero-sync ElasticBuffer mode requires EPLB_GIN_FENCE=signal")
         if _env_flag("EPLB_PROFILE") or _env_flag("PROFILE_TRACE"):
             raise ValueError("zero-sync ElasticBuffer mode requires EPLB_PROFILE=0 and PROFILE_TRACE=0")
+        if _env_flag("EPLB_DEBUG_TIMING"):
+            warnings.warn(
+                "EPLB_DEBUG_TIMING synchronizes once per MoE invocation; use its phase timings "
+                "for diagnosis only, not its end-to-end throughput",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return DeepEPAdapter()
     if name in ("", "alltoall", "all_to_all", "a2a"):
         return AllToAllAdapter()
@@ -132,6 +140,7 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
     reb = cfg["reb"]
     group = cfg["group"]
     spec: ProblemSpec = reb.spec
+    profiling.begin_debug_window()
 
     in_shape = hidden_states.shape
     tokens = hidden_states.reshape(-1, in_shape[-1])
@@ -175,7 +184,10 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
         gated=cfg["gated"], act=cfg["act"], transpose_w=True,
     )
     if profiling.enabled():
-        profiling.maybe_summary(print if (ep_rank == 0 or profiling.all_ranks()) else None)
+        profiling.maybe_summary(
+            print if (ep_rank == 0 or profiling.all_ranks()) else None,
+            context=f"mode=apply layer={cfg['layer_id']} mb={mb}",
+        )
     out = out.reshape(in_shape)
     if shared_expert_output is not None:
         out = out + shared_expert_output
