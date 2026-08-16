@@ -40,24 +40,6 @@ configure_model_recipe() {
   MODEL_DEFAULT_ROUTER_BALANCING="aux_loss"
 
   case "${model}" in
-    mixtral8x7b)
-      _configure_depth 32 0 || return
-      MODEL_ARGS=(
-        --use-mcore-models --disable-bias-linear --untie-embeddings-and-output-weights
-        --seq-length "${SEQ_LEN:-4096}" --max-position-embeddings 32768
-        --num-layers "${MODEL_NUM_LAYERS}" --hidden-size 4096 --ffn-hidden-size 14336
-        --num-attention-heads 32 --group-query-attention --num-query-groups 8
-        --normalization RMSNorm --position-embedding-type rope --rotary-base 1000000
-        --swiglu --no-masked-softmax-fusion --no-position-embedding
-        --attention-dropout 0.0 --hidden-dropout 0.0
-      )
-      MOE_ARGS=(
-        --num-experts 8 --moe-router-topk 2
-        --moe-router-load-balancing-type aux_loss --moe-aux-loss-coeff 1e-2
-        --moe-token-dispatcher-type alltoall --moe-layer-freq "${MODEL_MOE_PATTERN}"
-      )
-      ;;
-
     qwen3_30b_a3b)
       _configure_depth 48 0 || return
       # Megatron Bridge Qwen checkpoints store this RMSNorm as
@@ -148,7 +130,7 @@ configure_model_recipe() {
       ;;
 
     *)
-      echo "unknown MODEL=${model} (expected qwen3_30b_a3b | mixtral8x7b | deepseek_v2_160e | glm45_air)" >&2
+      echo "unknown MODEL=${model} (expected qwen3_30b_a3b | deepseek_v2_160e | glm45_air)" >&2
       return 1
       ;;
   esac

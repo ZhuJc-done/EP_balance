@@ -21,14 +21,13 @@ Run MoE on real Megatron-LM with three behaviors selected by `EPLB_MODE`:
 | `run_gb200_4x4.sh` | Multi-node 4 nodes x 4 GB200 launcher: Slurm auto-discovery + GB200 NCCL/RDMA env; mock-data smoke test by default, `REAL=1` forwards to `run_real_moe.sh`. |
 | `sbatch_gb200_4x4.sbatch` | Slurm wrapper (`sbatch`) that `srun`s `run_gb200_4x4.sh` (1 task/node). |
 | `run_real_moe.sh` | Real-model launcher; `REAL=1` from `run_gb200_4x4.sh` forwards here. `MOCK=1` = mock-data + random init; `MOCK=0 FROM_SCRATCH=1` = real data + random init; `DEEPEP=1` = native DeepEP dispatch. |
-| `model_recipes.sh` | Architecture presets for Mixtral, Qwen3, 160E DeepSeek-V2, and 128E GLM-4.5-Air, with launch-time depth override. |
+| `model_recipes.sh` | Architecture presets for Qwen3, 160E DeepSeek-V2, and 128E GLM-4.5-Air, with launch-time depth override. |
 | `run_slot_sweep.sh` | Sweep `N_slot=1..4` with workload seed 0 and save one non-detail baseline JSON per configuration; uses a fixed LPLB Ring topology. |
 | `run_solver_scaling.sh` | Sweep the Scale-EPLB CUDA solver over logical rank and expert counts and save hot-kernel JSON results. |
 | `prepare_open_workload.py` | Download task/corpus workloads, extract model inputs, and optionally build Megatron `.bin/.idx`. |
 | `eval/plot_solver_scaling.py` | Read an existing solver-scaling JSON directory and independently generate PNG/PDF plots. |
 | `install_megatron.sh` | Clone+install pinned community Megatron-LM, self-check `import megatron`. |
 | `install_deepep.sh` | Optional: clone+build DeepEP (NCCL Gin backend) for the sync-free transport. |
-| `convert_hf_to_mcore.sh` | Optional: convert HF Mixtral to mcore. Qwen3 needs a preconverted Megatron Bridge checkpoint. |
 
 > **Install** (clone + `install_megatron.sh` / `install_deepep.sh` + `pip install -e`)
 > lives in the [top-level README](../README.md#cluster-install-megatron-integration). This file is the
@@ -40,7 +39,6 @@ Select the architecture with one environment variable:
 
 ```bash
 MODEL=qwen3_30b_a3b
-MODEL=mixtral8x7b
 MODEL=deepseek_v2_160e
 MODEL=glm45_air
 ```
@@ -143,17 +141,10 @@ python scripts/prepare_open_workload.py \
 ```
 
 Qwen3 training needs an already converted Megatron Bridge checkpoint. Store it
-at `${EPLB_CHECKPOINT_DIR}/qwen3_30b_a3b_mcore`. The pinned community
-Megatron converter does not contain a Qwen3 loader. For Mixtral, use:
-
-```bash
-source scripts/env_hdfs.sh
-MEGATRON_DIR="${HOME}/Megatron-LM" \
-HF_MODEL=mistralai/Mixtral-8x7B-v0.1 \
-TOKENIZER_MODEL=/path/to/local/tokenizer.model \
-SAVE_DIR="${EPLB_CHECKPOINT_DIR}/mixtral8x7b_mcore" \
-TP=1 EP=8 bash scripts/convert_hf_to_mcore.sh
-```
+at `${EPLB_CHECKPOINT_DIR}/qwen3_30b_a3b_mcore`. The pinned community Megatron
+converter does not contain a Qwen3 loader; use Megatron Bridge's
+`examples/conversion/convert_checkpoints.py import` instead. `FROM_SCRATCH=1`
+skips the checkpoint entirely and random-initializes the model.
 
 ## Phase B — observe (recommended first)
 
@@ -497,8 +488,8 @@ done
 Two caveats. Megatron randomises the logits themselves on this path, so the **loss is
 meaningless** under `ROUTER_SKEW` — never use it for the loss-curve comparison, only for step
 time and imbalance. And the skew is synthetic: pair the sweep with one real-checkpoint run
-(use `convert_hf_to_mcore.sh` for Mixtral, or a preconverted Megatron Bridge checkpoint for
-Qwen3) to show the operating point a trained router actually lands on.
+(a preconverted Megatron Bridge checkpoint for Qwen3) to show the operating point a trained
+router actually lands on.
 
 Token dropping is off by design: the launcher never passes `--moe-expert-capacity-factor`, and
 unset means every routed token reaches its expert (`transformer_config.py`: "None means no token

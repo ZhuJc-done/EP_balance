@@ -57,7 +57,7 @@ SAVE_DIR="${SAVE_DIR:-}"                    # optional: where to write new check
 
 # --- which open model (architecture recipe) ----------------------------------
 MODEL="${MODEL:-qwen3_30b_a3b}"
-# qwen3_30b_a3b | mixtral8x7b | deepseek_v2_160e | glm45_air
+# qwen3_30b_a3b | deepseek_v2_160e | glm45_air
 
 # --- cluster topology (4x GB200 = 4 nodes x 4 GPUs by default) ----------------
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
