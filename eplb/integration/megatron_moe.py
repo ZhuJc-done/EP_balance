@@ -4,20 +4,38 @@ from __future__ import annotations
 
 import os
 import types
-from typing import Dict, List, Tuple
+import warnings
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
 from . import profiling
 from ..problem import ProblemSpec
-from .grouped_mlp import make_batched_gated_mlp
+from .grouped_mlp import make_batched_gated_mlp, make_grouped_gated_mlp, ragged_available
 from .eplb_manager import AllToAllAdapter, DeepEPAdapter, sync_free_moe_forward
 
 
 def _env_flag(name: str) -> bool:
     """Truthy parse of an on/off environment toggle."""
     return os.environ.get(name, "0").lower() not in ("0", "", "false", "no")
+
+
+def _env_cap() -> Optional[int]:
+    """``EPLB_CAP`` as a positive int, or None when unset -- the ragged path needs no cap."""
+    cap = int(os.environ.get("EPLB_CAP", "0") or "0")
+    return cap if cap > 0 else None
+
+
+def _env_max_recv_rows() -> Optional[int]:
+    """``EPLB_MAX_RECV_ROWS`` as a positive int, or None to keep the transport's worst-case rows.
+
+    Bounds this rank's *total* received rows, so a sane value is a margin over the balanced
+    expectation ``tokens_per_rank * topk / EPLB_CHUNKS``, not the worst case the buffer is sized
+    for. Too low is caught on device rather than silently dropping tokens.
+    """
+    rows = int(os.environ.get("EPLB_MAX_RECV_ROWS", "0") or "0")
+    return rows if rows > 0 else None
 
 
 def _make_adapter():
@@ -36,15 +54,24 @@ def _make_adapter():
                 "legacy DeepEP Buffer settings are not supported by ElasticBuffer: "
                 + ", ".join(legacy)
             )
-        cap = int(os.environ.get("EPLB_CAP", "0") or "0")
-        if cap <= 0:
-            raise ValueError("EPLB_ADAPTER=deepep requires a positive host-static EPLB_CAP")
+        if _env_cap() is None and not ragged_available():
+            raise ValueError(
+                "EPLB_ADAPTER=deepep requires a positive host-static EPLB_CAP unless the ragged "
+                "grouped GEMM is available (CUDA SM90+ bf16, EPLB_GROUPED_GEMM != 0)"
+            )
         if os.environ.get("EPLB_WEIGHT_COMM", "").strip().lower() != "gin":
             raise ValueError("zero-sync ElasticBuffer mode requires EPLB_WEIGHT_COMM=gin")
         if os.environ.get("EPLB_GIN_FENCE", "").strip().lower() != "signal":
             raise ValueError("zero-sync ElasticBuffer mode requires EPLB_GIN_FENCE=signal")
         if _env_flag("EPLB_PROFILE") or _env_flag("PROFILE_TRACE"):
             raise ValueError("zero-sync ElasticBuffer mode requires EPLB_PROFILE=0 and PROFILE_TRACE=0")
+        if _env_flag("EPLB_DEBUG_TIMING"):
+            warnings.warn(
+                "EPLB_DEBUG_TIMING synchronizes once per MoE invocation; use its phase timings "
+                "for diagnosis only, not its end-to-end throughput",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return DeepEPAdapter()
     if name in ("", "alltoall", "all_to_all", "a2a"):
         return AllToAllAdapter()
@@ -132,11 +159,17 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
     reb = cfg["reb"]
     group = cfg["group"]
     spec: ProblemSpec = reb.spec
+    profiling.begin_debug_window()
 
     in_shape = hidden_states.shape
     tokens = hidden_states.reshape(-1, in_shape[-1])
     if isinstance(cfg["adapter"], DeepEPAdapter) and tokens.dtype != torch.bfloat16:
         raise TypeError(f"ElasticBuffer apply mode requires BF16 hidden states, got {tokens.dtype}")
+
+    shared_expert_output = None
+    if getattr(self, "use_shared_expert", False):
+        with profiling.record("apply/shared_expert", time_it=True, device=tokens.device):
+            shared_expert_output = self.shared_experts_compute(hidden_states)
 
     with profiling.record("apply/route", time_it=True, device=tokens.device):
         probs, routing_map = self.router(hidden_states)
@@ -164,14 +197,22 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
         unit_prob=unit_prob.to(tokens.dtype),
         plan=plan, spec=spec, weights_local=weights_local,
         weight_shapes=weight_shapes, batched_mlp_fn=cfg["batched_mlp_fn"],
-        cap=int(os.environ["EPLB_CAP"]) if isinstance(cfg["adapter"], DeepEPAdapter) else None,
+        cap=_env_cap() if isinstance(cfg["adapter"], DeepEPAdapter) else None,
+        grouped_mlp_fn=cfg.get("grouped_mlp_fn"),
+        max_recv_rows=_env_max_recv_rows(),
         group=group, adapter=cfg["adapter"],
         rematerialize=cfg["rematerialize"], overlap=cfg["overlap"],
         gated=cfg["gated"], act=cfg["act"], transpose_w=True,
     )
     if profiling.enabled():
-        profiling.maybe_summary(print if (ep_rank == 0 or profiling.all_ranks()) else None)
-    return out.reshape(in_shape), None
+        profiling.maybe_summary(
+            print if (ep_rank == 0 or profiling.all_ranks()) else None,
+            context=f"mode=apply layer={cfg['layer_id']} mb={mb}",
+        )
+    out = out.reshape(in_shape)
+    if shared_expert_output is not None:
+        out = out + shared_expert_output
+    return out, None
 
 
 def bind_eplb_to_moe_layer(moe_layer, rebalancer, ep_group, layer_id: int = 0) -> None:
@@ -184,6 +225,18 @@ def bind_eplb_to_moe_layer(moe_layer, rebalancer, ep_group, layer_id: int = 0) -
         layer_id: Stable id used as the rebalancer's ring-buffer key.
     """
     config = moe_layer.config
+    if getattr(moe_layer, "use_shared_expert", False):
+        if getattr(moe_layer, "shared_expert_overlap", False):
+            raise NotImplementedError(
+                "EPLB apply mode supports shared experts only with "
+                "moe_shared_expert_overlap=False; the EPLB dispatcher replaces "
+                "Megatron's token dispatcher and cannot drive its overlap state machine."
+            )
+        if not callable(getattr(moe_layer, "shared_experts_compute", None)):
+            raise NotImplementedError(
+                "this Megatron MoELayer exposes shared experts but no "
+                "shared_experts_compute method"
+            )
     adapter = _make_adapter()
     if isinstance(adapter, DeepEPAdapter):
         topk = getattr(config, "moe_router_topk", None)
@@ -199,6 +252,7 @@ def bind_eplb_to_moe_layer(moe_layer, rebalancer, ep_group, layer_id: int = 0) -
         "gated": gated,
         "act": act,
         "batched_mlp_fn": make_batched_gated_mlp(gated, act),
+        "grouped_mlp_fn": make_grouped_gated_mlp(gated, act),
         "adapter": adapter,
         "rematerialize": _env_flag("EPLB_REMATERIALIZE"),
         "overlap": _env_flag("EPLB_OVERLAP"),

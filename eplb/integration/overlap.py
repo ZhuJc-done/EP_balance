@@ -39,7 +39,19 @@ from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 import torch
 import torch.distributed as dist
 
+from . import profiling
 from .comm import global_rank
+from .grouped_mlp import (
+    compact_rows,
+    mask_rows,
+    ragged_enabled,
+    ragged_expert_ok,
+    ragged_mm,
+    ragged_mm_tn,
+    scatter_rows,
+    slot_offsets,
+    slot_sort,
+)
 
 
 class WeightPool:
@@ -220,6 +232,11 @@ class BroadcastReplicaTransport:
         return grads
 
 
+def _remote_transfer_bytes(meta):
+    """Remote replica payload bytes for one pull/reduce (zero for unaccounted backends)."""
+    return meta.get("remote_payload_bytes", 0)
+
+
 def _acquire_stacks(meta, main_w, dtype, device, cs):
     """Build the per-slot effective weight stacks: main slots locally, replica slots over the transport.
 
@@ -265,7 +282,16 @@ class _ReplicaLease:
         if self._stacks is not None:
             return
         self._cs = _weight_stream(self.device)
-        self._stacks = _acquire_stacks(self.meta, self.main_w, self.dtype, self.device, self._cs)
+        with profiling.record(
+            "apply/weight_repull",
+            time_it=True,
+            device=self.device,
+            stream=self._cs,
+            payload_bytes=_remote_transfer_bytes(self.meta),
+        ):
+            self._stacks = _acquire_stacks(
+                self.meta, self.main_w, self.dtype, self.device, self._cs
+            )
         self._waited = False
 
     def wait(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -312,7 +338,13 @@ class _ReplicaWeights(torch.autograd.Function):
     @staticmethod
     def forward(ctx, meta, dtype, device, *main_w):
         ctx.meta = meta
-        return _acquire_stacks(meta, main_w, dtype, device, cs=None)
+        with profiling.record(
+            "apply/weight_move",
+            time_it=True,
+            device=device,
+            payload_bytes=_remote_transfer_bytes(meta),
+        ):
+            return _acquire_stacks(meta, main_w, dtype, device, cs=None)
 
     @staticmethod
     def backward(ctx, grad_w1_eff, grad_w2_eff):
@@ -321,9 +353,15 @@ class _ReplicaWeights(torch.autograd.Function):
         # back to per-expert parameter layout
         grad_w1_slot = grad_w1_eff.transpose(1, 2) if transpose_w else grad_w1_eff  # [S, *w1_shape]
         grad_w2_slot = grad_w2_eff.transpose(1, 2) if transpose_w else grad_w2_eff  # [S, *w2_shape]
-        grads = meta["transport"].reduce_grads(
-            meta, grad_w1_slot, grad_w2_slot, grad_w1_eff.dtype, grad_w1_eff.device
-        )
+        with profiling.record(
+            "apply/grad_move",
+            time_it=True,
+            device=grad_w1_eff.device,
+            payload_bytes=_remote_transfer_bytes(meta),
+        ):
+            grads = meta["transport"].reduce_grads(
+                meta, grad_w1_slot, grad_w2_slot, grad_w1_eff.dtype, grad_w1_eff.device
+            )
         return (None, None, None, *grads)
 
 
@@ -336,37 +374,38 @@ class _ChunkExperts(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x_pad, w1_eff, w2_eff, meta, lease):  # x_pad: [S, cap, H]
-        h_pre = torch.bmm(x_pad, w1_eff)
-        a = _activation(meta, h_pre)
-        y = torch.bmm(a, w2_eff)
-        ctx.meta, ctx.lease = meta, lease
-        ctx.save_for_backward(x_pad, h_pre)
+    def forward(ctx, x, w1_eff, w2_eff, meta, lease, offs):  # x: [S, cap, H] padded / [T, H] ragged
+        with profiling.record("apply/expert_gemm", time_it=True, device=x.device):
+            h_pre = ragged_mm(x, w1_eff, offs)
+            a = _activation(meta, h_pre)
+            y = ragged_mm(a, w2_eff, offs)
+        ctx.meta, ctx.lease, ctx.offs = meta, lease, offs
+        ctx.save_for_backward(x, h_pre)
         return y
 
     @staticmethod
-    def backward(ctx, grad_y):  # grad_y: [S, cap, H]
-        meta, lease = ctx.meta, ctx.lease
-        x_pad, h_pre = ctx.saved_tensors
+    def backward(ctx, grad_y):
+        meta, lease, offs = ctx.meta, ctx.lease, ctx.offs
+        x, h_pre = ctx.saved_tensors
         lease.start()      # no-op if the block's backward pre-hook already kicked the pull off
 
         # --- Wgrad of GEMM-2 needs no weight -> overlaps the in-flight re-acquisition ---
-        a = _activation(meta, h_pre)                                   # [S, cap, F]
-        grad_w2_eff = torch.bmm(a.transpose(1, 2), grad_y)             # [S, F, H]
+        a = _activation(meta, h_pre)
+        grad_w2_eff = ragged_mm_tn(a, grad_y, offs)                    # [S, F, H]
 
         w1_eff, w2_eff = lease.wait()                                  # replica weights are now needed
 
         # --- Dgrad chain (needs weights) ---
-        grad_a = torch.bmm(grad_y, w2_eff.transpose(1, 2))            # [S, cap, F]
+        grad_a = ragged_mm(grad_y, w2_eff.transpose(1, 2), offs)
         with torch.enable_grad():
             hp = h_pre.detach().requires_grad_(True)
             a_g = _activation(meta, hp)
-            (grad_h_pre,) = torch.autograd.grad(a_g, hp, grad_a)      # [S, cap, Fout]
-        grad_w1_eff = torch.bmm(x_pad.transpose(1, 2), grad_h_pre)    # [S, H, Fout]
-        grad_x = torch.bmm(grad_h_pre, w1_eff.transpose(1, 2))        # [S, cap, H]
+            (grad_h_pre,) = torch.autograd.grad(a_g, hp, grad_a)
+        grad_w1_eff = ragged_mm_tn(x, grad_h_pre, offs)                # [S, H, Fout]
+        grad_x = ragged_mm(grad_h_pre, w1_eff.transpose(1, 2), offs)
 
         lease.release()
-        return (grad_x, grad_w1_eff, grad_w2_eff, None, None)
+        return (grad_x, grad_w1_eff, grad_w2_eff, None, None, None)
 
 
 def build_meta(
@@ -391,6 +430,10 @@ def build_meta(
     experts in ascending id -- the order every consumer uses to line grads back up with parameters.
     """
     transport = transport or BroadcastReplicaTransport(pool)
+    remote_bytes_fn = getattr(transport, "remote_payload_bytes", None)
+    remote_payload_bytes = (
+        remote_bytes_fn() if profiling.enabled() and callable(remote_bytes_fn) else 0
+    )
     w1_shape = tuple(weight_shapes[0])
     w2_shape = tuple(weight_shapes[1])
     # slot_to_e/main_rank host lists + root_global drive the broadcast transport's host-side main-slot
@@ -419,6 +462,7 @@ def build_meta(
         "group": group,
         "pool": pool,
         "transport": transport,
+        "remote_payload_bytes": remote_payload_bytes,
     }
     main_w: List[torch.Tensor] = []
     for e in meta["main_experts"]:
@@ -480,20 +524,32 @@ class OverlappedExperts:
         recv_tokens: torch.Tensor,
         recv_slot: torch.Tensor,
         group_sizes: torch.Tensor,
-        cap: int,
+        cap: Optional[int] = None,
         valid_mask: Optional[torch.Tensor] = None,
+        max_recv_rows: Optional[int] = None,
     ) -> torch.Tensor:
         """Expert compute for one chunk of received tokens; returns them in ``recv_tokens`` order."""
         T, H = recv_tokens.shape
         n_slot, device = self.n_slot, recv_tokens.device
-        if valid_mask is None:
-            valid_mask = torch.ones(T, dtype=torch.bool, device=device)
-        else:
-            valid_mask = valid_mask.to(torch.bool)
-        sort_slot = torch.where(valid_mask, recv_slot, torch.full_like(recv_slot, n_slot))
-        order = torch.argsort(sort_slot, stable=True)
-        slot_sorted = sort_slot[order]
-        valid_sorted = valid_mask[order]
+        order, valid_sorted, slot_sorted = slot_sort(recv_slot, n_slot, valid_mask)
+
+        if ragged_enabled(recv_tokens) and ragged_expert_ok(
+            H, recv_tokens.element_size(), self.w1_eff, self.w2_eff, self.meta["gated"]
+        ):
+            order, valid_sorted = compact_rows(order, valid_sorted, group_sizes, max_recv_rows)
+            # Sorting already grouped the rows; masking keeps the trailing worst-case rows out of
+            # Dgrad, whose slots the grouped GEMM leaves unwritten.
+            x = mask_rows(recv_tokens.index_select(0, order), valid_sorted)
+            self.lease.expect_consumer()
+            y_sorted = _ChunkExperts.apply(
+                x, self.w1_eff, self.w2_eff, self.meta, self.lease,
+                slot_offsets(group_sizes, order.shape[0]),
+            )
+            y_sorted = mask_rows(y_sorted, valid_sorted)
+            return scatter_rows(y_sorted, order, T)
+
+        if cap is None:
+            raise ValueError("the padded expert path needs a host-static cap")
         safe_slot = slot_sorted.clamp(max=n_slot - 1)
         seg_start = torch.zeros(n_slot, dtype=torch.int64, device=device)
         if n_slot > 1:
@@ -511,11 +567,10 @@ class OverlappedExperts:
         x_pad = x_ext[:overflow].view(n_slot, cap, H)
 
         self.lease.expect_consumer()
-        y_pad = _ChunkExperts.apply(x_pad, self.w1_eff, self.w2_eff, self.meta, self.lease)
+        y_pad = _ChunkExperts.apply(x_pad, self.w1_eff, self.w2_eff, self.meta, self.lease, None)
         out_sorted = y_pad.reshape(overflow, H)[flat_idx.clamp(max=overflow - 1)]
         out_sorted = out_sorted * valid_sorted.unsqueeze(1).to(out_sorted.dtype)
-        out = out_sorted.new_empty((T, H))
-        return out.index_copy(0, order, out_sorted)
+        return scatter_rows(out_sorted, order, T)
 
 
 def overlapped_grouped_expert_mlp(
@@ -527,7 +582,7 @@ def overlapped_grouped_expert_mlp(
     main_rank: torch.Tensor,
     replicated: Sequence[int],
     weight_shapes: Sequence[torch.Size],
-    cap: int,
+    cap: Optional[int] = None,
     *,
     gated: bool,
     act: Callable,
@@ -538,6 +593,7 @@ def overlapped_grouped_expert_mlp(
     pool: WeightPool = _POOL,
     transport: "Optional[ReplicaTransport]" = None,
     valid_mask: Optional[torch.Tensor] = None,
+    max_recv_rows: Optional[int] = None,
 ) -> torch.Tensor:
     """Single-chunk :class:`OverlappedExperts`: grouped expert MLP whose backward re-acquires the weights.
 
@@ -550,7 +606,7 @@ def overlapped_grouped_expert_mlp(
         main_rank: int64 ``[E]`` group-local main rank of each expert.
         replicated: experts with more than one replica (need broadcast + reduce).
         weight_shapes: per-expert ``[(W1_shape), (W2_shape)]`` in parameter layout.
-        cap: per-slot capacity (host-static).
+        cap: per-slot capacity (host-static); only needed on the padded fallback path.
         gated: whether GEMM-1 is gated (SwiGLU-style).
         act: activation function.
         transpose_w: True if weights are stored ``[out, in]`` (Megatron) and used as ``x @ W.t()``.
@@ -559,6 +615,8 @@ def overlapped_grouped_expert_mlp(
         group: EP process group.
         pool: scratch buffer pool reused across layers.
         transport: replica-weight transport (defaults to :class:`BroadcastReplicaTransport`).
+        max_recv_rows: host-static bound on total received rows; shrinks the ragged path's
+            tensors below the transport's worst case. See :func:`grouped_mlp.compact_rows`.
 
     Returns:
         float ``[T, H]`` expert outputs in the original ``recv_tokens`` order.
@@ -569,4 +627,4 @@ def overlapped_grouped_expert_mlp(
         n_slot=n_slot, dtype=recv_tokens.dtype, device=recv_tokens.device, group=group, pool=pool,
         transport=transport,
     )
-    return layer.chunk(recv_tokens, recv_slot, group_sizes, cap, valid_mask)
+    return layer.chunk(recv_tokens, recv_slot, group_sizes, cap, valid_mask, max_recv_rows)

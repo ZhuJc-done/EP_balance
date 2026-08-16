@@ -125,6 +125,7 @@ def _draw_panel(
         markeredgewidth=0.8,
     )
     for index, (x_value, latency) in enumerate(zip(x, minimum)):
+        annotate_above = index % 2 == 0
         label = (
             f"{latency / 1_000:.2f} ms"
             if latency >= 1_000
@@ -133,9 +134,10 @@ def _draw_panel(
         axis.annotate(
             label,
             (x_value, latency),
-            xytext=(0, 8 + 9 * (index % 2)),
+            xytext=(0, 9 if annotate_above else -11),
             textcoords="offset points",
             ha="center",
+            va="bottom" if annotate_above else "top",
             fontsize=7,
             color=COLOR,
         )
@@ -145,7 +147,15 @@ def _draw_panel(
     axis.set_xticks(x, [str(value) for value in x])
     axis.margins(y=0.18)
     axis.set_xlabel(x_label, fontsize=16)
-    axis.set_title(title, fontsize=16, pad=8)
+    axis.text(
+        0.5,
+        -0.24,
+        title,
+        transform=axis.transAxes,
+        ha="center",
+        va="top",
+        fontsize=16,
+    )
     axis.grid(True, which="major", linestyle="--", linewidth=0.7, alpha=0.35)
     axis.tick_params(axis="both", labelsize=10)
     axis.tick_params(axis="x", labelrotation=30)
@@ -175,7 +185,7 @@ def plot(
     figure, axes = plt.subplots(
         1,
         2,
-        figsize=(11.0, 4.25),
+        figsize=(11.0, 4.45),
         constrained_layout=True,
         sharey=True,
     )
@@ -196,16 +206,6 @@ def plot(
         y_scale=y_scale,
     )
     axes[0].set_ylabel("kernel solve latency (µs)", fontsize=16)
-    handles, labels = axes[0].get_legend_handles_labels()
-    figure.legend(
-        handles,
-        labels,
-        loc="lower center",
-        bbox_to_anchor=(0.5, -0.05),
-        ncol=2,
-        frameon=False,
-        fontsize=16,
-    )
 
     output = output.expanduser().resolve()
     pdf_output = pdf_output.expanduser().resolve()

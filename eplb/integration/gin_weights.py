@@ -274,6 +274,7 @@ class GinReplicaTransport:
         )
         self.peers, self.ls, self.is_local = peers, ls, is_local
         self.is_remote = peers >= 0
+        self._remote_payload_bytes = None
         self.remote_col = self.is_remote.view(-1, *([1] * len(replicator.weight_shapes[0])))
         self.col = ls * replicator.world + replicator.my_rank  # scratch column of each slot's put
         # Rows the local grad scatter must not touch (remote and empty slots) go to a dump row past
@@ -282,6 +283,14 @@ class GinReplicaTransport:
         # real column: two experts main'd by different ranks can share a home index.
         dump = replicator.home_cap * replicator.world
         self.grad_row = torch.where(is_local, self.col, torch.full_like(self.col, dump))
+
+    def remote_payload_bytes(self):
+        """Logical bytes transferred by one get/put over this plan's remote replica slots."""
+        if self._remote_payload_bytes is None:
+            self._remote_payload_bytes = (
+                self.is_remote.to(torch.int64).sum() * sum(self.r.wb)
+            )
+        return self._remote_payload_bytes
 
     @staticmethod
     def _sctx(cs):

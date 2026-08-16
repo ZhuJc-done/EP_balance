@@ -26,6 +26,11 @@ def _batched_mlp(x, w):  # x[S,N,H], w0[S,H,F], w1[S,F,H]
     return torch.bmm(torch.relu(torch.bmm(x, w[0])), w[1])
 
 
+def _grouped_mlp(x, w, offs):  # ragged twin of _batched_mlp; x[T,H] packed slot-major
+    h = torch.relu(torch._grouped_mm(x, w[0], offs=offs))
+    return torch._grouped_mm(h, w[1], offs=offs)
+
+
 def _global_data():
     g = torch.Generator().manual_seed(1234)
     probs = torch.tensor([0.7, 0.1, 0.1, 0.1], dtype=torch.float64)
@@ -282,6 +287,91 @@ def test_routing_to_units():
     assert torch.allclose(p, torch.tensor([0.6, 0.4, 1.0]))
 
 
+def test_eplb_megatron_forward_adds_shared_expert_output(monkeypatch):
+    """Apply mode must preserve the native routed + shared expert sum."""
+    from types import SimpleNamespace
+
+    import eplb.integration.megatron_moe as binding
+
+    call_order = []
+    hidden = torch.randn(2, 1, 3, requires_grad=True)
+
+    def router(x):
+        call_order.append("route")
+        probs = x.new_tensor([[1.0, 0.0], [0.0, 1.0]])
+        return probs, probs.bool()
+
+    def shared_experts_compute(x):
+        call_order.append("shared")
+        return 3.0 * x
+
+    def fake_sync_free_moe_forward(**kwargs):
+        assert kwargs["plan"] == "test-plan"
+        assert kwargs["unit_expert"].tolist() == [0, 1]
+        return 2.0 * kwargs["tokens"]
+
+    class Rebalancer:
+        spec = SimpleNamespace(num_experts=2)
+
+        @staticmethod
+        def rebalance(local_row, layer_id, mb, group):
+            assert local_row.tolist() == [1, 1]
+            return SimpleNamespace(plan="test-plan")
+
+    def local_expert():
+        return SimpleNamespace(
+            linear_fc1=SimpleNamespace(weight=torch.empty(4, 3)),
+            linear_fc2=SimpleNamespace(weight=torch.empty(3, 2)),
+        )
+
+    layer = SimpleNamespace(
+        config=SimpleNamespace(moe_router_topk=1),
+        router=router,
+        experts=SimpleNamespace(local_experts=[local_expert(), local_expert()]),
+        use_shared_expert=True,
+        shared_expert_overlap=False,
+        shared_experts_compute=shared_experts_compute,
+        _eplb={
+            "reb": Rebalancer(),
+            "group": None,
+            "layer_id": 0,
+            "mb": 0,
+            "gated": True,
+            "act": torch.nn.functional.silu,
+            "batched_mlp_fn": None,
+            "adapter": object(),
+            "rematerialize": False,
+            "overlap": False,
+        },
+    )
+    monkeypatch.setattr(binding, "sync_free_moe_forward", fake_sync_free_moe_forward)
+    monkeypatch.setattr(binding.profiling, "enabled", lambda: False)
+
+    output, bias = binding.eplb_moe_forward(layer, hidden)
+    assert bias is None
+    assert call_order == ["shared", "route"]
+    assert torch.allclose(output, 5.0 * hidden)
+
+    output.sum().backward()
+    assert torch.allclose(hidden.grad, torch.full_like(hidden, 5.0))
+
+
+def test_eplb_binding_rejects_shared_expert_overlap():
+    """Megatron's dispatcher owns the shared-expert overlap state machine."""
+    from types import SimpleNamespace
+
+    from eplb.integration.megatron_moe import bind_eplb_to_moe_layer
+
+    layer = SimpleNamespace(
+        config=SimpleNamespace(moe_router_topk=2),
+        use_shared_expert=True,
+        shared_expert_overlap=True,
+        shared_experts_compute=lambda hidden: hidden,
+    )
+    with pytest.raises(NotImplementedError, match="moe_shared_expert_overlap=False"):
+        bind_eplb_to_moe_layer(layer, rebalancer=object(), ep_group=None)
+
+
 @pytest.mark.parametrize("hidden", [16, 512, 1024, 2048, 4096, 5120, 7168, 8192])
 @pytest.mark.parametrize("dtype,eligible", [(torch.bfloat16, True), (torch.float16, False)])
 def test_elastic_payload_requires_aligned_bf16(hidden, dtype, eligible):
@@ -341,6 +431,7 @@ def test_elastic_adapter_configuration_is_strict(monkeypatch):
     import sys
     import types
 
+    from eplb.integration.grouped_mlp import ragged_available
     from eplb.integration.megatron_moe import _make_adapter
 
     fake_deep_ep = types.ModuleType("deep_ep")
@@ -350,12 +441,19 @@ def test_elastic_adapter_configuration_is_strict(monkeypatch):
     monkeypatch.setenv("EPLB_ADAPTER", "deepep")
     for key in (
         "EPLB_CAP", "EPLB_WEIGHT_COMM", "EPLB_GIN_FENCE", "EPLB_PROFILE",
-        "PROFILE_TRACE", "EPLB_DEEPEP_ALLOW_MNNVL",
+        "EPLB_DEBUG_TIMING", "PROFILE_TRACE", "EPLB_DEEPEP_ALLOW_MNNVL",
     ):
         monkeypatch.delenv(key, raising=False)
 
+    # A cap is only mandatory for the padded expert path; the ragged one sizes itself on device.
+    monkeypatch.setenv("EPLB_GROUPED_GEMM", "0")
     with pytest.raises(ValueError, match="EPLB_CAP"):
         _make_adapter()
+    monkeypatch.delenv("EPLB_GROUPED_GEMM")
+    if ragged_available():
+        with pytest.raises(ValueError, match="WEIGHT_COMM"):
+            _make_adapter()   # no EPLB_CAP set, and none needed
+
     monkeypatch.setenv("EPLB_CAP", "16")
     with pytest.raises(ValueError, match="WEIGHT_COMM"):
         _make_adapter()
@@ -364,6 +462,14 @@ def test_elastic_adapter_configuration_is_strict(monkeypatch):
         _make_adapter()
     monkeypatch.setenv("EPLB_GIN_FENCE", "signal")
     assert _make_adapter().uses_padded_layout()
+    monkeypatch.setenv("EPLB_DEBUG_TIMING", "1")
+    with pytest.warns(RuntimeWarning, match="synchronizes once per MoE invocation"):
+        assert _make_adapter().uses_padded_layout()
+    monkeypatch.setenv("EPLB_PROFILE", "1")
+    with pytest.raises(ValueError, match="EPLB_PROFILE=0"):
+        _make_adapter()
+    monkeypatch.delenv("EPLB_PROFILE")
+    monkeypatch.delenv("EPLB_DEBUG_TIMING")
     monkeypatch.setenv("EPLB_DEEPEP_ALLOW_MNNVL", "1")
     with pytest.raises(ValueError, match="legacy"):
         _make_adapter()
@@ -396,7 +502,7 @@ def test_elastic_dispatch_uses_synthetic_experts_padding_and_no_sync(monkeypatch
                 handle = types.SimpleNamespace(
                     topk_idx=topk_idx.clone(),
                     num_experts=2,
-                    psum_num_recv_tokens_per_scaleup_rank=torch.tensor([n]),
+                    psum_num_recv_tokens_per_scaleup_rank=torch.tensor([n], device=x.device),
                     psum_num_recv_tokens_per_expert=torch.cumsum(counts, 0),
                 )
             return recv, recv_idx, None, handle, None
@@ -456,12 +562,23 @@ def test_elastic_dispatch_uses_synthetic_experts_padding_and_no_sync(monkeypatch
     "chunks,overlap,manual",
     [(1, False, False), (2, False, False), (2, True, False), (2, True, True)],
 )
-def test_elastic_padded_layout_matches_reference(monkeypatch, chunks, overlap, manual):
-    """Plain, overlapped and manual chunk paths ignore ElasticBuffer padding."""
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_elastic_padded_layout_matches_reference(monkeypatch, chunks, overlap, manual, device):
+    """Plain, overlapped and manual chunk paths ignore ElasticBuffer padding.
+
+    On CUDA this is also the end-to-end cover for the ragged grouped GEMM: all three compute
+    paths take it there, while CPU keeps exercising the padded fallback.
+    """
+    import dataclasses
     import sys
     import types
 
     import eplb.integration.eplb_manager as manager
+    from eplb.integration.grouped_mlp import ragged_available
+    from eplb.plan import Plan
+
+    if device == "cuda" and not ragged_available():
+        pytest.skip("ragged path needs torch._grouped_mm (CUDA SM90+, 16-bit float)")
 
     class FakeElastic:
         def __init__(self, group, **kwargs):
@@ -473,14 +590,14 @@ def test_elastic_padded_layout_matches_reference(monkeypatch, chunks, overlap, m
             n, h = topk_idx.shape[0], x.shape[1]
             recv = x.new_zeros((self.max_tokens, h))
             recv[:n] = x[:n]
-            recv_idx = torch.full((self.max_tokens, 1), -1, dtype=torch.int64)
+            recv_idx = torch.full((self.max_tokens, 1), -1, dtype=torch.int64, device=x.device)
             recv_idx[:n] = topk_idx
             if handle is None:
                 counts = torch.bincount(topk_idx[:, 0], minlength=2).to(torch.int64)
                 handle = types.SimpleNamespace(
                     topk_idx=topk_idx.clone(),
                     num_experts=2,
-                    psum_num_recv_tokens_per_scaleup_rank=torch.tensor([n]),
+                    psum_num_recv_tokens_per_scaleup_rank=torch.tensor([n], device=x.device),
                     psum_num_recv_tokens_per_expert=torch.cumsum(counts, 0),
                 )
             return recv, recv_idx, None, handle, None
@@ -497,7 +614,7 @@ def test_elastic_padded_layout_matches_reference(monkeypatch, chunks, overlap, m
     manager._ELASTIC_BUFFERS.clear()
 
     torch.manual_seed(7)
-    n, e, h, f = 8, 2, 8, 12
+    n, e, h, f = 8, 2, 16, 32   # widths are 16-byte aligned so CUDA takes the ragged path
     unit_expert = torch.tensor([0, 1, 0, 1, 1, 0, 0, 1], dtype=torch.int64)
     spec = ProblemSpec.uniform_main_placement(e, 1, weight_bytes_each=1, s_tok=1, n_slot=2)
     topo = Topology.from_nvlink_rdma(1, 1, 1, 1)
@@ -505,10 +622,27 @@ def test_elastic_padded_layout_matches_reference(monkeypatch, chunks, overlap, m
         Loads(torch.bincount(unit_expert, minlength=e).reshape(1, e)),
         topo, spec, EPLBConfig(),
     )
-    tokens = torch.randn(n, h, dtype=torch.bfloat16, requires_grad=True)
-    w0 = [torch.randn(h, f, dtype=torch.bfloat16).requires_grad_(True) for _ in range(e)]
-    w1 = [torch.randn(f, h, dtype=torch.bfloat16).requires_grad_(True) for _ in range(e)]
+    plan = Plan(x=plan.x.to(device), q=plan.q.to(device), theta=plan.theta)
+    spec = dataclasses.replace(
+        spec, main_rank=spec.main_rank.to(device), weight_bytes=spec.weight_bytes.to(device)
+    )
+    unit_expert = unit_expert.to(device)
+
+    tokens = torch.randn(n, h, dtype=torch.bfloat16, device=device, requires_grad=True)
+    w0 = [torch.randn(h, f, dtype=torch.bfloat16, device=device).requires_grad_(True) for _ in range(e)]
+    w1 = [torch.randn(f, h, dtype=torch.bfloat16, device=device).requires_grad_(True) for _ in range(e)]
     weights = {i: (w0[i], w1[i]) for i in range(e)}
+
+    # Count the ragged GEMMs so a silent fall back to the padded path cannot pass as coverage.
+    ragged_calls = []
+    if device == "cuda":
+        real_grouped_mm = torch._grouped_mm
+
+        def counting_grouped_mm(*args, **kwargs):
+            ragged_calls.append(1)
+            return real_grouped_mm(*args, **kwargs)
+
+        monkeypatch.setattr(torch, "_grouped_mm", counting_grouped_mm)
 
     ref_tokens = tokens.detach().clone().requires_grad_(True)
     rw0 = [w.detach().clone().requires_grad_(True) for w in w0]
@@ -521,16 +655,18 @@ def test_elastic_padded_layout_matches_reference(monkeypatch, chunks, overlap, m
 
     got = sync_free_moe_forward(
         tokens=tokens,
-        unit_token_idx=torch.arange(n),
+        unit_token_idx=torch.arange(n, device=device),
         unit_expert=unit_expert,
-        unit_prob=torch.ones(n, dtype=torch.bfloat16),
+        unit_prob=torch.ones(n, dtype=torch.bfloat16, device=device),
         plan=plan, spec=spec, weights_local=weights,
         weight_shapes=[torch.Size((h, f)), torch.Size((f, h))],
-        batched_mlp_fn=_batched_mlp, cap=n,
+        batched_mlp_fn=_batched_mlp, cap=n, grouped_mlp_fn=_grouped_mlp,
         adapter=manager.DeepEPAdapter(max_tokens_per_rank=n),
         overlap=overlap, gated=False, act=torch.relu,
     )
     assert torch.allclose(got, ref, atol=2e-2, rtol=2e-2)
+    if device == "cuda":
+        assert ragged_calls, "expected the ragged grouped GEMM to run on CUDA"
     got.float().sum().backward()
     ref.float().sum().backward()
     assert torch.allclose(tokens.grad, ref_tokens.grad, atol=2e-2, rtol=2e-2)

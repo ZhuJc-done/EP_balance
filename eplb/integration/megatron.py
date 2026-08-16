@@ -91,6 +91,7 @@ class MegatronEPLBHook:
         trace_max: int = 0,
         trace_every: int = 25,
         counts_reduced_over_tp_cp: bool = False,
+        owns_timing_window: bool = True,
     ) -> None:
         if mode not in ("observe", "apply"):
             raise ValueError("mode must be 'observe' or 'apply'")
@@ -106,6 +107,7 @@ class MegatronEPLBHook:
         self.trace_max = int(trace_max)
         self.trace_every = max(1, int(trace_every))
         self.counts_reduced_over_tp_cp = bool(counts_reduced_over_tp_cp)
+        self.owns_timing_window = bool(owns_timing_window)
         self._trace_samples: list[dict] = []
         self._trace_dirty = 0
         self._trace_ordinal = 0
@@ -126,6 +128,8 @@ class MegatronEPLBHook:
         Returns:
             The solved :class:`~eplb.plan.Plan`.
         """
+        if self.owns_timing_window:
+            profiling.begin_debug_window()
         res = self.reb.rebalance(local_counts, layer_id, micro_batch_id, group=self.ep_group)
         self.last_plan = res.plan
         if self.logger is not None:
@@ -148,7 +152,10 @@ class MegatronEPLBHook:
             f"theta={m.theta} imbalance={m.imbalance:.3f} "
             f"replicas={m.total_replicas} phi_token={m.phi_token}{extra}"
         )
-        profiling.maybe_summary(self.logger)
+        if self.owns_timing_window:
+            profiling.maybe_summary(
+                self.logger, context=f"mode=observe layer={layer_id} mb={micro_batch_id}"
+            )
 
     # -- trace capture (Phase B -> baseline replay) -----------------------------
     def _build_trace_meta(self) -> dict:
@@ -233,6 +240,7 @@ def attach_router_observers(
     micro_batch_id_fn=None,
     router_class_name: str = "TopKRouter",
     reduce_tp_cp: bool = True,
+    prefer_initial_forward: bool = False,
 ):
     """Register forward hooks on every MoE router to capture ``Ω``.
 
@@ -244,19 +252,31 @@ def attach_router_observers(
         router_class_name: Class name of the router module to match (default ``TopKRouter``).
         reduce_tp_cp: Sum router counts over Megatron's TP×CP token-sharding group
             before retaining EP ranks as separate ``Ω`` rows.
+        prefer_initial_forward: With reentrant activation checkpointing, observe the initial
+            no-grad forward and skip its later recompute. This keeps solver timing inside an
+            enclosing native-MoE forward timing window.
 
     Returns:
         List of hook handles; call ``.remove()`` on each to detach.
     """
     handles = []
-    state = {"layer": 0, "calls_by_layer": {}}
+    state = {"layer": 0, "calls_by_layer": {}, "pending_recompute_by_layer": {}}
 
     def make_cb(layer_id: int):
         def cb(_module, _inputs, output):
             # Reentrant activation checkpointing runs the original forward under
-            # no_grad and recomputes it with gradients enabled. Keep only one copy.
-            if getattr(_module, "training", False) and not torch.is_grad_enabled():
-                return output
+            # no_grad and recomputes it with gradients enabled. Standalone observation keeps the
+            # recompute, as before. Native whole-layer timing instead keeps the initial forward so
+            # its solver sample lands in the same timing window as dispatch/GEMM/combine.
+            if getattr(_module, "training", False):
+                pending = state["pending_recompute_by_layer"].get(layer_id, 0)
+                if not torch.is_grad_enabled():
+                    if not prefer_initial_forward:
+                        return output
+                    state["pending_recompute_by_layer"][layer_id] = pending + 1
+                elif prefer_initial_forward and pending:
+                    state["pending_recompute_by_layer"][layer_id] = pending - 1
+                    return output
             rmap = _extract_routing_map(output, num_experts)
             counts = omega_row_from_routing_map(rmap)
             if reduce_tp_cp:
@@ -299,6 +319,7 @@ def setup_eplb_observer(
     trace_max: int = 0,
     trace_every: int = 25,
     reduce_tp_cp: bool = True,
+    native_timing: bool = False,
 ):
     """One-call Phase B setup (call once after model build): read Megatron's EP state, build the rebalancer, attach observers.
 
@@ -321,6 +342,8 @@ def setup_eplb_observer(
         trace_max: Cap on the number of captured samples (0 = unbounded).
         trace_every: Flush the trace to disk every this many captured samples.
         reduce_tp_cp: Sum TP/SP and CP token shards before the EP all-gather.
+        native_timing: Let an enclosing native-MoE binding own the timing window and report after
+            dispatch, expert compute, and combine have also completed.
 
     Returns:
         ``(hook, handles)`` -- the :class:`MegatronEPLBHook` and its forward-hook handles.
@@ -343,6 +366,7 @@ def setup_eplb_observer(
         mode="observe", ep_group=ep_group, logger=logger,
         trace_out=trace_out, trace_max=trace_max, trace_every=trace_every,
         counts_reduced_over_tp_cp=reduce_tp_cp,
+        owns_timing_window=not native_timing,
     )
     handles = attach_router_observers(
         model,
@@ -351,6 +375,7 @@ def setup_eplb_observer(
         micro_batch_id_fn,
         router_class_name,
         reduce_tp_cp=reduce_tp_cp,
+        prefer_initial_forward=native_timing,
     )
     return hook, handles
 

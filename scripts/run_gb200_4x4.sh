@@ -76,10 +76,11 @@ TRAIN_ITERS="${TRAIN_ITERS:-20}"
 export GPUS_PER_NODE EPLB_MODE
 
 # --- debug / profiling toggles (optional) ------------------------------------
-# EPLB_PROFILE=1 -> time the eplb/solve, eplb/all_gather_omega and apply/* regions with
-# CUDA events and print a min/mean/max summary every EPLB_PROFILE_EVERY calls (default 20).
+# EPLB_PROFILE=1 -> aggregate native/* or apply/* CUDA-event timing.
+# EPLB_DEBUG_TIMING=1 -> print one forward breakdown per MoE invocation in off/observe/apply.
 export EPLB_PROFILE="${EPLB_PROFILE:-0}"
 export EPLB_PROFILE_EVERY="${EPLB_PROFILE_EVERY:-20}"
+export EPLB_DEBUG_TIMING="${EPLB_DEBUG_TIMING:-0}"
 
 # EPLB_REMATERIALIZE=1 (apply mode) -> don't hold replica expert weights across fwd->bwd; free them
 # after forward and re-broadcast at backward start (weight recompute). Trades extra broadcast for memory.

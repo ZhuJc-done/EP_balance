@@ -1,4 +1,4 @@
-"""Zero-fork Megatron-LM ``main`` entrypoint for Scale-EPLB; EPLB_MODE=observe (Phase B) or apply (Phase C)."""
+"""Zero-fork Megatron entrypoint for native timing, EPLB observation, or EPLB application."""
 
 from __future__ import annotations
 
@@ -27,7 +27,12 @@ from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
 
 from eplb import EPLBConfig, Topology
-from eplb.integration import EPLBRebalancer, bind_eplb_to_moe_layer, find_moe_layers
+from eplb.integration import (
+    EPLBRebalancer,
+    bind_eplb_to_moe_layer,
+    bind_native_moe_timing,
+    find_moe_layers,
+)
 from eplb.integration import profiling
 from eplb.integration.megatron import build_spec_for_megatron, setup_eplb_observer
 
@@ -95,7 +100,7 @@ def _use_separate_mlp_norm_checkpoint_keys(model) -> None:
 def model_provider(
     pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None
 ):
-    """Megatron's GPT model_provider plus the EPLB observer (Phase B) or dispatcher binding (Phase C)."""
+    """Build GPT and attach native timing, the EPLB observer, or the EPLB dispatcher."""
     args = get_args()
     if args.normalization == "RMSNorm" and args.transformer_impl == "local":
         # This Megatron revision picks Apex FusedLayerNorm whenever Apex is
@@ -118,21 +123,31 @@ def model_provider(
     )
     _use_separate_mlp_norm_checkpoint_keys(model)
     mode = os.environ.get("EPLB_MODE", "observe")
-    if mode == "off" or not getattr(args, "num_experts", None):
+    has_moe = bool(getattr(args, "num_experts", None))
+    rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+    timing_logger = print if (rank0 or profiling.all_ranks()) else None
+    native_instrumentation = (
+        mode in ("off", "observe") and has_moe and profiling.regions_requested()
+    )
+    if native_instrumentation:
+        bindings = bind_native_moe_timing(model, mode=mode, logger=timing_logger)
+        _KEEPALIVE.append(bindings)
+
+    if mode == "off" or not has_moe:
         return model
 
     p = _eplb_params(args)
     if mode == "observe":
-        rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
         # Optional: dump the real routing trace (rank 0 only) for offline baseline replay.
         trace_out = os.environ.get("EPLB_TRACE_OUT") if rank0 else None
         hook, handles = setup_eplb_observer(
             model, num_experts=p["num_experts"], weight_bytes_each=p["weight_bytes_each"],
             s_tok=p["s_tok"], n_slot=p["n_slot"], gpus_per_node=p["gpus_per_node"],
-            logger=(print if (rank0 or profiling.all_ranks()) else None),
+            logger=timing_logger,
             trace_out=trace_out,
             trace_max=int(os.environ.get("EPLB_TRACE_MAX") or 0),
             trace_every=int(os.environ.get("EPLB_TRACE_EVERY") or 25),
+            native_timing=native_instrumentation,
         )
         if trace_out:
             print(f"[run_real_moe] dumping routing trace to {trace_out}")

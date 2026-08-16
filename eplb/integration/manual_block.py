@@ -35,12 +35,25 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from . import profiling
+from .grouped_mlp import (
+    compact_rows,
+    mask_rows,
+    ragged_enabled,
+    ragged_expert_ok,
+    ragged_mm,
+    ragged_mm_tn,
+    scatter_rows,
+    slot_offsets,
+    slot_sort,
+)
 from .overlap import (
     _PrefetchOnBackward,
     _ReplicaLease,
     _acquire_stacks,
     _activation,
     _comm_stream,
+    _remote_transfer_bytes,
     _weight_stream,
     build_meta,
 )
@@ -67,19 +80,27 @@ def _slot_layout(
     recv_slot: torch.Tensor,
     group_sizes: torch.Tensor,
     n_slot: int,
-    cap: int,
+    cap: Optional[int],
     valid_mask: Optional[torch.Tensor] = None,
+    ragged: bool = False,
+    max_recv_rows: Optional[int] = None,
 ):
-    """Permutation + padded destination index that group received tokens by physical slot."""
+    """Group received tokens by physical slot, ragged or padded.
+
+    Returns:
+        ``(order, valid_sorted, flat, offs)``. Ragged mode leaves ``flat`` None and returns the
+        grouped GEMM's row offsets; padded mode leaves ``offs`` None and returns the destination
+        index into the ``[n_slot * cap + 1]`` bucket layout. ``max_recv_rows`` trims the ragged
+        order to a host-static budget; see :func:`grouped_mlp.compact_rows`.
+    """
     T, device = recv_slot.shape[0], recv_slot.device
-    if valid_mask is None:
-        valid_mask = torch.ones(T, dtype=torch.bool, device=device)
-    else:
-        valid_mask = valid_mask.to(torch.bool)
-    sort_slot = torch.where(valid_mask, recv_slot, torch.full_like(recv_slot, n_slot))
-    order = torch.argsort(sort_slot, stable=True)
-    slot_sorted = sort_slot[order]
-    valid_sorted = valid_mask[order]
+    order, valid_sorted, slot_sorted = slot_sort(recv_slot, n_slot, valid_mask)
+    if ragged:
+        order, valid_sorted = compact_rows(order, valid_sorted, group_sizes, max_recv_rows)
+        return order, valid_sorted, None, slot_offsets(group_sizes, order.shape[0])
+
+    if cap is None:
+        raise ValueError("the padded expert path needs a host-static cap")
     safe_slot = slot_sorted.clamp(max=n_slot - 1)
     seg_start = torch.zeros(n_slot, dtype=torch.int64, device=device)
     if n_slot > 1:
@@ -91,7 +112,7 @@ def _slot_layout(
         safe_slot * cap + pos_in_slot.clamp(max=cap - 1),
         torch.full_like(pos_in_slot, overflow),
     )
-    return order, flat, valid_sorted
+    return order, valid_sorted, flat, None
 
 
 class _ManualExpertPipeline(torch.autograd.Function):
@@ -108,10 +129,13 @@ class _ManualExpertPipeline(torch.autograd.Function):
         nc = int(cfg["nc"])
         payloads, main_w = list(tensors[:nc]), list(tensors[nc:])
         meta, adapter, group = cfg["meta"], cfg["adapter"], cfg["group"]
-        cap, n_slot, H = int(cfg["cap"]), int(cfg["n_slot"]), int(cfg["H"])
+        cap = None if cfg["cap"] is None else int(cfg["cap"])
+        max_recv_rows = cfg.get("max_recv_rows")
+        n_slot, H = int(cfg["n_slot"]), int(cfg["H"])
         my_rank, sent, recv, routes = (
             int(cfg["my_rank"]), cfg["sent"], cfg["recv"], cfg["routes"]
         )
+        dispatch_bytes, combine_bytes = cfg["dispatch_bytes"], cfg["combine_bytes"]
         device, dtype = payloads[0].device, payloads[0].dtype
 
         cs, ws = _comm_stream(device), _weight_stream(device)
@@ -120,7 +144,18 @@ class _ManualExpertPipeline(torch.autograd.Function):
 
         # Weight pull first, on the weight stream: it now hides behind chunk 1's dispatch below rather
         # than being an exposed prologue to the layer.
-        w1_eff, w2_eff = _acquire_stacks(meta, main_w, dtype, device, ws)
+        with profiling.record(
+            "apply/weight_move",
+            time_it=True,
+            device=device,
+            stream=ws,
+            payload_bytes=_remote_transfer_bytes(meta),
+        ):
+            w1_eff, w2_eff = _acquire_stacks(meta, main_w, dtype, device, ws)
+
+        ragged = ragged_enabled(payloads[0]) and ragged_expert_ok(
+            H, payloads[0].element_size(), w1_eff, w2_eff, meta["gated"]
+        )
 
         if on_cuda:
             cs.wait_stream(ms)                      # payloads were written on the compute stream
@@ -128,10 +163,17 @@ class _ManualExpertPipeline(torch.autograd.Function):
         disp_evt: List[Optional[torch.cuda.Event]] = [None] * nc
         with _sctx(cs):
             for k in range(nc):
-                recv_pl[k] = adapter.dispatch_chunk(
-                    payloads[k], sent[k], recv[k], group, tag=k,
-                    route_idx=routes[k], n_slot=n_slot, cap=cap,
-                )
+                with profiling.record(
+                    "apply/dispatch",
+                    time_it=True,
+                    device=device,
+                    stream=cs,
+                    payload_bytes=dispatch_bytes[k],
+                ):
+                    recv_pl[k] = adapter.dispatch_chunk(
+                        payloads[k], sent[k], recv[k], group, tag=k,
+                        route_idx=routes[k], n_slot=n_slot, cap=cap,
+                    )
                 if on_cuda:
                     _rec(recv_pl[k], ms)
                     disp_evt[k] = _event(on_cuda, cs)
@@ -154,31 +196,46 @@ class _ManualExpertPipeline(torch.autograd.Function):
                 group_sizes = torch.bincount(
                     recv_slot.clamp(min=0, max=n_slot - 1), minlength=n_slot
                 ).to(torch.int64)
-            order, flat, valid_sorted = _slot_layout(
-                recv_slot, group_sizes, n_slot, cap, valid_mask
+            order, valid_sorted, flat, offs = _slot_layout(
+                recv_slot, group_sizes, n_slot, cap, valid_mask, ragged, max_recv_rows
             )
 
             T = recv_tokens.shape[0]
-            overflow = n_slot * cap
-            x_ext = recv_tokens.new_zeros((overflow + 1, H))
-            x_ext.index_copy_(0, flat, recv_tokens[order])
-            x_pad = x_ext[:overflow].view(n_slot, cap, H)
-            h_pre = torch.bmm(x_pad, w1_eff)
-            y_pad = torch.bmm(_activation(meta, h_pre), w2_eff)
-            y_sorted = y_pad.reshape(overflow, H)[flat.clamp(max=overflow - 1)]
-            y_sorted = y_sorted * valid_sorted.unsqueeze(1).to(y_sorted.dtype)
-            y = y_sorted.new_empty((T, H))
-            y.index_copy_(0, order, y_sorted)
+            if ragged:
+                # The sort already packed the rows slot-major, so it doubles as the grouping and
+                # the [n_slot * cap, H] staging buffer disappears entirely.
+                x = recv_tokens.index_select(0, order)
+            else:
+                overflow = n_slot * cap
+                x_ext = recv_tokens.new_zeros((overflow + 1, H))
+                x_ext.index_copy_(0, flat, recv_tokens[order])
+                x = x_ext[:overflow].view(n_slot, cap, H)
+            with profiling.record("apply/expert_gemm", time_it=True, device=device):
+                h_pre = ragged_mm(x, w1_eff, offs)
+                y_out = ragged_mm(_activation(meta, h_pre), w2_eff, offs)
+            if ragged:
+                y_sorted = mask_rows(y_out, valid_sorted)
+            else:
+                y_sorted = y_out.reshape(n_slot * cap, H)[flat.clamp(max=n_slot * cap - 1)]
+                y_sorted = y_sorted * valid_sorted.unsqueeze(1).to(y_sorted.dtype)
+            y = scatter_rows(y_sorted, order, T)
 
-            saved.extend([x_pad, h_pre])
-            idx.append((order, flat, valid_sorted))
+            saved.extend([x, h_pre])
+            idx.append((order, flat, valid_sorted, offs))
             comp_evt = _event(on_cuda, ms)
             if on_cuda:
                 _rec(y, cs)
             with _sctx(cs):
                 if on_cuda:
                     cs.wait_event(comp_evt)
-                comb[k] = adapter.combine_chunk(y, sent[k], recv[k], group, tag=k)
+                with profiling.record(
+                    "apply/combine",
+                    time_it=True,
+                    device=device,
+                    stream=cs,
+                    payload_bytes=combine_bytes[k],
+                ):
+                    comb[k] = adapter.combine_chunk(y, sent[k], recv[k], group, tag=k)
                 if on_cuda:
                     _rec(comb[k], ms)
             cfg["state"].append(adapter.chunk_state(k))   # replay info for this chunk's transpose legs
@@ -194,7 +251,8 @@ class _ManualExpertPipeline(torch.autograd.Function):
     def backward(ctx, *grad_comb):
         cfg, meta = ctx.cfg, ctx.cfg["meta"]
         nc, adapter, group = int(cfg["nc"]), cfg["adapter"], cfg["group"]
-        cap, n_slot, H = int(cfg["cap"]), int(cfg["n_slot"]), int(cfg["H"])
+        cap = None if cfg["cap"] is None else int(cfg["cap"])
+        n_slot, H = int(cfg["n_slot"]), int(cfg["H"])
         pad_cols, lease, state = int(cfg["pad_cols"]), cfg["lease"], cfg["state"]
         saved = ctx.saved_tensors
         device, dtype = grad_comb[0].device, grad_comb[0].dtype
@@ -235,27 +293,34 @@ class _ManualExpertPipeline(torch.autograd.Function):
         for k in range(nc):
             if on_cuda:
                 ms.wait_event(comb_evt[k])
-            x_pad, h_pre = saved[2 * k], saved[2 * k + 1]
-            order, flat, valid_sorted = ctx.idx[k]
+            x, h_pre = saved[2 * k], saved[2 * k + 1]
+            order, flat, valid_sorted, offs = ctx.idx[k]
             T = gy[k].shape[0]
 
-            overflow = n_slot * cap
-            g_ext = gy[k].new_zeros((overflow + 1, H))
-            g_ext.index_add_(0, flat, gy[k].index_select(0, order))
-            g_pad = g_ext[:overflow].view(n_slot, cap, H)
+            if offs is not None:
+                g = mask_rows(gy[k].index_select(0, order), valid_sorted)
+            else:
+                overflow = n_slot * cap
+                g_ext = gy[k].new_zeros((overflow + 1, H))
+                g_ext.index_add_(0, flat, gy[k].index_select(0, order))
+                g = g_ext[:overflow].view(n_slot, cap, H)
 
             # --- Dgrad chain: needs the replica weights, so this is where a late pull would stall ---
             w1_eff, w2_eff = lease.wait()
-            grad_a = torch.bmm(g_pad, w2_eff.transpose(1, 2))
+            grad_a = ragged_mm(g, w2_eff.transpose(1, 2), offs)
             with torch.enable_grad():
                 hp = h_pre.detach().requires_grad_(True)
                 a_g = _activation(meta, hp)
                 (grad_h_pre,) = torch.autograd.grad(a_g, hp, grad_a)
-            gx_pad = torch.bmm(grad_h_pre, w1_eff.transpose(1, 2))
-            gx_sorted = gx_pad.reshape(overflow, H)[flat.clamp(max=overflow - 1)]
-            gx_sorted = gx_sorted * valid_sorted.unsqueeze(1).to(gx_sorted.dtype)
-            gx = gx_sorted.new_zeros((T, H))
-            gx.index_copy_(0, order, gx_sorted)
+            gx_out = ragged_mm(grad_h_pre, w1_eff.transpose(1, 2), offs)
+            if offs is not None:
+                # Rows past the last offset are slots the GEMM never wrote; select, do not multiply.
+                gx_sorted = mask_rows(gx_out, valid_sorted)
+            else:
+                overflow = n_slot * cap
+                gx_sorted = gx_out.reshape(overflow, H)[flat.clamp(max=overflow - 1)]
+                gx_sorted = gx_sorted * valid_sorted.unsqueeze(1).to(gx_sorted.dtype)
+            gx = scatter_rows(gx_sorted, order, T)
             # the payload's trailing columns carried the physical ids, a constant -> zero grad
             g_rp = torch.cat([gx, gx.new_zeros((T, pad_cols))], dim=1)
             comp_evt = _event(on_cuda, ms)
@@ -270,11 +335,10 @@ class _ManualExpertPipeline(torch.autograd.Function):
 
             # --- Wgrads: nothing downstream waits on them, so they run under dispatch^-1(k) ---
             a = a_g.detach()                            # the activation the Dgrad chain already built
-            g2 = torch.bmm(g_pad.transpose(1, 2), a) if transpose_w \
-                else torch.bmm(a.transpose(1, 2), g_pad)
-            gw2 = g2 if gw2 is None else gw2.add_(g2)   # bmm output, unaliased -> safe in place
-            g1 = torch.bmm(grad_h_pre.transpose(1, 2), x_pad) if transpose_w \
-                else torch.bmm(x_pad.transpose(1, 2), grad_h_pre)
+            g2 = ragged_mm_tn(g, a, offs) if transpose_w else ragged_mm_tn(a, g, offs)
+            gw2 = g2 if gw2 is None else gw2.add_(g2)   # matmul output, unaliased -> safe in place
+            g1 = ragged_mm_tn(grad_h_pre, x, offs) if transpose_w \
+                else ragged_mm_tn(x, grad_h_pre, offs)
             gw1 = g1 if gw1 is None else gw1.add_(g1)
 
         # 4. every chunk's Wgrad is in -> reduce to main(e), on the weight stream and behind the last
@@ -284,7 +348,14 @@ class _ManualExpertPipeline(torch.autograd.Function):
             _rec(gw1, ws)
             _rec(gw2, ws)
         with _sctx(ws):
-            grads = meta["transport"].reduce_grads(meta, gw1, gw2, dtype, device)
+            with profiling.record(
+                "apply/grad_move",
+                time_it=True,
+                device=device,
+                stream=ws,
+                payload_bytes=_remote_transfer_bytes(meta),
+            ):
+                grads = meta["transport"].reduce_grads(meta, gw1, gw2, dtype, device)
             if on_cuda:
                 for g in grads:
                     _rec(g, ms)
@@ -335,19 +406,24 @@ class ManualMoEBlock:
         sent: Sequence[torch.Tensor],
         recv: Sequence[torch.Tensor],
         routes: Sequence[torch.Tensor],
+        dispatch_bytes: Sequence[torch.Tensor],
+        combine_bytes: Sequence[torch.Tensor],
         *,
         adapter,
         group,
-        cap: int,
+        cap: Optional[int],
         n_slot: int,
         H: int,
         pad_cols: int,
         my_rank: int,
+        max_recv_rows: Optional[int] = None,
     ) -> Tuple[torch.Tensor, ...]:
         cfg = {
             "nc": len(payloads), "meta": self.meta, "adapter": adapter, "group": group,
-            "cap": cap, "n_slot": n_slot, "H": H, "pad_cols": pad_cols, "my_rank": my_rank,
+            "cap": cap, "max_recv_rows": max_recv_rows,
+            "n_slot": n_slot, "H": H, "pad_cols": pad_cols, "my_rank": my_rank,
             "sent": list(sent), "recv": list(recv), "routes": list(routes),
+            "dispatch_bytes": list(dispatch_bytes), "combine_bytes": list(combine_bytes),
             "lease": self.lease, "state": [],
         }
         # one consumer for the lease: the single node now owns every chunk's backward

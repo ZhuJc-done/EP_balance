@@ -32,7 +32,7 @@ EVAL_ITERS="${EVAL_ITERS:-50}"
 
 TRACE_OUT="${TRACE_OUT:-${EPLB_DIR}/logs/hotspot_${WORKLOAD}.pt}"
 LOG_FILE="${LOG_FILE:-${EPLB_DIR}/logs/hotspot_${WORKLOAD}_node${NODE_RANK}.log}"
-TRACE_FLUSH_EVERY="${TRACE_FLUSH_EVERY:-$([[ "${MODEL}" == "mixtral8x7b" ]] && echo 32 || echo 48)}"
+TRACE_FLUSH_EVERY="${TRACE_FLUSH_EVERY:-48}"
 
 if [[ ! -f "${MEGATRON_DIR}/pretrain_gpt.py" ]]; then
   echo "Megatron pretrain entrypoint not found: ${MEGATRON_DIR}/pretrain_gpt.py" >&2

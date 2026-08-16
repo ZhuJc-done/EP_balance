@@ -17,6 +17,9 @@ scripts until the corresponding command is invoked.
 - `plot_expert_hotspots.py`: expert-ID hotspot heatmaps and placement metrics.
 - `plot_gin_replica_transport.py`: schematic of the GIN replica transport (needs no trace).
 - `PAPER_FIGURE_TEXT.md`: paper-ready caption and body text in English and Chinese.
+- `calibrate_router_skew.py`, `extract_routing_imbalance.py`: the synthetic-skew
+  workflow described at the end of this file, which is *not* part of the frozen
+  checkpoint capture above.
 
 The capture wrapper delegates model execution to the shared
 `scripts/run_real_moe.sh`; that launcher remains under `scripts/` because it is
@@ -101,8 +104,8 @@ request-level serving replay.
 
 ## 2. Convert the trained Qwen checkpoint
 
-Use the official Megatron Bridge converter; the repository's legacy
-`convert_hf_to_mcore.sh` is a Mixtral example, not a Qwen converter.
+Use the official Megatron Bridge converter; the pinned community Megatron
+converter has no Qwen3 loader.
 
 ```bash
 python examples/conversion/convert_checkpoints.py import \
@@ -205,3 +208,42 @@ equivalent to training with Megatron's `global_aux_loss`. A true
 microbatch-loss versus global-batch-loss comparison requires two checkpoints
 trained from the same initialization with `aux_loss` and `global_aux_loss`,
 followed by this same frozen evaluation.
+
+## Related: synthetic router skew, without a trained checkpoint
+
+Separate from the frozen-checkpoint capture above. `ROUTER_SKEW=<std>` makes
+`run_real_moe.sh` pass Megatron's `--moe-router-force-biased`, which *replaces* the
+router logits with noise plus a globally shared per-expert bias. That manufactures a
+controllable imbalance in a few hundred steps instead of waiting for experts to
+specialise, at the cost of a meaningless loss: use it for step time and imbalance only.
+
+Pick the magnitude before spending GPU time. `calibrate_router_skew.py` reproduces that
+sampler offline and reports the imbalance each `std` yields, including the spread across
+bias draws (a run gets exactly one draw, so the same `ROUTER_SKEW` at a different `--seed`
+lands elsewhere):
+
+```bash
+python eval/calibrate_router_skew.py --target-rank-imbalance 1.5
+```
+
+Rank-level skew is much weaker than expert-level skew because the bias is drawn per
+expert while each rank owns `E / R` of them. `--bias-mode block` bounds what a co-located
+hotspot pattern would give; Megatron cannot express it today.
+
+Then measure what actually happened. The `[EPLB] ... imbalance=` line an observe run
+prints is the residual *after* replica placement, so the raw skew needs `EPLB_TRACE_OUT`:
+
+```bash
+EPLB_MODE=observe ROUTER_SKEW=-0.5 EPLB_TRACE_OUT=traces/skew05.pt ... \
+  bash scripts/run_real_moe.sh ...
+
+python eval/extract_routing_imbalance.py \
+  --trace traces/skew05.pt \
+  --log logs/skew05_observe_node0.log \
+  --out-dir exp/skew05
+```
+
+That reports raw expert and rank max/mean per layer, joins the residual on `(layer, mb)`,
+and derives the share of the excess the solver absorbed. Write the trace to local disk:
+`flush_trace` rewrites the whole file every `EPLB_TRACE_EVERY` samples, which the HDFS
+FUSE mount handles poorly.
