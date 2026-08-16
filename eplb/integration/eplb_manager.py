@@ -25,7 +25,7 @@ from ..plan import Plan
 from ..problem import ProblemSpec
 from .comm import a2a_raw, all_to_all_single, broadcast_from_main
 from .gin_weights import GinReplicaTransport, GinWeightReplicator, gin_enabled
-from .grouped_mlp import grouped_expert_mlp
+from .grouped_mlp import grouped_expert_mlp, ragged_enabled
 from .manual_block import ManualMoEBlock
 from .overlap import OverlappedExperts, _comm_stream, overlapped_grouped_expert_mlp
 from .physical import assign_physical
@@ -345,7 +345,7 @@ class DeepEPAdapter:
         payload: torch.Tensor,
         route_idx: torch.Tensor,
         n_slot: int,
-        cap: int,
+        cap: Optional[int],
         group,
     ) -> Tuple[torch.Tensor, Dict[str, object]]:
         if not self._deepep_eligible(payload):
@@ -386,7 +386,9 @@ class DeepEPAdapter:
         valid = rows < total_recv
         recv_topk_idx = holder["recv_topk_idx"]
         recv_slot = torch.where(valid, recv_topk_idx[:, 0].to(torch.int64), 0)
-        if hasattr(torch, "_assert_async"):
+        # Only the padded expert path has a per-slot ceiling to violate; the ragged one sizes each
+        # group from these very counts, so there is nothing to check.
+        if cap is not None and hasattr(torch, "_assert_async"):
             torch._assert_async(
                 torch.all(group_sizes <= int(cap)),
                 "ElasticBuffer: EPLB_CAP is below a physical slot's received-token count",
@@ -423,9 +425,11 @@ class DeepEPAdapter:
         self, payload, sent_per_dst, recv_per_src, group, tag: int = 0,
         *, route_idx=None, n_slot=None, cap=None,
     ):
-        if n_slot is None or cap is None:
-            raise ValueError("ElasticBuffer dispatch requires n_slot and cap")
-        recv, holder = self._dispatch(payload, route_idx, int(n_slot), int(cap), group)
+        if n_slot is None:
+            raise ValueError("ElasticBuffer dispatch requires n_slot")
+        recv, holder = self._dispatch(
+            payload, route_idx, int(n_slot), None if cap is None else int(cap), group
+        )
         self._handles[tag] = holder
         self._state.setdefault(tag, {})["disp"] = holder
         return recv
@@ -547,7 +551,9 @@ def _make_materialize_and_compute(
     group_sizes: torch.Tensor,
     valid_mask: Optional[torch.Tensor],
     batched_mlp_fn: Callable,
-    cap: int,
+    cap: Optional[int],
+    grouped_mlp_fn: Optional[Callable],
+    max_recv_rows: Optional[int],
     n_slot: int,
     dtype: torch.dtype,
     device,
@@ -599,7 +605,7 @@ def _make_materialize_and_compute(
             w_stacked.append(buf[:n_slot])
         out_units_recv = grouped_expert_mlp(
             recv_tokens, recv_slot, group_sizes, tuple(w_stacked), batched_mlp_fn, cap,
-            valid_mask=valid_mask,
+            valid_mask=valid_mask, grouped_mlp_fn=grouped_mlp_fn, max_recv_rows=max_recv_rows,
         )
         # keepalive: make output depend on every broadcast so all ranks hit the matching reduce in backward
         keep = recv_tokens.sum() * 0.0
@@ -713,7 +719,9 @@ def _moe_forward_two_chunks(
     experts: "Optional[OverlappedExperts]",
     block: "Optional[ManualMoEBlock]",
     batched_mlp_fn: Callable,
-    cap: int,
+    cap: Optional[int],
+    grouped_mlp_fn: Optional[Callable],
+    max_recv_rows: Optional[int],
     group,
     adapter,
     my_rank: int,
@@ -789,7 +797,7 @@ def _moe_forward_two_chunks(
             [p["route"] for p in prep],
             [p["dispatch_bytes"] for p in prep], [p["combine_bytes"] for p in prep],
             adapter=adapter, group=group, cap=cap, n_slot=n_slot, H=H, pad_cols=pad_cols,
-            my_rank=my_rank,
+            my_rank=my_rank, max_recv_rows=max_recv_rows,
         )
         return block.prefetch_on_backward_of(
             _scatter_to_tokens(comb, prep, tokens.shape[0], H, device, keepalive=None)
@@ -840,11 +848,13 @@ def _moe_forward_two_chunks(
                 recv_slot_k.clamp(min=0, max=n_slot - 1), n_slot
             )
         if experts is not None:
-            y_k = experts.chunk(recv_tokens_k, recv_slot_k, group_sizes_k, cap, valid_k)
+            y_k = experts.chunk(
+                recv_tokens_k, recv_slot_k, group_sizes_k, cap, valid_k, max_recv_rows
+            )
         else:
             y_k = grouped_expert_mlp(
                 recv_tokens_k, recv_slot_k, group_sizes_k, w_stacked, batched_mlp_fn, cap,
-                valid_mask=valid_k,
+                valid_mask=valid_k, grouped_mlp_fn=grouped_mlp_fn, max_recv_rows=max_recv_rows,
             )
         if on_cuda:
             comp_evt = torch.cuda.Event()
@@ -903,6 +913,8 @@ def sync_free_moe_forward(
     weight_shapes: Sequence[torch.Size],
     batched_mlp_fn: Callable[[torch.Tensor, Tuple[torch.Tensor, ...]], torch.Tensor],
     cap: Optional[int] = None,
+    grouped_mlp_fn: Optional[Callable[..., torch.Tensor]] = None,
+    max_recv_rows: Optional[int] = None,
     group=None,
     adapter: Optional[CommAdapter] = None,
     rematerialize: bool = False,
@@ -922,8 +934,16 @@ def sync_free_moe_forward(
         spec: Problem spec (``num_experts``, ``main_rank`` as group-local ranks, ``n_slot``).
         weights_local: ``{e: weight_tuple}`` for experts whose ``main(e)`` is this rank.
         weight_shapes: Shape of each weight tensor in an expert's tuple.
-        batched_mlp_fn: ``(x[S, cap, H], stacked_weights) -> y[S, cap, H]`` batched expert forward.
-        cap: Per-slot capacity. ElasticBuffer requires a host-static value or ``EPLB_CAP``.
+        batched_mlp_fn: ``(x[S, cap, H], stacked_weights) -> y[S, cap, H]`` padded expert forward.
+        cap: Per-slot capacity for the padded path. ElasticBuffer requires a host-static value or
+            ``EPLB_CAP`` unless the ragged path applies.
+        grouped_mlp_fn: ``(x[T, H], stacked_weights, offs[n_slot]) -> y[T, H]`` ragged expert
+            forward, matching ``batched_mlp_fn``'s weight convention. Supplying it lets the plain
+            (non-overlapped) path drop both the padding and the ``cap`` host read.
+        max_recv_rows: Host-static bound on this rank's total received rows, for the ragged path.
+            ElasticBuffer hands back a worst-case ``ep_size * max_tokens_per_rank`` rows; setting
+            this shrinks every expert tensor to the budget instead. See
+            :func:`grouped_mlp.compact_rows`.
         group: EP process group.
         adapter: Transport backend (defaults to :class:`AllToAllAdapter`).
         rematerialize: ``dist.broadcast`` path only: if True, checkpoint the replication + expert GEMM
@@ -955,12 +975,18 @@ def sync_free_moe_forward(
     slot_to_e, slot_of_e, hosted = _slot_tables(plan.x, my_rank, n_slot)
     group_sizes = _group_sizes_by_slot(slot_to_e, recv_per_expert, n_slot, device)
 
+    # The ragged expert path takes its slot boundaries from a device tensor, so it needs no `cap`
+    # at all. Deciding that here is what removes the last host read from the GIN path below.
+    ragged = ragged_enabled(tokens) and (
+        overlap or gin_enabled() or grouped_mlp_fn is not None
+    )
     if cap is None and os.environ.get("EPLB_CAP"):
         cap = int(os.environ["EPLB_CAP"])
     elastic = adapter.uses_padded_layout()
-    if cap is None and elastic:
+    if cap is None and elastic and not ragged:
         raise ValueError(
-            "ElasticBuffer needs a host-static per-slot cap: pass cap=... or set EPLB_CAP"
+            "ElasticBuffer needs a host-static per-slot cap: pass cap=..., set EPLB_CAP, or "
+            "supply grouped_mlp_fn so the ragged path can size itself on device"
         )
 
     # Control plane for the replica broadcasts. `dist.broadcast` needs a host-side `src`, so the set of
@@ -968,26 +994,26 @@ def sync_free_moe_forward(
     # ~E ints, not per-slot/per-token -- carrying `cap` along when it still has to be derived.
     # Everything else on this path stays on device. The GIN weight backend needs none of this: its
     # get_batched/put_batched schedule (weight pull and grad reduce-to-main alike) is device-resident,
-    # so on that path the only host read left here is `cap` -- and that is a compute-side quantity,
-    # not part of the weight channel.
+    # so on that path `cap` was the only host read left -- and the ragged expert path removes it,
+    # making GIN + ragged genuinely free of host reads.
     #
-    # `cap` sizes the dense [n_slot, cap, H] batch `grouped_expert_mlp` pads to, whose activations
-    # dominate this path's memory -- far more than the replica weights. `group_sizes` is the exact
-    # per-slot token count under this plan, so its max is the tightest correct cap and ~n_slot x below
-    # the naive "every received token could land in one slot" bound; a better-balanced plan is
-    # therefore also a cheaper one.
+    # `cap` only exists for the padded fallback, where it sizes the dense [n_slot, cap, H] batch and
+    # so costs n_slot x cap rows of GEMM whatever the real occupancy. The ragged path reads the same
+    # `group_sizes` straight off the device as grouped-GEMM offsets and computes exactly the received
+    # rows, so neither the host read nor the padding survives.
     replicated, replicated_main = [], []
+    need_cap = cap is None and not ragged
     if not gin_enabled():
         rep_e = (plan.num_replicas() > 1).nonzero(as_tuple=False).flatten()   # ascending expert ids
         n_rep = int(rep_e.shape[0])   # host-known: nonzero already resolved its own output size
         parts = [rep_e, spec.main_rank.index_select(0, rep_e).to(torch.int64)]
-        if cap is None:
+        if need_cap:
             parts.append(group_sizes.max().reshape(1))
         flat = torch.cat(parts).tolist()
         replicated, replicated_main = flat[:n_rep], flat[n_rep:2 * n_rep]
-        if cap is None:
+        if need_cap:
             cap = max(flat[-1], 1)
-    elif cap is None:
+    elif need_cap:
         cap = max(int(group_sizes.max()), 1)
 
     # --- STAGE 1: ROUTE each unit -> (physical id, dst rank); order by dst; split sizes ------
@@ -1032,7 +1058,8 @@ def sync_free_moe_forward(
         return _moe_forward_two_chunks(
             tokens=tokens, unit_token_idx=unit_token_idx, unit_prob=unit_prob,
             phys_id=phys_id, dst_rank=dst_rank, w_stacked=w_stacked, keepalive=keepalive,
-            experts=experts, block=block, batched_mlp_fn=batched_mlp_fn, cap=cap, group=group,
+            experts=experts, block=block, batched_mlp_fn=batched_mlp_fn, cap=cap,
+            grouped_mlp_fn=grouped_mlp_fn, max_recv_rows=max_recv_rows, group=group,
             adapter=adapter, my_rank=my_rank, n_slot=n_slot, H=H, dtype=dtype, device=device,
             R=int(plan.q.shape[0]), num_chunks=num_chunks,
         )
@@ -1098,15 +1125,15 @@ def sync_free_moe_forward(
                 device=device, group=group, transport=transport,
             )
             out_units_recv = experts.chunk(
-                recv_tokens, recv_slot, group_sizes, cap, valid_mask
+                recv_tokens, recv_slot, group_sizes, cap, valid_mask, max_recv_rows
             )
         else:
             compute = _make_materialize_and_compute(
                 replicated=replicated, replicated_main=replicated_main, weights_local=weights_local,
                 weight_shapes=weight_shapes, slot_of_e=slot_of_e, hosted=hosted, recv_slot=recv_slot,
                 group_sizes=group_sizes, valid_mask=valid_mask,
-                batched_mlp_fn=batched_mlp_fn, cap=cap,
-                n_slot=n_slot, dtype=dtype, device=device, group=group,
+                batched_mlp_fn=batched_mlp_fn, cap=cap, grouped_mlp_fn=grouped_mlp_fn,
+                max_recv_rows=max_recv_rows, n_slot=n_slot, dtype=dtype, device=device, group=group,
             )
             if rematerialize:  # Level A: recompute the broadcasts in backward instead of holding them
                 out_units_recv = checkpoint(compute, recv_tokens, use_reentrant=False, preserve_rng_state=False)

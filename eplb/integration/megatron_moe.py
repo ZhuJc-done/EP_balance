@@ -5,20 +5,37 @@ from __future__ import annotations
 import os
 import types
 import warnings
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
 from . import profiling
 from ..problem import ProblemSpec
-from .grouped_mlp import make_batched_gated_mlp
+from .grouped_mlp import make_batched_gated_mlp, make_grouped_gated_mlp, ragged_available
 from .eplb_manager import AllToAllAdapter, DeepEPAdapter, sync_free_moe_forward
 
 
 def _env_flag(name: str) -> bool:
     """Truthy parse of an on/off environment toggle."""
     return os.environ.get(name, "0").lower() not in ("0", "", "false", "no")
+
+
+def _env_cap() -> Optional[int]:
+    """``EPLB_CAP`` as a positive int, or None when unset -- the ragged path needs no cap."""
+    cap = int(os.environ.get("EPLB_CAP", "0") or "0")
+    return cap if cap > 0 else None
+
+
+def _env_max_recv_rows() -> Optional[int]:
+    """``EPLB_MAX_RECV_ROWS`` as a positive int, or None to keep the transport's worst-case rows.
+
+    Bounds this rank's *total* received rows, so a sane value is a margin over the balanced
+    expectation ``tokens_per_rank * topk / EPLB_CHUNKS``, not the worst case the buffer is sized
+    for. Too low is caught on device rather than silently dropping tokens.
+    """
+    rows = int(os.environ.get("EPLB_MAX_RECV_ROWS", "0") or "0")
+    return rows if rows > 0 else None
 
 
 def _make_adapter():
@@ -37,9 +54,11 @@ def _make_adapter():
                 "legacy DeepEP Buffer settings are not supported by ElasticBuffer: "
                 + ", ".join(legacy)
             )
-        cap = int(os.environ.get("EPLB_CAP", "0") or "0")
-        if cap <= 0:
-            raise ValueError("EPLB_ADAPTER=deepep requires a positive host-static EPLB_CAP")
+        if _env_cap() is None and not ragged_available():
+            raise ValueError(
+                "EPLB_ADAPTER=deepep requires a positive host-static EPLB_CAP unless the ragged "
+                "grouped GEMM is available (CUDA SM90+ bf16, EPLB_GROUPED_GEMM != 0)"
+            )
         if os.environ.get("EPLB_WEIGHT_COMM", "").strip().lower() != "gin":
             raise ValueError("zero-sync ElasticBuffer mode requires EPLB_WEIGHT_COMM=gin")
         if os.environ.get("EPLB_GIN_FENCE", "").strip().lower() != "signal":
@@ -178,7 +197,9 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
         unit_prob=unit_prob.to(tokens.dtype),
         plan=plan, spec=spec, weights_local=weights_local,
         weight_shapes=weight_shapes, batched_mlp_fn=cfg["batched_mlp_fn"],
-        cap=int(os.environ["EPLB_CAP"]) if isinstance(cfg["adapter"], DeepEPAdapter) else None,
+        cap=_env_cap() if isinstance(cfg["adapter"], DeepEPAdapter) else None,
+        grouped_mlp_fn=cfg.get("grouped_mlp_fn"),
+        max_recv_rows=_env_max_recv_rows(),
         group=group, adapter=cfg["adapter"],
         rematerialize=cfg["rematerialize"], overlap=cfg["overlap"],
         gated=cfg["gated"], act=cfg["act"], transpose_w=True,
@@ -231,6 +252,7 @@ def bind_eplb_to_moe_layer(moe_layer, rebalancer, ep_group, layer_id: int = 0) -
         "gated": gated,
         "act": act,
         "batched_mlp_fn": make_batched_gated_mlp(gated, act),
+        "grouped_mlp_fn": make_grouped_gated_mlp(gated, act),
         "adapter": adapter,
         "rematerialize": _env_flag("EPLB_REMATERIALIZE"),
         "overlap": _env_flag("EPLB_OVERLAP"),
