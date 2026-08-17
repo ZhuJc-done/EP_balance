@@ -455,3 +455,131 @@ def test_replica_schedule_device_math():
     assert peers.tolist() == [1, -1, -1]          # only slot 0 (expert2 on rank1) is a remote get
     assert ls.tolist() == [0, 0, 0]               # local_slot(e2)=0, local_slot(e0)=0
     assert is_local.tolist() == [False, True, False]  # slot 1 (expert0) filled by on-device gather
+
+
+def test_grad_reduce_ignores_stale_inactive_columns_and_stages_only_remotes():
+    """CPU fake of the plan-masked owner reduction; real kernels are covered by cluster tests."""
+    from eplb.integration.gin_weights import GinReplicaTransport
+
+    class FakeGin:
+        def __init__(self):
+            self.copy_masks = []
+            self.put_calls = 0
+            self.sum_calls = 0
+
+        def copy_rows_masked(self, src, dst, active):
+            self.copy_masks.append(active.clone())
+            dst[active] = src[active]
+
+        def put_batched(self, *args, **kwargs):
+            # Active remote owner columns are pre-populated below, emulating completed puts.
+            self.put_calls += 1
+
+        def masked_sum_rows(self, scratch, local, active, local_rows, local_rank):
+            self.sum_calls += 1
+            output = []
+            for expert in range(active.shape[0]):
+                terms = []
+                for rank in range(active.shape[1]):
+                    if not bool(active[expert, rank]):
+                        continue
+                    if rank == local_rank:
+                        terms.append(local[int(local_rows[expert])])
+                    else:
+                        terms.append(scratch[expert, rank])
+                output.append(torch.stack(terms).sum(dim=0))
+            return torch.stack(output)
+
+    class FakeReplicator:
+        E = 3
+        n_slot = 3
+        J = 2
+        world = 3
+        my_rank = 0
+        home_cap = 2
+        dtype = torch.float32
+        weight_shapes = [torch.Size((2,)), torch.Size((2,))]
+        wb = [8, 8]
+        grid = 8
+        use_lsa = True
+        main_experts = [0, 1]
+        main_expert_dev = torch.tensor([0, 1], dtype=torch.int64)
+        local_slot_dev = torch.tensor([0, 1, 0], dtype=torch.int64)
+
+        def __init__(self):
+            self._gin = FakeGin()
+            self.slot = [torch.empty(self.n_slot * width, dtype=torch.uint8) for width in self.wb]
+            self.scratch = [
+                torch.empty(self.home_cap * self.world * width, dtype=torch.uint8)
+                for width in self.wb
+            ]
+            self.slot_off = [
+                torch.arange(self.n_slot, dtype=torch.int64) * width for width in self.wb
+            ]
+            self.nbytes_const = [
+                torch.full((self.n_slot,), width, dtype=torch.int64) for width in self.wb
+            ]
+            self.fences = []
+
+        def slot_tables(self, plan_x):
+            del plan_x
+            return (
+                torch.tensor([0, 1, 2], dtype=torch.int64),
+                torch.tensor([0, 0, 1], dtype=torch.int64),
+            )
+
+        def _check_dtype(self, tensor, what):
+            assert tensor.dtype == self.dtype, what
+
+        def fence(self, index):
+            self.fences.append(index)
+
+    # Rank 0 owns e0/e1 and hosts remote e2. For its owned experts, only columns {0,1} and {0,2}
+    # are live. Large sentinels in every other column must survive and must not enter the result.
+    plan_x = torch.tensor(
+        [
+            [1, 1, 0],
+            [1, 0, 1],
+            [1, 1, 0],
+        ],
+        dtype=torch.int8,
+    )
+    replicator = FakeReplicator()
+    scratch_values = [
+        torch.tensor(
+            [
+                [[900.0, 900.0], [10.0, 20.0], [901.0, 901.0]],
+                [[902.0, 902.0], [903.0, 903.0], [30.0, 40.0]],
+            ]
+        ),
+        torch.tensor(
+            [
+                [[904.0, 904.0], [100.0, 200.0], [905.0, 905.0]],
+                [[906.0, 906.0], [907.0, 907.0], [300.0, 400.0]],
+            ]
+        ),
+    ]
+    for scratch, values in zip(replicator.scratch, scratch_values):
+        scratch.view(torch.float32).reshape_as(values).copy_(values)
+    for slot in replicator.slot:
+        slot.view(torch.float32).fill_(-7.0)
+
+    grad_w1 = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    grad_w2 = torch.tensor([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]])
+    transport = GinReplicaTransport(replicator, plan_x)
+    grads = transport.reduce_grads(
+        {"main_experts": [0, 1]}, grad_w1, grad_w2, torch.float32, torch.device("cpu")
+    )
+
+    assert torch.equal(
+        torch.stack(grads),
+        torch.tensor([[11.0, 22.0], [110.0, 220.0], [33.0, 44.0], [330.0, 440.0]]),
+    )
+    assert replicator.fences == [2, 3]
+    assert replicator._gin.put_calls == 2
+    assert replicator._gin.sum_calls == 2
+    assert all(mask.tolist() == [False, False, True] for mask in replicator._gin.copy_masks)
+    assert torch.equal(replicator.slot[0].view(torch.float32)[:4], torch.full((4,), -7.0))
+    assert torch.equal(replicator.slot[0].view(torch.float32)[4:], torch.tensor([5.0, 6.0]))
+    for scratch, values in zip(replicator.scratch, scratch_values):
+        assert torch.equal(scratch.view(torch.float32).reshape_as(values), values)

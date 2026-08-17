@@ -25,6 +25,7 @@ Run MoE on real Megatron-LM with three behaviors selected by `EPLB_MODE`:
 | `run_slot_sweep.sh` | Sweep `N_slot=1..4` with workload seed 0 and save one non-detail baseline JSON per configuration; uses a fixed LPLB Ring topology. |
 | `run_solver_scaling.sh` | Sweep the Scale-EPLB CUDA solver over logical rank and expert counts and save hot-kernel JSON results. |
 | `prepare_open_workload.py` | Download task/corpus workloads, extract model inputs, and optionally build Megatron `.bin/.idx`. |
+| `reindex_mixed_1b.sh` | Re-tokenize an existing mixed JSONL for DeepSeek-V2 and GLM-4.5-Air without changing the raw corpus or Qwen index. |
 | `eval/plot_solver_scaling.py` | Read an existing solver-scaling JSON directory and independently generate PNG/PDF plots. |
 | `install_megatron.sh` | Clone+install pinned community Megatron-LM, self-check `import megatron`. |
 | `install_deepep.sh` | Optional: clone+build DeepEP (NCCL Gin backend) for the sync-free transport. |
@@ -126,6 +127,28 @@ MAX_DOCS=0 bash scripts/prepare_data.sh
 # Training prefix:
 # DATA_PATH=${EPLB_INDEXED_DATA_DIR}/wikitext103_text_document
 ```
+
+### Re-index an existing mixed corpus for another model
+
+`DATA_PATH` is a Megatron indexed prefix, not a raw-text path: it resolves to
+`<DATA_PATH>.bin` and `<DATA_PATH>.idx`. Token IDs are tokenizer-specific, so a
+Qwen-indexed `mixed_1b_text_document` must not be passed to the DeepSeek or GLM
+recipes. Reuse the source JSONL instead:
+
+```bash
+source scripts/env_hdfs.sh
+MEGATRON_DIR="${HOME}/Megatron-LM" \
+  bash scripts/reindex_mixed_1b.sh
+
+# DeepSeek: DATA_PATH=${EPLB_INDEXED_DATA_DIR}/mixed_1b_deepseek_v2_160e_text_document
+# GLM:      DATA_PATH=${EPLB_INDEXED_DATA_DIR}/mixed_1b_glm45_air_text_document
+```
+
+The launcher reads `raw/mixed_1b.jsonl` but never rewrites it. It processes
+DeepSeek then GLM, writes each result through a temporary prefix, validates the
+index, and only then promotes it to the model-specific path. Existing verified
+variant indexes are reused; `FORCE=1` regenerates only the selected variant.
+Use `MODELS=deepseek_v2_160e` or `MODELS=glm45_air` to process one model.
 
 For DAPO-Math and the other workload adapters:
 

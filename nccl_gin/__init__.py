@@ -320,6 +320,44 @@ def put_batched(
             int(k), int(blocks_per_desc), bool(use_lsa), stream_opt))
 
 
+def copy_rows_masked(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    active: torch.Tensor,
+    stream: Optional[torch.cuda.Stream] = None,
+):
+    """Copy only ``active`` rows into a symmetric staging tensor.
+
+    The shape stays static and the mask remains device-resident, but inactive local/main/empty
+    rows generate no source or destination HBM traffic.
+    """
+    _ensure_loaded()
+    return _run_with_stream(
+        stream,
+        lambda stream_opt: _C.copy_rows_masked(src, dst, active, stream_opt))
+
+
+def masked_sum_rows(
+    scratch: torch.Tensor,
+    local: torch.Tensor,
+    active: torch.Tensor,
+    local_rows: torch.Tensor,
+    local_rank: int,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> torch.Tensor:
+    """Reduce only live placement columns from ``scratch``.
+
+    ``scratch`` is ``[owned_experts, world, ...]`` and may contain stale values wherever
+    ``active`` is false. The local-rank term is read directly from ``local[local_rows]``, so no
+    owner gradient is copied into scratch. Accumulation is fp32 and the result uses ``local.dtype``.
+    """
+    _ensure_loaded()
+    return _run_with_stream(
+        stream,
+        lambda stream_opt: _C.masked_sum_rows(
+            scratch, local, active, local_rows, int(local_rank), stream_opt))
+
+
 def put_signal(
     src_buffer: torch.Tensor,
     dst_buffer: torch.Tensor,

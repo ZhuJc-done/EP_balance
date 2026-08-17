@@ -811,6 +811,105 @@ __global__ void GinPutBatchedKernel(ncclWindow_t srcWin, size_t srcBase,
 }
 
 // ---------------------------------------------------------------------------
+// Local gradient staging and sparse owner reduction
+//
+// The symmetric scratch allocation is fixed at [max_mains, world, weight_bytes], but only the
+// columns named by the current placement table contain this iteration's gradients. Predicating the
+// loads here removes both the full-buffer memset and the dense world-way torch.sum. The owner's own
+// gradient bypasses scratch, which also removes the fixed-shape index_copy_ and its dump row.
+// ---------------------------------------------------------------------------
+static constexpr int LOCAL_GRAD_THREADS = 256;
+static constexpr int LOCAL_GRAD_MAX_BLOCKS = 4096;
+static constexpr int MASKED_COPY_BYTES = 16;
+
+__global__ void CopyRowsMaskedKernel(const uint8_t* __restrict__ src,
+                                     uint8_t* __restrict__ dst,
+                                     const bool* __restrict__ active,
+                                     int64_t rows, int64_t rowBytes) {
+  const int64_t chunksPerRow =
+      (rowBytes + MASKED_COPY_BYTES - 1) / MASKED_COPY_BYTES;
+  const int64_t tasks = rows * chunksPerRow;
+  for (int64_t task = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+       task < tasks;
+       task += (int64_t)gridDim.x * blockDim.x) {
+    const int64_t row = task / chunksPerRow;
+    if (!active[row]) continue;
+    const int64_t inRow = (task - row * chunksPerRow) * MASKED_COPY_BYTES;
+    const int64_t bytes =
+        min((int64_t)MASKED_COPY_BYTES, rowBytes - inRow);
+    const int64_t off = row * rowBytes + inRow;
+    const uint8_t* s = src + off;
+    uint8_t* d = dst + off;
+    const uintptr_t alignment =
+        reinterpret_cast<uintptr_t>(s) | reinterpret_cast<uintptr_t>(d);
+    if (bytes == MASKED_COPY_BYTES &&
+        (alignment & (MASKED_COPY_BYTES - 1)) == 0) {
+      *reinterpret_cast<uint4*>(d) = *reinterpret_cast<const uint4*>(s);
+    } else {
+      #pragma unroll
+      for (int i = 0; i < MASKED_COPY_BYTES; ++i)
+        if (i < bytes) d[i] = s[i];
+    }
+  }
+}
+
+template <typename scalar_t>
+__global__ void CopyRowsMaskedStridedKernel(
+    const scalar_t* __restrict__ src,
+    scalar_t* __restrict__ dst,
+    const bool* __restrict__ active,
+    int64_t rows, int64_t rowElems, int64_t innerDim,
+    int64_t stride0, int64_t stride1, int64_t stride2) {
+  const int64_t tasks = rows * rowElems;
+  for (int64_t task = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+       task < tasks;
+       task += (int64_t)gridDim.x * blockDim.x) {
+    const int64_t row = task / rowElems;
+    if (!active[row]) continue;
+    const int64_t elem = task - row * rowElems;
+    const int64_t outer = elem / innerDim;
+    const int64_t inner = elem - outer * innerDim;
+    dst[task] = src[row * stride0 + outer * stride1 + inner * stride2];
+  }
+}
+
+template <typename scalar_t>
+__global__ void MaskedSumRowsKernel(
+    const scalar_t* __restrict__ scratch,
+    const scalar_t* __restrict__ local,
+    const bool* __restrict__ active,
+    const int64_t* __restrict__ localRows,
+    scalar_t* __restrict__ output,
+    int64_t experts, int64_t world, int64_t rowElems, int localRank,
+    int localContiguous, int64_t localInnerDim,
+    int64_t localStride0, int64_t localStride1, int64_t localStride2) {
+  const int64_t tasks = experts * rowElems;
+  for (int64_t task = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+       task < tasks;
+       task += (int64_t)gridDim.x * blockDim.x) {
+    const int64_t expert = task / rowElems;
+    const int64_t elem = task - expert * rowElems;
+    float sum = 0.0f;
+    for (int64_t rank = 0; rank < world; ++rank) {
+      if (!active[expert * world + rank]) continue;
+      int64_t localOff = localRows[expert] * rowElems + elem;
+      if (!localContiguous) {
+        const int64_t outer = elem / localInnerDim;
+        const int64_t inner = elem - outer * localInnerDim;
+        localOff = localRows[expert] * localStride0 +
+                   outer * localStride1 + inner * localStride2;
+      }
+      const scalar_t value =
+          rank == localRank
+              ? local[localOff]
+              : scratch[(expert * world + rank) * rowElems + elem];
+      sum += static_cast<float>(value);
+    }
+    output[task] = static_cast<scalar_t>(sum);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // World fence
 //
 // ncclSignal posts to a GIN connection, and connections only exist for peers this rank reaches
@@ -1226,6 +1325,175 @@ void put_batched(torch::Tensor src_buffer, torch::Tensor dst_buffer,
       (int)K, enableLsa ? 1 : 0, enableTma ? 1 : 0, g_state.devComm);
 }
 
+void copy_rows_masked(torch::Tensor src, torch::Tensor dst,
+                      torch::Tensor active,
+                      c10::optional<c10::cuda::CUDAStream> stream_opt) {
+  if (!src.is_cuda() || !dst.is_cuda() || !active.is_cuda())
+    throw std::runtime_error("copy_rows_masked tensors must be CUDA tensors");
+  if (!dst.is_contiguous() || !active.is_contiguous())
+    throw std::runtime_error("copy_rows_masked destination and mask must be contiguous");
+  if (src.scalar_type() != dst.scalar_type())
+    throw std::runtime_error("copy_rows_masked source and destination dtypes differ");
+  if (src.sizes() != dst.sizes())
+    throw std::runtime_error("copy_rows_masked source and destination shapes differ");
+  if (src.dim() < 1)
+    throw std::runtime_error("copy_rows_masked source must have a row dimension");
+  if (active.scalar_type() != torch::kBool || active.dim() != 1 ||
+      active.numel() != src.size(0))
+    throw std::runtime_error("copy_rows_masked active must be bool [rows]");
+  if (src.device() != dst.device() || src.device() != active.device())
+    throw std::runtime_error("copy_rows_masked tensors must share a CUDA device");
+
+  const int64_t rows = src.size(0);
+  if (rows == 0) return;
+  const int64_t totalBytes = src.numel() * src.element_size();
+  if (totalBytes == 0) return;
+  const int64_t rowBytes = totalBytes / rows;
+  cudaStream_t cuda_stream = stream_opt.has_value()
+                                 ? stream_opt->stream()
+                                 : at::cuda::getCurrentCUDAStream().stream();
+
+  if (src.is_contiguous()) {
+    const int64_t chunksPerRow =
+        (rowBytes + MASKED_COPY_BYTES - 1) / MASKED_COPY_BYTES;
+    const int64_t tasks = rows * chunksPerRow;
+    int64_t blocks64 =
+        (tasks + LOCAL_GRAD_THREADS - 1) / LOCAL_GRAD_THREADS;
+    if (blocks64 > LOCAL_GRAD_MAX_BLOCKS) blocks64 = LOCAL_GRAD_MAX_BLOCKS;
+    CopyRowsMaskedKernel<<<(int)blocks64, LOCAL_GRAD_THREADS, 0, cuda_stream>>>(
+        reinterpret_cast<const uint8_t*>(src.data_ptr()),
+        reinterpret_cast<uint8_t*>(dst.data_ptr()),
+        active.data_ptr<bool>(), rows, rowBytes);
+    CUDA_CHECK(cudaGetLastError());
+    return;
+  }
+
+  if (src.dim() != 2 && src.dim() != 3)
+    throw std::runtime_error(
+        "copy_rows_masked non-contiguous source must be [rows, n] or [rows, m, n]");
+  const int64_t rowElems = src.numel() / rows;
+  const int64_t innerDim = src.dim() == 3 ? src.size(2) : 1;
+  const int64_t stride0 = src.stride(0);
+  const int64_t stride1 = src.stride(1);
+  const int64_t stride2 = src.dim() == 3 ? src.stride(2) : 0;
+  const int64_t tasks = rows * rowElems;
+  int64_t blocks64 =
+      (tasks + LOCAL_GRAD_THREADS - 1) / LOCAL_GRAD_THREADS;
+  if (blocks64 > LOCAL_GRAD_MAX_BLOCKS) blocks64 = LOCAL_GRAD_MAX_BLOCKS;
+
+#define LAUNCH_MASKED_COPY(scalar_t)                                             \
+  CopyRowsMaskedStridedKernel<scalar_t>                                          \
+      <<<(int)blocks64, LOCAL_GRAD_THREADS, 0, cuda_stream>>>(                    \
+          src.data_ptr<scalar_t>(), dst.data_ptr<scalar_t>(),                    \
+          active.data_ptr<bool>(), rows, rowElems, innerDim,                     \
+          stride0, stride1, stride2)
+
+  switch (src.scalar_type()) {
+    case torch::kFloat32:
+      LAUNCH_MASKED_COPY(float);
+      break;
+    case torch::kFloat16:
+      LAUNCH_MASKED_COPY(at::Half);
+      break;
+    case torch::kBFloat16:
+      LAUNCH_MASKED_COPY(at::BFloat16);
+      break;
+    default:
+      throw std::runtime_error(
+          "copy_rows_masked strided source supports float32, float16, and bfloat16");
+  }
+#undef LAUNCH_MASKED_COPY
+  CUDA_CHECK(cudaGetLastError());
+}
+
+torch::Tensor masked_sum_rows(
+    torch::Tensor scratch, torch::Tensor local, torch::Tensor active,
+    torch::Tensor local_rows, int64_t local_rank,
+    c10::optional<c10::cuda::CUDAStream> stream_opt) {
+  if (!scratch.is_cuda() || !local.is_cuda() || !active.is_cuda() ||
+      !local_rows.is_cuda())
+    throw std::runtime_error("masked_sum_rows tensors must be CUDA tensors");
+  if (!scratch.is_contiguous() || !active.is_contiguous() ||
+      !local_rows.is_contiguous())
+    throw std::runtime_error(
+        "masked_sum_rows scratch, active, and local_rows must be contiguous");
+  if (scratch.dim() < 3)
+    throw std::runtime_error("masked_sum_rows scratch must be [experts, world, ...]");
+  if (local.dim() + 1 != scratch.dim())
+    throw std::runtime_error("masked_sum_rows local tensor has the wrong rank");
+  if (scratch.scalar_type() != local.scalar_type())
+    throw std::runtime_error("masked_sum_rows scratch and local dtypes differ");
+  if (scratch.device() != local.device() || scratch.device() != active.device() ||
+      scratch.device() != local_rows.device())
+    throw std::runtime_error("masked_sum_rows tensors must share a CUDA device");
+
+  const int64_t experts = scratch.size(0);
+  const int64_t world = scratch.size(1);
+  if (active.scalar_type() != torch::kBool || active.dim() != 2 ||
+      active.size(0) != experts || active.size(1) != world)
+    throw std::runtime_error("masked_sum_rows active must be bool [experts, world]");
+  if (local_rows.scalar_type() != torch::kInt64 || local_rows.dim() != 1 ||
+      local_rows.numel() != experts)
+    throw std::runtime_error("masked_sum_rows local_rows must be int64 [experts]");
+  if (local_rank < 0 || local_rank >= world)
+    throw std::runtime_error("masked_sum_rows local_rank is out of range");
+  if (!local.is_contiguous() && local.dim() != 2 && local.dim() != 3)
+    throw std::runtime_error(
+        "masked_sum_rows non-contiguous local must be [slots, n] or [slots, m, n]");
+  for (int64_t dim = 2; dim < scratch.dim(); ++dim)
+    if (scratch.size(dim) != local.size(dim - 1))
+      throw std::runtime_error("masked_sum_rows trailing shapes differ");
+
+  std::vector<int64_t> outputShape;
+  outputShape.reserve(scratch.dim() - 1);
+  outputShape.push_back(experts);
+  for (int64_t dim = 2; dim < scratch.dim(); ++dim)
+    outputShape.push_back(scratch.size(dim));
+  torch::Tensor output = torch::empty(outputShape, scratch.options());
+  if (output.numel() == 0) return output;
+
+  const int64_t rowElems = output.numel() / experts;
+  int64_t blocks64 =
+      (output.numel() + LOCAL_GRAD_THREADS - 1) / LOCAL_GRAD_THREADS;
+  if (blocks64 > LOCAL_GRAD_MAX_BLOCKS) blocks64 = LOCAL_GRAD_MAX_BLOCKS;
+  cudaStream_t cuda_stream = stream_opt.has_value()
+                                 ? stream_opt->stream()
+                                 : at::cuda::getCurrentCUDAStream().stream();
+  const int localContiguous = local.is_contiguous() ? 1 : 0;
+  const int64_t localInnerDim =
+      local.dim() == 3 ? local.size(2) : 1;
+  const int64_t localStride0 = localContiguous ? 0 : local.stride(0);
+  const int64_t localStride1 = localContiguous ? 0 : local.stride(1);
+  const int64_t localStride2 =
+      localContiguous || local.dim() != 3 ? 0 : local.stride(2);
+
+#define LAUNCH_MASKED_SUM(scalar_t)                                              \
+  MaskedSumRowsKernel<scalar_t><<<(int)blocks64, LOCAL_GRAD_THREADS, 0,           \
+                                  cuda_stream>>>(                                 \
+      scratch.data_ptr<scalar_t>(), local.data_ptr<scalar_t>(),                   \
+      active.data_ptr<bool>(), local_rows.data_ptr<int64_t>(),                    \
+      output.data_ptr<scalar_t>(), experts, world, rowElems, (int)local_rank,     \
+      localContiguous, localInnerDim, localStride0, localStride1, localStride2)
+
+  switch (scratch.scalar_type()) {
+    case torch::kFloat32:
+      LAUNCH_MASKED_SUM(float);
+      break;
+    case torch::kFloat16:
+      LAUNCH_MASKED_SUM(at::Half);
+      break;
+    case torch::kBFloat16:
+      LAUNCH_MASKED_SUM(at::BFloat16);
+      break;
+    default:
+      throw std::runtime_error(
+          "masked_sum_rows supports float32, float16, and bfloat16");
+  }
+#undef LAUNCH_MASKED_SUM
+  CUDA_CHECK(cudaGetLastError());
+  return output;
+}
+
 void put_signal(torch::Tensor src_buffer, torch::Tensor dst_buffer,
                 int64_t src_offset, int64_t dst_offset,
                 int64_t num_bytes, int peer,
@@ -1397,6 +1665,15 @@ PYBIND11_MODULE(_nccl_gin_C, m) {
         py::arg("nbytes"), py::arg("peers"), py::arg("k"),
         py::arg("blocks_per_desc") = 1,
         py::arg("use_lsa") = true,
+        py::arg("stream") = py::none());
+  m.def("copy_rows_masked", &copy_rows_masked,
+        "Copy only active rows into a symmetric staging tensor",
+        py::arg("src"), py::arg("dst"), py::arg("active"),
+        py::arg("stream") = py::none());
+  m.def("masked_sum_rows", &masked_sum_rows,
+        "Sum live per-rank scratch rows, taking the local rank directly from slot gradients",
+        py::arg("scratch"), py::arg("local"), py::arg("active"),
+        py::arg("local_rows"), py::arg("local_rank"),
         py::arg("stream") = py::none());
   m.def("put_signal", &put_signal,
         "P2P put via host-side ncclPutSignal",

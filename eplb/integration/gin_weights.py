@@ -16,8 +16,9 @@ with the expert-parallel group inside a node, routing every slot through ``gin.p
 whole weight channel out to the NIC and back at a fraction of NVLink bandwidth. ``EPLB_GIN_LSA=0``
 forces the network path for every peer, for A/B measurement only.
 
-Two ordering fences per direction remain (homes-visible-before-get, reads-done-before-recycle, and the
-backward puts-landed-before-sum). They default to ``dist.barrier`` (host-launched); set
+Two ordering fences per direction remain (homes-visible-before-get, reads-done-before-recycle,
+scratch-readers-done-before-put, and puts-landed-before-sum). They default to ``dist.barrier``
+(host-launched); set
 ``EPLB_GIN_FENCE=signal`` for the device-stream ``ncclSignal``/``ncclWaitSignal`` fence that is CUDA-graph
 capturable (cluster-validate the signal-counter epochs before relying on it in capture).
 
@@ -25,7 +26,8 @@ Replica weights are never held across forward->backward. :class:`GinReplicaTrans
 ``overlap.overlapped_grouped_expert_mlp``) is the only consumption path: forward pulls the replica slots
 it needs and keeps no clone, and backward re-acquires them with a second ``get_batched`` on a side
 stream, overlapping the pull with the weight-free Wgrad before consuming them for Dgrad. Grad reduction
-to ``main(e)`` is ``put_batched`` into the owner's scratch column plus a local sum.
+to ``main(e)`` is ``put_batched`` into the owner's per-source scratch column followed by one
+placement-masked sum that reads only live replica columns.
 
 The backward re-pull costs no re-derivation of the routing: a transport instance is bound to one
 micro-batch's plan at construction and caches the resulting device schedule (a handful of ``[n_slot]``
@@ -115,6 +117,7 @@ class GinWeightReplicator:
         # in ascending expert-id order. Computed once on host from the immutable main_rank.
         main_host = main_rank.to(torch.int64).tolist()
         self.main_host: List[int] = [int(m) for m in main_host]
+        self.main_experts = [e for e, m in enumerate(self.main_host) if m == self.my_rank]
         counts = [0] * self.world
         local_slot_of_e: List[int] = [0] * self.E
         for e in range(self.E):
@@ -125,6 +128,9 @@ class GinWeightReplicator:
 
         # device-resident copies of the static tables, so the per-step schedule never touches host
         self.main_dev = torch.as_tensor(self.main_host, dtype=torch.int64, device=device)
+        self.main_expert_dev = torch.as_tensor(
+            self.main_experts, dtype=torch.int64, device=device
+        )
         self.local_slot_dev = torch.as_tensor(local_slot_of_e, dtype=torch.int64, device=device)
         self.local_slot_of_e = local_slot_of_e  # host list (used only for the static home-publish loop)
         self.slot_arange = torch.arange(self.n_slot, dtype=torch.int64, device=device)
@@ -153,10 +159,12 @@ class GinWeightReplicator:
                      for j in range(self.J)]
         self.slot = [self._gin.create_tensor(self.n_slot * self.wb[j], torch.uint8)
                      for j in range(self.J)]
-        # one row past the real columns: the local grad scatter sends the rows it must not write
-        # there, which keeps it a fixed-shape index_copy_ (see GinReplicaTransport.grad_row)
-        self.scratch = [self._gin.create_tensor((self.home_cap * self.world + 1) * self.wb[j],
-                                                torch.uint8)
+        # Per-owner-expert, per-source-rank gradient columns. Inactive columns are deliberately left
+        # stale: the reduction kernel predicates their loads with the current plan's placement mask.
+        # Keep one physical row for the degenerate "this rank owns no mains" case because symmetric
+        # allocators need a non-empty allocation, but that row is never read.
+        scratch_rows = max(1, self.home_cap * self.world)
+        self.scratch = [self._gin.create_tensor(scratch_rows * self.wb[j], torch.uint8)
                         for j in range(self.J)]
 
     def _log_transport(self) -> None:
@@ -252,10 +260,9 @@ class GinReplicaTransport:
     the pull. That spends a second ``get_batched`` (bandwidth) instead of ``n_layers x n_slot x |W_e|``
     of resident memory.
 
-    A transport instance is bound to one micro-batch's plan (``plan_x``) and derives the device schedule
-    once in ``__init__``: ``peers``/``ls``/``is_local``/``is_remote``/``col``/``grad_row``, six
-    ``[n_slot]`` index tensors (order 1 KiB). Both directions then read those, so the backward re-pull
-    neither re-derives
+    A transport instance is bound to one micro-batch's plan (``plan_x``) and derives the device
+    transfer schedule plus the owner-side placement mask once in ``__init__``. Both directions then
+    read those small tensors, so the backward re-pull neither re-derives
     the routing nor risks disagreeing with the forward get about which slot came from where. Both ops
     fill/consume the effective-layout stacks the overlap skeleton owns; only replica (non-main) slots are
     touched here -- main-owned slots are filled locally by ``overlap._fill_main_slots`` and their grads
@@ -277,12 +284,13 @@ class GinReplicaTransport:
         self._remote_payload_bytes = None
         self.remote_col = self.is_remote.view(-1, *([1] * len(replicator.weight_shapes[0])))
         self.col = ls * replicator.world + replicator.my_rank  # scratch column of each slot's put
-        # Rows the local grad scatter must not touch (remote and empty slots) go to a dump row past
-        # the real columns, so the scatter is one fixed-shape index_copy_ instead of a boolean mask
-        # -- which would cost a D2H per tensor per layer. Their `col` would otherwise collide with a
-        # real column: two experts main'd by different ranks can share a home index.
-        dump = replicator.home_cap * replicator.world
-        self.grad_row = torch.where(is_local, self.col, torch.full_like(self.col, dump))
+        # Owner-side sparse reduction schedule. `active_main[i, r]` says whether source rank r hosts
+        # this rank's i-th main expert, so stale columns in the fixed symmetric scratch allocation are
+        # never loaded. The local source bypasses scratch entirely; its physical slot is found with
+        # the same ascending-expert prefix sum used by slot_tables.
+        self.active_main = plan_x.index_select(0, replicator.main_expert_dev).to(torch.bool)
+        slot_of_e = torch.cumsum(plan_x[:, replicator.my_rank].to(torch.int64), dim=0) - 1
+        self.local_slot_for_main = slot_of_e.index_select(0, replicator.main_expert_dev)
 
     def remote_payload_bytes(self):
         """Logical bytes transferred by one get/put over this plan's remote replica slots."""
@@ -344,16 +352,26 @@ class GinReplicaTransport:
         r = self.r
         J, wb, nb, world = r.J, r.wb, r.n_slot, r.world
         grad_slot = (grad_w1_slot, grad_w2_slot)
-        g_bytes = []
+        main_experts = meta["main_experts"]
+        if main_experts != r.main_experts:
+            raise RuntimeError(
+                "GIN main-expert order disagrees with the replicator's static ownership table"
+            )
+
+        grad_contig = []
         for j in range(J):
-            r.scratch[j].zero_()
             r._check_dtype(grad_slot[j], "an expert weight gradient")
-            g_bytes.append(grad_slot[j].detach().contiguous().view(torch.uint8).reshape(nb, wb[j]))
-            r.slot[j].view(nb, wb[j]).copy_(g_bytes[j])
-        # Clearing the scratch is itself a cross-rank ordering point: the columns a peer pushes into
-        # are mine to clear, so its put has to wait for my zero. Without this the reduction drops
-        # whichever replica arrived early -- masked by the host-barrier fence, which drains the group
-        # anyway, and wrong under the device one.
+            # Keep the existing contiguous parameter-layout materialisation: Megatron hands this
+            # path a transposed view, and its tuned transpose is safer than making the sparse kernel
+            # read that matrix with an uncoalesced stride. Symmetric staging below is still remote-only.
+            grad = grad_slot[j].detach().contiguous()
+            grad_contig.append(grad)
+            symmetric_slot = r.slot[j].view(dtype).reshape(nb, *r.weight_shapes[j])
+            # Only remote replica rows need symmetric staging. Main, empty, and other local rows stay
+            # untouched; put_batched skips the same descriptors through peers<0.
+            r._gin.copy_rows_masked(grad, symmetric_slot, self.is_remote)
+        # Scratch is reused without clearing. This fence keeps every rank's previous masked-sum read
+        # ahead of the next puts and also publishes this iteration's symmetric source staging.
         r.fence(2)
 
         for j in range(J):
@@ -362,16 +380,38 @@ class GinReplicaTransport:
                 r.slot[j], r.scratch[j], r.slot_off[j], self.col * wb[j], r.nbytes_const[j],
                 self.peers, blocks_per_desc=r.grid, use_lsa=r.use_lsa,
             )
-            # local slots: on-device copy grad -> my own scratch column; the rest land on the dump row
-            scratch_view = r.scratch[j].view(r.home_cap * world + 1, wb[j])
-            scratch_view.index_copy_(0, self.grad_row, g_bytes[j])
-        r.fence(3)  # all remote grad puts landed before local sum
+        r.fence(3)  # all remote grad puts landed before the masked sums
+
+        # Two kernels per layer (one per parameter tensor), replacing one dense sum per local expert.
+        # The kernel loops only over x[e, r] == 1 columns and reads the owner's local slot directly,
+        # so inactive/stale scratch rows and the local scratch column generate no HBM traffic.
+        reduced = []
+        n_main = len(main_experts)
+        for j in range(J):
+            if n_main == 0:
+                reduced.append(
+                    grad_contig[j].new_empty((0, *r.weight_shapes[j]))
+                )
+                continue
+            live_bytes = n_main * world * wb[j]
+            scratch = (
+                r.scratch[j]
+                .narrow(0, 0, live_bytes)
+                .view(dtype)
+                .reshape(n_main, world, *r.weight_shapes[j])
+            )
+            reduced.append(
+                r._gin.masked_sum_rows(
+                    scratch,
+                    grad_contig[j],
+                    self.active_main,
+                    self.local_slot_for_main,
+                    r.my_rank,
+                )
+            )
 
         grads: List[torch.Tensor] = []
-        for e in meta["main_experts"]:
-            base = r.local_slot_of_e[e]
+        for i in range(n_main):
             for j in range(J):
-                seg = r.scratch[j].narrow(0, base * world * wb[j], world * wb[j])
-                stacked = seg.view(dtype).reshape(world, *r.weight_shapes[j])
-                grads.append(stacked.sum(dim=0))
+                grads.append(reduced[j][i])
         return grads
