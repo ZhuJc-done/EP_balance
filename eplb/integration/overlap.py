@@ -274,6 +274,8 @@ class _ReplicaLease:
         self._stacks: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._cs = None
         self._waited = False
+        self.debug_interval_enabled = False
+        self.debug_backward_start = None
 
     def expect_consumer(self) -> None:
         self.consumers += 1
@@ -323,6 +325,10 @@ class _PrefetchOnBackward(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
+        if ctx.lease.debug_interval_enabled:
+            ctx.lease.debug_backward_start = profiling.start_debug_interval(
+                device=ctx.lease.device
+            )
         ctx.lease.prefetched = True
         ctx.lease.start()
         return grad_out, None

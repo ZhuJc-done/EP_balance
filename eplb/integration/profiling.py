@@ -40,7 +40,13 @@ _DEBUG_PHASES = (
     ("combine", ("apply/combine", "native/combine")),
 )
 _DEBUG_BACKWARD_PHASES = (
+    ("backward_total", ("apply/backward_total",)),
     ("expert_repull", ("apply/weight_repull",)),
+    ("combine_bwd", ("apply/combine_bwd",)),
+    ("expert_dgrad", ("apply/expert_bwd_dgrad",)),
+    ("activation_bwd", ("apply/activation_bwd",)),
+    ("dispatch_bwd", ("apply/dispatch_bwd",)),
+    ("expert_wgrad", ("apply/expert_bwd_wgrad",)),
     ("expert_grad_reduce", ("apply/grad_move",)),
 )
 
@@ -138,6 +144,35 @@ def _drain() -> None:
     _PENDING = []
 
 
+def start_debug_interval(*, device=None, stream=None):
+    """Start a debug-only interval that may span multiple autograd nodes."""
+    if not _DEBUG_ENABLED:
+        return None
+    use_cuda = torch.cuda.is_available() and (
+        device is None or torch.device(device).type == "cuda"
+    )
+    if use_cuda:
+        start = torch.cuda.Event(enable_timing=True)
+        start.record(stream)
+        return "cuda", start
+    return "cpu", time.perf_counter()
+
+
+def finish_debug_interval(name: str, marker, *, stream=None) -> None:
+    """Finish an interval returned by :func:`start_debug_interval`."""
+    if marker is None:
+        return
+    kind, start = marker
+    if kind == "cuda":
+        end = torch.cuda.Event(enable_timing=True)
+        end.record(stream)
+        _PENDING.append((name, start, end, 0))
+        if len(_PENDING) >= _MAX_PENDING:
+            _drain()
+        return
+    _add_sample(name, (time.perf_counter() - start) * 1e3)
+
+
 def _format_fields(phases, missing: Optional[Mapping[str, str]] = None):
     fields = []
     missing = missing or {}
@@ -160,12 +195,28 @@ def _format_fields(phases, missing: Optional[Mapping[str, str]] = None):
     return fields
 
 
-def _emit_deferred_backward() -> None:
+def _emit_deferred_backward(context: str = "") -> None:
     fields = _format_fields(_DEBUG_BACKWARD_PHASES)
     if fields and _debug_logger is not None:
+        where = f" {context}" if context else ""
         _debug_logger(
-            f"{_DEBUG_PREFIX} mode=apply direction=backward " + " ".join(fields)
+            f"{_DEBUG_PREFIX} mode=apply direction=backward{where} "
+            + " ".join(fields)
         )
+
+
+def emit_backward_debug(context: str = "") -> None:
+    """Synchronize and print one completed apply-layer backward timing window.
+
+    The manual apply path calls this at the end of every layer backward. It intentionally pays a
+    full device synchronization when debug timing is enabled, so the reported fields contain only
+    that layer's two token chunks instead of accumulating all MoE layers until the next forward.
+    """
+    if not _DEBUG_ENABLED:
+        return
+    _drain()
+    _emit_deferred_backward(context)
+    _WINDOW_STATS.clear()
 
 
 def begin_debug_window() -> None:
@@ -176,9 +227,7 @@ def begin_debug_window() -> None:
     """
     if not _DEBUG_ENABLED:
         return
-    _drain()
-    _emit_deferred_backward()
-    _WINDOW_STATS.clear()
+    emit_backward_debug()
 
 
 @contextlib.contextmanager

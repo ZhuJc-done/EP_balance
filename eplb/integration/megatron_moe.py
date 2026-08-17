@@ -203,6 +203,7 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
         group=group, adapter=cfg["adapter"],
         rematerialize=cfg["rematerialize"], overlap=cfg["overlap"],
         gated=cfg["gated"], act=cfg["act"], transpose_w=True,
+        debug_context=f"layer={cfg['layer_id']} mb={mb}",
     )
     if profiling.enabled():
         profiling.maybe_summary(

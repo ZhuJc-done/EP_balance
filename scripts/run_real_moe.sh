@@ -107,8 +107,11 @@ fi
 # EPLB_DEBUG_TIMING=1       print one compact forward timing line per MoE invocation in every mode.
 #                           off: native router/dispatch/GEMM/combine; observe: native stages + solver;
 #                           apply: Scale-EPLB stages + expert transfer, remote payload MiB and effective
-#                           payload GB/s; backward GIN re-pull/grad-reduce are reported separately.
-#                           Invocation-boundary sync makes this diagnostic only: never quote the
+#                           payload GB/s; backward re-pull, inverse token transfers, Dgrad/activation/
+#                           Wgrad expert compute, grad-reduce, and overlapped critical-path total are
+#                           reported per layer.
+#                           Every forward and apply-layer backward boundary synchronizes, making this
+#                           diagnostic only: never quote the
 #                           instrumented end-to-end step time. Use ALL_RANKS for cluster bandwidth.
 #
 # apply-mode backends (ignored in off/observe, which use Megatron's own dispatcher):
@@ -154,7 +157,7 @@ for _knob in EPLB_N_SLOT EPLB_PROFILE EPLB_PROFILE_ALL_RANKS EPLB_PROFILE_EVERY 
 done
 if [[ -n "${EPLB_N_SLOT:-}" ]]; then echo "[run_real_moe] EPLB_N_SLOT=${EPLB_N_SLOT} (slot budget override)"; fi
 if [[ "${EPLB_DEBUG_TIMING:-0}" != "0" ]]; then
-  echo "[run_real_moe] EPLB_DEBUG_TIMING=1 -> per-MoE forward breakdown; throughput is perturbed"
+  echo "[run_real_moe] EPLB_DEBUG_TIMING=1 -> per-MoE forward/backward breakdown; throughput is perturbed"
 fi
 if [[ "${EPLB_MODE}" == "apply" ]]; then
   echo "[run_real_moe] apply backends: adapter=${EPLB_ADAPTER:-alltoall} weight_comm=${EPLB_WEIGHT_COMM:-broadcast}" \

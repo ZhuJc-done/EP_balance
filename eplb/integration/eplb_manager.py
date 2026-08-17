@@ -922,6 +922,7 @@ def sync_free_moe_forward(
     gated: bool = False,
     act: Callable = torch.relu,
     transpose_w: bool = False,
+    debug_context: str = "",
 ) -> torch.Tensor:
     """Replication-aware MoE forward via physical-id routing + grouped compute (the Phase C dispatch path; only the adapter may sync).
 
@@ -957,6 +958,7 @@ def sync_free_moe_forward(
         act: Activation function (used on the overlap/GIN path).
         transpose_w: True if weights are ``[out, in]`` (Megatron) and used as ``x @ W.t()``
             (overlap/GIN path only).
+        debug_context: Layer/micro-batch label attached to per-layer backward debug output.
 
     Returns:
         float ``[Ntok, H]`` combined MoE output for this rank's tokens.
@@ -1043,7 +1045,7 @@ def sync_free_moe_forward(
                 device=device, group=group, transport=transport,
             )
             if _env_truthy("EPLB_MANUAL_BWD", "1"):
-                block = ManualMoEBlock(**kw)
+                block = ManualMoEBlock(debug_context=debug_context, **kw)
             else:
                 experts = OverlappedExperts(**kw)
         else:

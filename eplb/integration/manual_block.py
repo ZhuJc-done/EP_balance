@@ -254,6 +254,7 @@ class _ManualExpertPipeline(torch.autograd.Function):
         cap = None if cfg["cap"] is None else int(cfg["cap"])
         n_slot, H = int(cfg["n_slot"]), int(cfg["H"])
         pad_cols, lease, state = int(cfg["pad_cols"]), cfg["lease"], cfg["state"]
+        dispatch_bytes, combine_bytes = cfg["dispatch_bytes"], cfg["combine_bytes"]
         saved = ctx.saved_tensors
         device, dtype = grad_comb[0].device, grad_comb[0].dtype
 
@@ -271,7 +272,16 @@ class _ManualExpertPipeline(torch.autograd.Function):
         comb_evt: List[Optional[torch.cuda.Event]] = [None] * nc
         with _sctx(cs):
             for k in range(nc):
-                gy[k] = adapter.combine_chunk_bwd(grad_comb[k].contiguous(), state[k], group)
+                with profiling.record(
+                    "apply/combine_bwd",
+                    time_it=True,
+                    device=device,
+                    stream=cs,
+                    payload_bytes=combine_bytes[k],
+                ):
+                    gy[k] = adapter.combine_chunk_bwd(
+                        grad_comb[k].contiguous(), state[k], group
+                    )
                 if on_cuda:
                     _rec(gy[k], ms)
                     comb_evt[k] = _event(on_cuda, cs)
@@ -307,12 +317,30 @@ class _ManualExpertPipeline(torch.autograd.Function):
 
             # --- Dgrad chain: needs the replica weights, so this is where a late pull would stall ---
             w1_eff, w2_eff = lease.wait()
-            grad_a = ragged_mm(g, w2_eff.transpose(1, 2), offs)
-            with torch.enable_grad():
-                hp = h_pre.detach().requires_grad_(True)
-                a_g = _activation(meta, hp)
-                (grad_h_pre,) = torch.autograd.grad(a_g, hp, grad_a)
-            gx_out = ragged_mm(grad_h_pre, w1_eff.transpose(1, 2), offs)
+            with profiling.record(
+                "apply/expert_bwd_dgrad",
+                time_it=True,
+                device=device,
+                stream=ms,
+            ):
+                grad_a = ragged_mm(g, w2_eff.transpose(1, 2), offs)
+            with profiling.record(
+                "apply/activation_bwd",
+                time_it=True,
+                device=device,
+                stream=ms,
+            ):
+                with torch.enable_grad():
+                    hp = h_pre.detach().requires_grad_(True)
+                    a_g = _activation(meta, hp)
+                    (grad_h_pre,) = torch.autograd.grad(a_g, hp, grad_a)
+            with profiling.record(
+                "apply/expert_bwd_dgrad",
+                time_it=True,
+                device=device,
+                stream=ms,
+            ):
+                gx_out = ragged_mm(grad_h_pre, w1_eff.transpose(1, 2), offs)
             if offs is not None:
                 # Rows past the last offset are slots the GEMM never wrote; select, do not multiply.
                 gx_sorted = mask_rows(gx_out, valid_sorted)
@@ -329,17 +357,30 @@ class _ManualExpertPipeline(torch.autograd.Function):
             with _sctx(cs):
                 if on_cuda:
                     cs.wait_event(comp_evt)
-                grad_pl[k] = adapter.dispatch_chunk_bwd(g_rp, state[k], group)
+                with profiling.record(
+                    "apply/dispatch_bwd",
+                    time_it=True,
+                    device=device,
+                    stream=cs,
+                    payload_bytes=dispatch_bytes[k],
+                ):
+                    grad_pl[k] = adapter.dispatch_chunk_bwd(g_rp, state[k], group)
                 if on_cuda:
                     _rec(grad_pl[k], ms)
 
             # --- Wgrads: nothing downstream waits on them, so they run under dispatch^-1(k) ---
-            a = a_g.detach()                            # the activation the Dgrad chain already built
-            g2 = ragged_mm_tn(g, a, offs) if transpose_w else ragged_mm_tn(a, g, offs)
-            gw2 = g2 if gw2 is None else gw2.add_(g2)   # matmul output, unaliased -> safe in place
-            g1 = ragged_mm_tn(grad_h_pre, x, offs) if transpose_w \
-                else ragged_mm_tn(x, grad_h_pre, offs)
-            gw1 = g1 if gw1 is None else gw1.add_(g1)
+            with profiling.record(
+                "apply/expert_bwd_wgrad",
+                time_it=True,
+                device=device,
+                stream=ms,
+            ):
+                a = a_g.detach()                        # the activation the Dgrad chain already built
+                g2 = ragged_mm_tn(g, a, offs) if transpose_w else ragged_mm_tn(a, g, offs)
+                gw2 = g2 if gw2 is None else gw2.add_(g2)  # matmul output, unaliased -> safe in place
+                g1 = ragged_mm_tn(grad_h_pre, x, offs) if transpose_w \
+                    else ragged_mm_tn(x, grad_h_pre, offs)
+                gw1 = g1 if gw1 is None else gw1.add_(g1)
 
         # 4. every chunk's Wgrad is in -> reduce to main(e), on the weight stream and behind the last
         #    dispatch^-1, which is still draining. Nothing in this layer's backward waits on it.
@@ -364,6 +405,11 @@ class _ManualExpertPipeline(torch.autograd.Function):
         if on_cuda:
             ms.wait_stream(cs)
             ms.wait_stream(ws)
+        profiling.finish_debug_interval(
+            "apply/backward_total", lease.debug_backward_start, stream=ms
+        )
+        lease.debug_backward_start = None
+        profiling.emit_backward_debug(cfg.get("debug_context", ""))
         return (None, *grad_pl, *grads)
 
 
@@ -387,6 +433,7 @@ class ManualMoEBlock:
         device,
         group=None,
         transport=None,
+        debug_context: str = "",
     ) -> None:
         self.meta, self.main_w = build_meta(
             weights_local=weights_local, slot_to_e=slot_to_e, main_rank=main_rank,
@@ -395,6 +442,8 @@ class ManualMoEBlock:
             transport=transport,
         )
         self.lease = _ReplicaLease(self.meta, self.main_w, dtype, device)
+        self.lease.debug_interval_enabled = True
+        self.debug_context = str(debug_context)
 
     def prefetch_on_backward_of(self, out: torch.Tensor) -> torch.Tensor:
         """Tag the block output so its backward starts this layer's weight pull before anything else."""
@@ -424,7 +473,7 @@ class ManualMoEBlock:
             "n_slot": n_slot, "H": H, "pad_cols": pad_cols, "my_rank": my_rank,
             "sent": list(sent), "recv": list(recv), "routes": list(routes),
             "dispatch_bytes": list(dispatch_bytes), "combine_bytes": list(combine_bytes),
-            "lease": self.lease, "state": [],
+            "lease": self.lease, "state": [], "debug_context": self.debug_context,
         }
         # one consumer for the lease: the single node now owns every chunk's backward
         self.lease.expect_consumer()
