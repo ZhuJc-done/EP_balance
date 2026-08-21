@@ -66,6 +66,14 @@ Shared experts remain outside EPLB placement and are added to the routed-expert
 output in `apply` mode. Shared-expert communication overlap is deliberately
 disabled in all three modes so their step times use the same execution schedule.
 
+DeepSeek-V2 keeps Megatron's local implementation and does not require
+Transformer Engine. The custom entrypoint installs a narrow MLA compatibility
+adapter before model construction because Megatron `0ff7226f6` passes distinct
+`k_channels`/`v_channels` to its local `DotProductAttention` even though that
+revision's constructor does not accept them. The adapter preserves the local
+attention math and corrects the flattened value-projection width; the Megatron
+source tree is not modified.
+
 ## Fresh machine: install once, keep artifacts on HDFS
 
 Use local disk for source trees and compiled extensions; use the shared HDFS

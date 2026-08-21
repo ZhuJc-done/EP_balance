@@ -124,6 +124,15 @@ def model_provider(
 ):
     """Build GPT and attach native timing, the EPLB observer, or the EPLB dispatcher."""
     args = get_args()
+    rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+    if getattr(args, "multi_latent_attention", False) and args.transformer_impl == "local":
+        from eplb.integration.local_mla import install_local_mla_attention_compat
+
+        if install_local_mla_attention_compat() and rank0:
+            print(
+                "[run_real_moe] enabled local MLA attention compatibility "
+                "(distinct QK/V head dimensions; Transformer Engine not required)"
+            )
     if args.normalization == "RMSNorm" and args.transformer_impl == "local":
         # This Megatron revision picks Apex FusedLayerNorm whenever Apex is
         # importable, but that implementation rejects RMSNorm. Keep Apex
@@ -146,7 +155,6 @@ def model_provider(
     _use_separate_mlp_norm_checkpoint_keys(model)
     mode = os.environ.get("EPLB_MODE", "observe")
     has_moe = bool(getattr(args, "num_experts", None))
-    rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
     timing_logger = print if (rank0 or profiling.all_ranks()) else None
     native_instrumentation = (
         mode in ("off", "observe") and has_moe and profiling.regions_requested()
