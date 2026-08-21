@@ -85,7 +85,15 @@ EP="${EP:-8}"
 
 # --- EPLB mode ----------------------------------------------------------------
 EPLB_MODE="${EPLB_MODE:-observe}"           # off (pure Megatron) | observe (Phase B) | apply (Phase C)
-export EPLB_MODE GPUS_PER_NODE
+EPLB_PLAN_SOLVER="${EPLB_PLAN_SOLVER:-scale}" # scale | fastermoe | deepseek | flexmoe | lplb
+case "${EPLB_PLAN_SOLVER}" in
+  scale|fastermoe|deepseek|flexmoe|lplb) ;;
+  *)
+    echo "unknown EPLB_PLAN_SOLVER=${EPLB_PLAN_SOLVER}; expected scale|fastermoe|deepseek|flexmoe|lplb" >&2
+    exit 1
+    ;;
+esac
+export EPLB_MODE EPLB_PLAN_SOLVER GPUS_PER_NODE
 
 # --- optional routing-trace capture (observe mode) ---------------------------
 # EPLB_TRACE_OUT=<path> makes rank 0 dump the real gathered Ω[R,E] per
@@ -100,14 +108,23 @@ fi
 # --- optional sweep / instrumentation knobs ----------------------------------
 # EPLB_N_SLOT=<int>         per-rank physical slot budget N_slot (default 2x mains-per-rank). Each slot
 #                           above the mains floor carries one expert replica -> the balance-vs-memory knob.
+# EPLB_PLAN_SOLVER=<name>    placement/quota policy in apply mode: scale (default), fastermoe,
+#                           deepseek (main-fixed), flexmoe, or lplb. All policies reuse the same
+#                           weight materialization, token transport, expert kernels, and grad reduction.
+# EPLB_FASTERMOE_BW_NET=<B/s>, EPLB_FASTERMOE_BW_MM=<FLOP/s> tune its cost model.
+# EPLB_DEEPSEEK_NUM_GROUPS=<n> sets the requested hierarchy group count (default 8; invalid values
+#                           fall back to a topology-compatible count).
+# EPLB_FLEXMOE_THRESHOLD=<f> sets its expansion trigger (default 1.2).
+# EPLB_LPLB_ROOT=<path>, EPLB_LPLB_TOPOLOGY=auto|cube|ring configure optional compiled LPLB.
 # EPLB_PROFILE=1            periodic per-region latency + peak-memory summary. CUDA events are queued and
 #                           resolved in one batch, so this adds no per-region host sync.
 # EPLB_PROFILE_ALL_RANKS=1  every rank prints its own summary (required for max-vs-mean straggler analysis).
 # EPLB_PROFILE_EVERY=<n>    summary cadence; EPLB_PROFILE_RESET_AT=<n> resets peak memory after warmup.
-# EPLB_DEBUG_TIMING=1       print one compact forward timing line per MoE invocation in every mode.
+# EPLB_DEBUG_TIMING=1       print compact per-MoE forward/backward timing (apply backward ends at reverse-dispatch).
 #                           off: native router/dispatch/GEMM/combine; observe: native stages + solver;
 #                           apply: Scale-EPLB stages + expert transfer, remote payload MiB and effective
-#                           payload GB/s; backward GIN re-pull/grad-reduce are reported separately.
+#                           payload GB/s; backward token comm, Dgrad/activation/Wgrad and GIN
+#                           re-pull/grad-reduce are reported separately.
 #                           Invocation-boundary sync makes this diagnostic only: never quote the
 #                           instrumented end-to-end step time. Use ALL_RANKS for cluster bandwidth.
 #
@@ -129,8 +146,7 @@ fi
 #                           an SM90+ TMA-staged copy; with the EP group inside a node that is the
 #                           whole weight channel, so this is for A/B measurement only.
 # EPLB_GIN_LSA_TMA=0        keep LSA/NVLink routing but restore vector load/store for A/B or fallback.
-# EPLB_CAP=<int>            pin the per-slot capacity (sizes the padded expert-GEMM batch and the
-#                           Elastic compute layout). Required for Elastic; overflow fails asynchronously.
+# Expert compute is SM90-only ragged grouped GEMM: there is no padded per-slot cap.
 # EPLB_CHUNKS=2             split this rank's routing units in two and pipeline dispatch/compute/
 #                           combine across a compute and a comm stream, so dispatch(c2) hides behind
 #                           compute(c1) and combine(c1) behind compute(c2); only the first dispatch
@@ -145,20 +161,22 @@ fi
 #                           A/B-ing the schedule.
 # EPLB_REMATERIALIZE=1      dist.broadcast transport only: free replica weights after forward and
 #                           re-broadcast them in backward.
-for _knob in EPLB_N_SLOT EPLB_PROFILE EPLB_PROFILE_ALL_RANKS EPLB_PROFILE_EVERY EPLB_PROFILE_RESET_AT \
+for _knob in EPLB_N_SLOT EPLB_PLAN_SOLVER EPLB_FASTERMOE_BW_NET EPLB_FASTERMOE_BW_MM \
+             EPLB_DEEPSEEK_NUM_GROUPS EPLB_FLEXMOE_THRESHOLD EPLB_LPLB_ROOT EPLB_LPLB_TOPOLOGY \
+             EPLB_PROFILE EPLB_PROFILE_ALL_RANKS EPLB_PROFILE_EVERY EPLB_PROFILE_RESET_AT \
              EPLB_DEBUG_TIMING \
              EPLB_ADAPTER EPLB_DEEPEP_HYBRID EPLB_DEEPEP_MAX_TOKENS_PER_RANK \
-             EPLB_WEIGHT_COMM EPLB_GIN_FENCE EPLB_GIN_LSA EPLB_CAP \
+             EPLB_WEIGHT_COMM EPLB_GIN_FENCE EPLB_GIN_LSA \
              EPLB_CHUNKS EPLB_MANUAL_BWD EPLB_OVERLAP EPLB_REMATERIALIZE; do
   if [[ -n "${!_knob:-}" ]]; then export "${_knob}"; fi
 done
 if [[ -n "${EPLB_N_SLOT:-}" ]]; then echo "[run_real_moe] EPLB_N_SLOT=${EPLB_N_SLOT} (slot budget override)"; fi
 if [[ "${EPLB_DEBUG_TIMING:-0}" != "0" ]]; then
-  echo "[run_real_moe] EPLB_DEBUG_TIMING=1 -> per-MoE forward breakdown; throughput is perturbed"
+  echo "[run_real_moe] EPLB_DEBUG_TIMING=1 -> per-MoE forward/backward breakdown; throughput is perturbed"
 fi
 if [[ "${EPLB_MODE}" == "apply" ]]; then
-  echo "[run_real_moe] apply backends: adapter=${EPLB_ADAPTER:-alltoall} weight_comm=${EPLB_WEIGHT_COMM:-broadcast}" \
-       "cap=${EPLB_CAP:-<from plan>} chunks=${EPLB_CHUNKS:-1} manual_bwd=${EPLB_MANUAL_BWD:-1}" \
+  echo "[run_real_moe] apply backends: plan=${EPLB_PLAN_SOLVER} adapter=${EPLB_ADAPTER:-alltoall} weight_comm=${EPLB_WEIGHT_COMM:-broadcast}" \
+       "chunks=${EPLB_CHUNKS:-1} manual_bwd=${EPLB_MANUAL_BWD:-1}" \
        "overlap=${EPLB_OVERLAP:-0} remat=${EPLB_REMATERIALIZE:-0}"
   if [[ "${EPLB_WEIGHT_COMM:-}" == "gin" && "${EPLB_GIN_LSA:-1}" == "0" ]]; then
     echo "[run_real_moe] WARNING: EPLB_GIN_LSA=0 sends intra-node replica traffic to the NIC" \
@@ -172,9 +190,6 @@ if [[ "${EPLB_MODE}" == "apply" ]]; then
         exit 1
       fi
     done
-    [[ -n "${EPLB_CAP:-}" && "${EPLB_CAP}" -gt 0 ]] || {
-      echo "EPLB_ADAPTER=deepep requires EPLB_CAP=<positive static bound>" >&2; exit 1;
-    }
     [[ "${EPLB_WEIGHT_COMM:-}" == "gin" ]] || {
       echo "zero-sync Elastic mode requires EPLB_WEIGHT_COMM=gin" >&2; exit 1;
     }

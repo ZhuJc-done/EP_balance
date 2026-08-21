@@ -21,12 +21,6 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").lower() not in ("0", "", "false", "no")
 
 
-def _env_cap() -> Optional[int]:
-    """``EPLB_CAP`` as a positive int, or None when unset -- the ragged path needs no cap."""
-    cap = int(os.environ.get("EPLB_CAP", "0") or "0")
-    return cap if cap > 0 else None
-
-
 def _env_max_recv_rows() -> Optional[int]:
     """``EPLB_MAX_RECV_ROWS`` as a positive int, or None to keep the transport's worst-case rows.
 
@@ -54,10 +48,10 @@ def _make_adapter():
                 "legacy DeepEP Buffer settings are not supported by ElasticBuffer: "
                 + ", ".join(legacy)
             )
-        if _env_cap() is None and not ragged_available():
+        if not ragged_available():
             raise ValueError(
-                "EPLB_ADAPTER=deepep requires a positive host-static EPLB_CAP unless the ragged "
-                "grouped GEMM is available (CUDA SM90+ bf16, EPLB_GROUPED_GEMM != 0)"
+                "EPLB_ADAPTER=deepep requires the SM90+ BF16 ragged grouped-GEMM path "
+                "(torch._grouped_mm available and EPLB_GROUPED_GEMM != 0)"
             )
         if os.environ.get("EPLB_WEIGHT_COMM", "").strip().lower() != "gin":
             raise ValueError("zero-sync ElasticBuffer mode requires EPLB_WEIGHT_COMM=gin")
@@ -153,6 +147,20 @@ def _routing_to_units(
     return unit_token_idx, unit_expert, unit_prob
 
 
+class _MoEBackwardTimingStart(torch.autograd.Function):
+    """Mark when the final MoE output first receives its backward gradient."""
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, state: dict) -> torch.Tensor:
+        ctx.state = state
+        return output.view_as(output)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        ctx.state["start"] = profiling.start_debug_interval(device=grad_output.device)
+        return grad_output, None
+
+
 def eplb_moe_forward(self, hidden_states, *args, **kwargs):
     """Drop-in ``MoELayer.forward`` using the sync-free EPLB dispatcher (bound via :func:`bind_eplb_to_moe_layer`)."""
     cfg = self._eplb
@@ -160,6 +168,7 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
     group = cfg["group"]
     spec: ProblemSpec = reb.spec
     profiling.begin_debug_window()
+    fwd_start = profiling.start_debug_interval(device=hidden_states.device)
 
     in_shape = hidden_states.shape
     tokens = hidden_states.reshape(-1, in_shape[-1])
@@ -181,6 +190,12 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
 
     mb = cfg["mb"]
     cfg["mb"] = mb + 1
+    debug_context = f"layer={cfg['layer_id']} mb={mb}"
+    backward_timer = (
+        {"context": debug_context, "start": None}
+        if profiling.debug_enabled()
+        else None
+    )
     plan = reb.rebalance(local_row, cfg["layer_id"], mb, group=group).plan
 
     ep_rank = dist.get_rank(group) if dist.is_initialized() else 0
@@ -197,21 +212,24 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
         unit_prob=unit_prob.to(tokens.dtype),
         plan=plan, spec=spec, weights_local=weights_local,
         weight_shapes=weight_shapes, batched_mlp_fn=cfg["batched_mlp_fn"],
-        cap=_env_cap() if isinstance(cfg["adapter"], DeepEPAdapter) else None,
         grouped_mlp_fn=cfg.get("grouped_mlp_fn"),
         max_recv_rows=_env_max_recv_rows(),
         group=group, adapter=cfg["adapter"],
         rematerialize=cfg["rematerialize"], overlap=cfg["overlap"],
         gated=cfg["gated"], act=cfg["act"], transpose_w=True,
+        backward_timer=backward_timer,
     )
-    if profiling.enabled():
-        profiling.maybe_summary(
-            print if (ep_rank == 0 or profiling.all_ranks()) else None,
-            context=f"mode=apply layer={cfg['layer_id']} mb={mb}",
-        )
     out = out.reshape(in_shape)
     if shared_expert_output is not None:
         out = out + shared_expert_output
+    if backward_timer is not None:
+        out = _MoEBackwardTimingStart.apply(out, backward_timer)
+    profiling.finish_debug_interval("apply/moe_fwd_total", fwd_start)
+    if profiling.enabled():
+        profiling.maybe_summary(
+            print if (ep_rank == 0 or profiling.all_ranks()) else None,
+            context=f"mode=apply {debug_context}",
+        )
     return out, None
 
 

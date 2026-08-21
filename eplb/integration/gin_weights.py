@@ -43,6 +43,8 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 import torch.distributed as dist
 
+from . import profiling
+
 
 def gin_enabled() -> bool:
     """Whether the GIN weight-replication backend is selected (``EPLB_WEIGHT_COMM=gin``)."""
@@ -275,6 +277,7 @@ class GinReplicaTransport:
         self.peers, self.ls, self.is_local = peers, ls, is_local
         self.is_remote = peers >= 0
         self._remote_payload_bytes = None
+        self._remote_replica_count = None
         self.remote_col = self.is_remote.view(-1, *([1] * len(replicator.weight_shapes[0])))
         self.col = ls * replicator.world + replicator.my_rank  # scratch column of each slot's put
         # Rows the local grad scatter must not touch (remote and empty slots) go to a dump row past
@@ -284,12 +287,19 @@ class GinReplicaTransport:
         dump = replicator.home_cap * replicator.world
         self.grad_row = torch.where(is_local, self.col, torch.full_like(self.col, dump))
 
-    def remote_payload_bytes(self):
-        """Logical bytes transferred by one get/put over this plan's remote replica slots."""
+    def remote_payload_bytes(self, tensor_index: int | None = None):
+        """Logical bytes transferred by one get/put over remote replica slots.
+
+        ``tensor_index`` selects one expert parameter tensor (W1 or W2), which
+        lets the transfer-only timing sum the two independently timed kernels
+        without counting the full payload twice.
+        """
+        if self._remote_replica_count is None:
+            self._remote_replica_count = self.is_remote.to(torch.int64).sum()
+        if tensor_index is not None:
+            return self._remote_replica_count * self.r.wb[int(tensor_index)]
         if self._remote_payload_bytes is None:
-            self._remote_payload_bytes = (
-                self.is_remote.to(torch.int64).sum() * sum(self.r.wb)
-            )
+            self._remote_payload_bytes = self._remote_replica_count * sum(self.r.wb)
         return self._remote_payload_bytes
 
     @staticmethod
@@ -318,10 +328,20 @@ class GinReplicaTransport:
 
             for j in range(J):
                 # replica slots only: peers<0 (empty / main==me) skipped on device
-                r._gin.get_batched(
-                    r.home[j], r.slot[j], self.ls * wb[j], r.slot_off[j], r.nbytes_const[j],
-                    self.peers, blocks_per_desc=r.grid, use_lsa=r.use_lsa,
-                )
+                with profiling.record(
+                    "apply/weight_get_wire",
+                    time_it=True,
+                    device=device,
+                    stream=cs,
+                    payload_bytes=(
+                        self.remote_payload_bytes(j) if profiling.enabled() else 0
+                    ),
+                ):
+                    r._gin.get_batched(
+                        r.home[j], r.slot[j], self.ls * wb[j], r.slot_off[j],
+                        r.nbytes_const[j], self.peers, blocks_per_desc=r.grid,
+                        use_lsa=r.use_lsa,
+                    )
                 # pulled bytes -> effective-layout stack (transpose for Megatron)
                 slot_param = r.slot[j].view(dtype).reshape(nb, *r.weight_shapes[j])
                 eff = slot_param.transpose(1, 2) if meta["transpose_w"] else slot_param
@@ -358,10 +378,19 @@ class GinReplicaTransport:
 
         for j in range(J):
             # replica slots: put grad -> main(e)'s scratch column (peers<0 skipped on device)
-            r._gin.put_batched(
-                r.slot[j], r.scratch[j], r.slot_off[j], self.col * wb[j], r.nbytes_const[j],
-                self.peers, blocks_per_desc=r.grid, use_lsa=r.use_lsa,
-            )
+            with profiling.record(
+                "apply/grad_put_wire",
+                time_it=True,
+                device=device,
+                payload_bytes=(
+                    self.remote_payload_bytes(j) if profiling.enabled() else 0
+                ),
+            ):
+                r._gin.put_batched(
+                    r.slot[j], r.scratch[j], r.slot_off[j], self.col * wb[j],
+                    r.nbytes_const[j], self.peers, blocks_per_desc=r.grid,
+                    use_lsa=r.use_lsa,
+                )
             # local slots: on-device copy grad -> my own scratch column; the rest land on the dump row
             scratch_view = r.scratch[j].view(r.home_cap * world + 1, wb[j])
             scratch_view.index_copy_(0, self.grad_row, g_bytes[j])

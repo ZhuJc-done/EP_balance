@@ -87,9 +87,6 @@ export EPLB_DEBUG_TIMING="${EPLB_DEBUG_TIMING:-0}"
 export EPLB_REMATERIALIZE="${EPLB_REMATERIALIZE:-0}"
 
 if [[ "${EPLB_MODE}" == "apply" && "${EPLB_ADAPTER:-alltoall}" == "deepep" ]]; then
-  [[ -n "${EPLB_CAP:-}" && "${EPLB_CAP}" -gt 0 ]] || {
-    echo "ElasticBuffer smoke requires EPLB_CAP=<positive static bound>" >&2; exit 1;
-  }
   [[ "${EPLB_WEIGHT_COMM:-}" == "gin" && "${EPLB_GIN_FENCE:-}" == "signal" ]] || {
     echo "ElasticBuffer smoke requires EPLB_WEIGHT_COMM=gin EPLB_GIN_FENCE=signal" >&2; exit 1;
   }

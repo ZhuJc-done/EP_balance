@@ -3,8 +3,13 @@
 set -euo pipefail
 
 EPLB_DIR="${EPLB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+source "${EPLB_DIR}/scripts/env_hdfs.sh"
 PYTHON_BIN="${PYTHON_BIN:-python}"
-OUT_DIR="${OUT_DIR:-${EPLB_DIR}/logs/solver_scaling}"
+OUT_DIR="${OUT_DIR:-${EPLB_EXP_DIR}/solver_scaling}"
+CSV_FILE="${CSV_FILE:-${OUT_DIR}/solver_scaling.csv}"
+PLOT="${PLOT:-1}"
+PLOT_FILE="${PLOT_FILE:-${OUT_DIR}/solver_scaling.png}"
+PLOT_PDF_FILE="${PLOT_PDF_FILE:-${OUT_DIR}/solver_scaling.pdf}"
 
 # Space-separated sweep values.
 RANKS="${RANKS:-8 16 32 64 128}"
@@ -27,6 +32,10 @@ PATIENCE_ARGS=()
 if [[ "${STAGE2_PATIENCE_ALL_SCALES}" == "1" ]]; then
   PATIENCE_ARGS+=(--stage2-patience-all-scales)
 fi
+[[ "${PLOT}" == "0" || "${PLOT}" == "1" ]] || {
+  echo "invalid PLOT=${PLOT} (expected 0 or 1)" >&2
+  exit 1
+}
 
 mkdir -p "${OUT_DIR}"
 cd "${EPLB_DIR}"
@@ -84,5 +93,19 @@ for experts in "${EXPERT_VALUES[@]}"; do
   run_case "expert_scale" "${EXPERT_SWEEP_RANKS}" "${experts}"
 done
 
+"${PYTHON_BIN}" "${EPLB_DIR}/scripts/export_sweep_csv.py" \
+  --kind solver-scaling \
+  --input-dir "${OUT_DIR}" \
+  --output "${CSV_FILE}"
+
+if [[ "${PLOT}" == "1" ]]; then
+  "${PYTHON_BIN}" "${EPLB_DIR}/eval/plot_solver_scaling.py" \
+    --input-dir "${OUT_DIR}" \
+    --output "${PLOT_FILE}" \
+    --pdf-output "${PLOT_PDF_FILE}"
+fi
+
 echo "[solver-scaling] completed $(( ${#RANK_VALUES[@]} + ${#EXPERT_VALUES[@]} )) runs"
 echo "[solver-scaling] JSON results saved in ${OUT_DIR}"
+echo "[solver-scaling] CSV results: ${CSV_FILE}"
+[[ "${PLOT}" == "1" ]] && echo "[solver-scaling] plot: ${PLOT_FILE}"

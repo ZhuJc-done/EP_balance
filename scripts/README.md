@@ -22,8 +22,9 @@ Run MoE on real Megatron-LM with three behaviors selected by `EPLB_MODE`:
 | `sbatch_gb200_4x4.sbatch` | Slurm wrapper (`sbatch`) that `srun`s `run_gb200_4x4.sh` (1 task/node). |
 | `run_real_moe.sh` | Real-model launcher; `REAL=1` from `run_gb200_4x4.sh` forwards here. `MOCK=1` = mock-data + random init; `MOCK=0 FROM_SCRATCH=1` = real data + random init; `DEEPEP=1` = native DeepEP dispatch. |
 | `model_recipes.sh` | Architecture presets for Qwen3, 160E DeepSeek-V2, and 128E GLM-4.5-Air, with launch-time depth override. |
-| `run_slot_sweep.sh` | Sweep `N_slot=1..4` with workload seed 0 and save one non-detail baseline JSON per configuration; uses a fixed LPLB Ring topology. |
-| `run_solver_scaling.sh` | Sweep the Scale-EPLB CUDA solver over logical rank and expert counts and save hot-kernel JSON results. |
+| `run_slot_sweep.sh` | Sweep `N_slot=1..4`; save raw JSON, flat CSV, seed summary CSV, and PNG/PDF under the shared experiment directory. |
+| `run_solver_scaling.sh` | Sweep the Scale-EPLB CUDA solver over logical rank and expert counts; save raw JSON, flat CSV, and PNG/PDF under the shared experiment directory. |
+| `export_sweep_csv.py` | Flatten existing slot-sweep or solver-scaling JSON reports into CSV without rerunning a benchmark. |
 | `prepare_open_workload.py` | Download task/corpus workloads, extract model inputs, and optionally build Megatron `.bin/.idx`. |
 | `eval/plot_solver_scaling.py` | Read an existing solver-scaling JSON directory and independently generate PNG/PDF plots. |
 | `install_megatron.sh` | Clone+install pinned community Megatron-LM, self-check `import megatron`. |
@@ -95,6 +96,7 @@ creates this persistent layout:
 ├── indexed/             # Megatron .bin/.idx
 ├── tokenizers/
 ├── checkpoints/
+├── exp/                 # benchmark JSON, CSV, PNG, and PDF artifacts
 └── logs/
 ```
 
@@ -195,18 +197,31 @@ simulates the full logical problem and times only the hot `fast_solver.cu` kerne
 JIT compilation is recorded separately and excluded from the plotted latency:
 
 ```bash
-# Step 1: run the benchmark and write JSON only
+# Runs the benchmark, then writes JSON + CSV + PNG/PDF.
 bash scripts/run_solver_scaling.sh
-# -> logs/solver_scaling/{rank_scale,expert_scale}_r*_e*.json
-
-# Step 2: plot the existing JSON results
-python eval/plot_solver_scaling.py --input-dir logs/solver_scaling
-# -> logs/solver_scaling/solver_scaling.{png,pdf}
+# -> ${EPLB_EXP_DIR}/solver_scaling/
+#    ├── {rank_scale,expert_scale}_r*_e*.json
+#    ├── solver_scaling.csv
+#    └── solver_scaling.{png,pdf}
 ```
 
 The plot uses `kernel_only.min_us`, the fastest measured iteration for each
 configuration, and labels every point directly. Mean, p50, p95, and max remain
-available in the JSON for variability analysis but are not drawn.
+available in `solver_scaling.csv` for variability analysis but are not drawn.
+
+The N_slot sweep follows the same layout:
+
+```bash
+bash scripts/run_slot_sweep.sh
+# -> ${EPLB_EXP_DIR}/slot_sweep/
+#    ├── baseline_skew*_slot*_seed*.json
+#    ├── slot_sweep.csv              # one row per strategy / seed / N_slot
+#    ├── slot_sweep_summary.csv      # seed-aggregated key metrics
+#    └── slot_imbalance.{png,pdf}
+```
+
+Set `PLOT=0` to produce JSON and CSV without invoking Matplotlib. The standalone
+plot scripts also use `${EPLB_EXP_DIR}` by default after `source scripts/env_hdfs.sh`.
 
 The default rank sweep holds `E=640` while varying `R=8..64`; the expert sweep
 holds `R=32` while varying `E=64..1024`. Both use four replica slots per rank,
@@ -224,23 +239,25 @@ comparison, keep its JSON separate from the fixed-iteration default:
 
 ```bash
 STAGE2_PATIENCE_ALL_SCALES=1 \
-OUT_DIR=logs/solver_scaling_patience_all \
+OUT_DIR="${EPLB_EXP_DIR}/solver_scaling_patience_all" \
 bash scripts/run_solver_scaling.sh
-python eval/plot_solver_scaling.py --input-dir logs/solver_scaling_patience_all
 ```
 
 Use an idle GPU for timing; unrelated kernels contaminate CUDA-event latency.
 Select the benchmark device with `CUDA_DEVICE=<id>`.
 
-For a compact forward-path breakdown of each MoE invocation, enable debug timing in any mode:
+For a compact forward/backward breakdown of each MoE invocation, enable debug timing in any mode:
 
 ```bash
 # Pure Megatron baseline: native router / dispatcher / experts remain unchanged.
 EPLB_MODE=off EPLB_DEBUG_TIMING=1 \
   bash scripts/run_real_moe.sh
-# [EPLB-debug r0] mode=off layer=0 mb=0 solver=n/a omega_gather=n/a \
+# [EPLB-debug r0] mode=off layer=0 mb=0 moe_fwd_total=...ms \
+#   solver=n/a omega_gather=n/a \
 #   router=0.391ms expert_transfer=n/a dispatch=2.107ms \
 #   expert_gemm=4.936ms combine=1.988ms
+# [EPLB-debug r0] mode=off direction=backward layer=0 mb=0 \
+#   moe_bwd_total=...ms combine_bwd=...ms expert_bwd=...ms dispatch_bwd=...ms
 
 # Native Megatron execution plus Ω collection and the EPLB solver; plan is not applied.
 EPLB_MODE=observe EPLB_DEBUG_TIMING=1 \
@@ -250,12 +267,20 @@ EPLB_MODE=observe EPLB_DEBUG_TIMING=1 \
 EPLB_MODE=apply EPLB_DEBUG_TIMING=1 \
   bash scripts/run_real_moe.sh
 # [EPLB-debug r0] mode=apply layer=0 mb=0 ... \
+#   moe_fwd_total=...ms \
 #   expert_transfer=1.824ms/512.00MiB/294.36GB/s \
+#   expert_transfer_wire=...ms(x2)/512.00MiB/...GB/s \
 #   dispatch=2.107ms/64.00MiB/31.86GB/s ... \
 #   combine=1.988ms/64.00MiB/33.75GB/s
-# [EPLB-debug r0] mode=apply direction=backward \
+# [EPLB-debug r0] mode=apply direction=backward layer=0 mb=0 \
+#   moe_bwd_total=...ms \
 #   expert_repull=1.791ms/512.00MiB/299.71GB/s \
-#   expert_grad_reduce=2.031ms/512.00MiB/264.30GB/s
+#   expert_repull_wire=...ms(x2)/512.00MiB/...GB/s \
+#   combine_bwd=...ms(x2)/64.00MiB/...GB/s \
+#   expert_dgrad=...ms(x4) activation_bwd=...ms(x2) \
+#   dispatch_bwd=...ms(x2)/64.00MiB/...GB/s expert_wgrad=...ms(x2) \
+#   expert_grad_reduce=2.031ms/512.00MiB/264.30GB/s \
+#   expert_grad_put_wire=...ms(x2)/512.00MiB/...GB/s
 ```
 
 `EPLB_DEBUG_TIMING=1` synchronizes at each invocation boundary so that one line contains only
@@ -269,8 +294,25 @@ directly does not install these wrappers.
 Set `EPLB_PROFILE_ALL_RANKS=1` to print one line per rank. Under `EPLB_CHUNKS>=2`, an `(xN)`
 suffix means the displayed value is the sum of the `N` chunk events. Dispatch, expert GEMM,
 combine, and expert transfer can overlap in the apply pipeline, so their values are not additive.
-Backward GIN re-pull and gradient-reduce samples are emitted at the next forward boundary (and
-flushed at process exit), because they occur after that layer's forward line.
+`moe_fwd_total` spans the complete MoE forward invocation in both native (`off`/`observe`) and
+Scale-EPLB (`apply`) modes. `moe_bwd_total` starts when the final MoE output receives its gradient.
+On the default manual apply path it ends at the event immediately following the last
+reverse-dispatch on the token-communication stream. On the native path, its graph endpoint is
+inserted directly before `token_dispatch`, so the backward event fires immediately after that
+dispatch collective's inverse communication. This marker sits inside Megatron's optional
+delayed-Wgrad boundary: delayed Wgrad and attention backward are therefore excluded. Apply's
+following Wgrad/gradient-reduce tail, including time for which gradient-reduce remains live under
+attention backward, is excluded too. Stock native autograd usually executes expert Wgrad before
+reverse-dispatch, so that work remains inside native `moe_bwd_total`; the two modes have the same
+endpoint but not necessarily identical internal composition. The backward line is emitted
+immediately with its layer/micro-batch identity. Other reference autograd paths still defer their
+phase samples to the next forward boundary (or process exit).
+
+The manual apply path reports its two expert Dgrad GEMMs per chunk as `expert_dgrad`, activation
+backward separately, and both Wgrad GEMMs per chunk as `expert_wgrad`. Native Megatron's local
+tensor-parallel linear computes Dgrad and Wgrad inside one autograd function, so non-invasive
+instrumentation reports the complete native experts subgraph as `expert_bwd`; it cannot split that
+node into Dgrad/Wgrad without modifying Megatron's linear backward.
 
 Transfer fields also report logical remote payload and effective payload bandwidth:
 
@@ -283,6 +325,11 @@ main-owned slots are excluded. `expert_transfer` is the forward pull, `expert_re
 backward pull, and `expert_grad_reduce` is the gradient put/reduce-to-main. Their elapsed times
 cover the complete runtime operation (fences, staging and local reduction where applicable), so
 the result is end-to-end effective bandwidth rather than a raw copy-engine peak.
+
+The corresponding `*_wire` fields time only the two `get_batched` or `put_batched` CUDA kernels
+for W1 and W2 (hence `(x2)`). They exclude both world fences, local HBM staging, effective-stack
+assembly, scratch clearing, and the owner-side gradient sum. For GIN put, this is sender-side
+kernel/flush time; the following fence still defines when every owner may safely consume the data.
 
 For token transport, payload counts only routing units whose destination is another rank.
 Dispatch includes the transported row's metadata/alignment padding; DeepEP combine includes its
@@ -338,6 +385,21 @@ EPLB_MODE=apply EPLB_PROFILE=1 EPLB_PROFILE_ALL_RANKS=1 EPLB_PROFILE_RESET_AT=1 
 grep 'apply/expert_compute' logs/real_*.log
 ```
 
+For the per-layer debug breakdown, collect every rank and let the extractor take max-over-ranks
+for each matching `(layer, mb, phase)` before summing layers:
+
+```bash
+EPLB_DEBUG_TIMING=1 EPLB_PROFILE_ALL_RANKS=1 \
+  bash scripts/run_real_moe.sh
+python eval/extract_eplb_debug.py \
+  --log logs/real_*_node*.log \
+  --out-dir results/debug_breakdown \
+  --warmup 100 --expected-ranks 32
+```
+
+`critical_rank.csv` contains the critical rank and latency for every layer invocation. The summary
+uses `sum_layer(max_rank(phase_ms))`; it does not take the maximum of per-rank medians.
+
 `N_slot` budget sweep (balance gain vs replica memory and weight-move bandwidth):
 
 ```bash
@@ -360,12 +422,12 @@ measurement.
 
 ### Apply-mode memory: what actually allocates
 
-Two per-layer buffers, both live across forward→backward, and the small one is not the problem:
+The SM90 production path has two relevant buffer families:
 
 | Buffer | Size | Qwen3-30B-A3B, EP=8, seq 4096 |
 |---|---|---|
 | `w_stacked` (per-slot expert weights) | `n_slot x \|W_e\|` | 297 MB |
-| `x_pad` + its activations (dense grouped-GEMM batch) | `n_slot x cap x H` | **~12.7 GB** |
+| packed token rows + grouped-GEMM activations | proportional to actual/receive-bound rows | bounded by `EPLB_MAX_RECV_ROWS` |
 
 There is **no persistent or symmetric buffer**: `w_stacked` is a fresh
 `[n_slot+1, *weight_shape]` allocated on every layer's forward, and *all* slots are copied into
@@ -373,11 +435,10 @@ it — the rank's own mains as well as the replicas — because the grouped GEMM
 stack. So even `EPLB_N_SLOT = num_experts/EP` (no replication headroom at all) still costs one
 full duplicate of the layer's expert weights.
 
-The dominant term is `cap`, the per-slot capacity that `grouped_expert_mlp` pads its dense
-`[n_slot, cap, H]` batch to. `cap` is derived from `group_sizes.max()` — the exact per-slot token
-count under the solved plan — which keeps the padded batch close to the real token count. Because
-it is derived from the plan, **a better-balanced plan is also a cheaper one**. `EPLB_CAP=<int>`
-overrides it; setting it *below* the true per-slot max silently drops tokens, so only raise it.
+There is no dense `[n_slot, cap, H]` compute batch in production. SM90
+`torch._grouped_mm` consumes slot-major packed rows plus device offsets and computes exactly the
+received token rows, including forward, Dgrad, and Wgrad. The old padded per-slot-capacity setting
+is not part of the training interface.
 
 If apply mode still OOMs, in order of effect:
 
@@ -385,9 +446,10 @@ If apply mode still OOMs, in order of effect:
 EPLB_REMATERIALIZE=1   # dist.broadcast path only: checkpoints the replication + expert GEMM so
                        # backward re-broadcasts instead of holding the stack. The GIN path never
                        # holds it, so this knob does not apply there.
-EPLB_N_SLOT=16         # = num_experts/EP: no replica headroom, halves both buffers. Also removes
+EPLB_N_SLOT=16         # = num_experts/EP: no replica headroom, shrinks the weight stack. Also removes
                        # the balancing freedom, so use it to isolate memory, not to benchmark.
-SEQ_LEN=2048           # cap scales with tokens per rank, so this halves the padded batch too.
+EPLB_MAX_RECV_ROWS=... # bound packed rows after dispatch; exceeding it aborts asynchronously.
+SEQ_LEN=2048           # reduces the real token rows and their grouped-GEMM activations.
 ```
 
 The GIN path keeps no replica weights across forward→backward: backward re-acquires them with a
@@ -519,7 +581,7 @@ DATA_PATH="${EPLB_INDEXED_DATA_DIR}/dapo_math_text_document" \
 TOKENIZER_MODEL="${EPLB_TOKENIZER_DIR}/qwen3_30b_a3b" \
 MOCK=0 FROM_SCRATCH=0 MODEL=qwen3_30b_a3b \
 EPLB_MODE=apply EPLB_ADAPTER=deepep \
-EPLB_WEIGHT_COMM=gin EPLB_GIN_FENCE=signal EPLB_CAP=<validated-bound> \
+EPLB_WEIGHT_COMM=gin EPLB_GIN_FENCE=signal \
 EPLB_DEEPEP_HYBRID=1 EPLB_PROFILE=0 PROFILE_TRACE=0 \
 GPUS_PER_NODE=4 NNODES=4 NODE_RANK=<0..3> \
 MASTER_ADDR=<node0-ip> MASTER_PORT=29500 \
@@ -557,13 +619,13 @@ Apply mode moves two independent things across ranks, and they use different bac
 | `EPLB_GIN_FENCE` | `barrier` (host, not stream-ordered) | `signal` — device-stream, capture-safe |
 | `EPLB_GIN_LSA` | `1` — intra-node peers over NVLink | `0` forces everything onto the network (A/B only) |
 | `EPLB_GIN_LSA_TMA` | `1` — SM90+ TMA copy | `0` keeps LSA routing but restores vector load/store (A/B/fallback) |
-| `EPLB_CAP` | derived only for alltoall | required static bound for Elastic; overflow aborts asynchronously |
+| Expert compute | SM90+ BF16 ragged `torch._grouped_mm` | no padded fallback or per-slot cap |
 | `EPLB_DEEPEP_HYBRID` | `1` | NVLink scale-up plus GIN scale-out |
 | `EPLB_DEEPEP_MAX_TOKENS_PER_RANK` | first chunk's static size | optional larger per-chunk input bound |
 
 ```bash
 EPLB_MODE=apply EPLB_ADAPTER=deepep EPLB_WEIGHT_COMM=gin \
-EPLB_GIN_FENCE=signal EPLB_CAP=<validated-bound> \
+EPLB_GIN_FENCE=signal \
 EPLB_PROFILE=0 PROFILE_TRACE=0 \
   ... bash scripts/run_real_moe.sh
 ```
@@ -628,7 +690,7 @@ schedule buys is two placements autograd cannot express:
 |---|---|---|
 | forward weight pull | exposed before the first dispatch | on the weight stream, hidden behind `dispatch(c1)` |
 | Dgrad vs Wgrad in a chunk | fused in one node, Wgrad first (it needs no weight) | Dgrad first, `dispatch⁻¹(k)` issued between the two, Wgrad under that transfer |
-| backward reduce-to-main | last in the layer because autograd puts it there — it is the node nearest the parameters, so every chunk's Wgrad must reach it first | last in the layer because it is the one transfer nothing in the layer waits on |
+| backward reduce-to-main | last in the layer because autograd puts it there — it is the node nearest the parameters, so every chunk's Wgrad must reach it first | issued after the Wgrads on the weight stream; the token branch continues through router/attention, and an end-of-backward callback joins before expert `AccumulateGrad`/DDP |
 
 Only Dgrad is on anyone's critical path: it produces `grad_x`, which the token channel carries back to
 the token owners. The Wgrads feed the parameter reduction alone, so issuing `dispatch⁻¹(k)` between the
@@ -639,17 +701,22 @@ this gives up is the cushion for a late weight pull — Wgrad-first needs no wei
 The reduce overlap is real only when the weight channel has its own transport: `dist.reduce` shares
 the token all-to-alls' NCCL communicator, and NCCL serialises same-communicator work whatever stream
 it was enqueued on, so under the broadcast transport the reordering is host-side only. Under `gin` the
-reduction is device-initiated on a separate channel and genuinely runs concurrently.
+reduction is device-initiated on a separate channel and genuinely runs concurrently. Expert weights
+are deliberately not direct differentiable inputs of the manual node: otherwise autograd schedules
+their leaf accumulators before following the token gradient into router/attention and the required
+stream wait would still block the critical path. The queued leaf-only callback preserves normal
+parameter hooks and Megatron `main_grad`/DDP behavior after the asynchronous reduction is complete.
 
 Ordering is invisible in gradients — every schedule produces the same numbers — so it is pinned
 directly by `test_sync_free_two_chunk_backward_issue_order`, which asserts the sequence
 `combine⁻¹(c1), combine⁻¹(c2), dispatch⁻¹(c1), dispatch⁻¹(c2), reduce`.
 
-`EPLB_CAP` sizes the compute batch `[n_slot, cap, H]` and is mandatory in Elastic mode. Choose it
-from a measured per-slot maximum plus headroom. A low value triggers `torch._assert_async` instead
-of dropping or overwriting tokens. With `do_cpu_sync=False`, non-expanded Elastic receive storage is
-the worst case `[EP * max_units_per_chunk, padded_hidden]`; lower
-`EPLB_DEEPEP_MAX_TOKENS_PER_RANK` by using fixed-size chunks when memory is tight.
+Elastic compute is SM90+ BF16 ragged grouped GEMM only. Per-slot counts remain on device as grouped
+offsets, so there is no padded compute batch or per-slot capacity setting. With
+`do_cpu_sync=False`, non-expanded Elastic receive storage is still the worst case
+`[EP * max_units_per_chunk, padded_hidden]`; use fixed-size chunks and lower
+`EPLB_DEEPEP_MAX_TOKENS_PER_RANK`, or set a validated total `EPLB_MAX_RECV_ROWS`, when memory is
+tight.
 
 **Validate the combination before spending cluster hours on it.** The CPU suite pins
 `AllToAllAdapter` over gloo, so neither backend is exercised there. On the target cluster:
@@ -696,7 +763,7 @@ MEGATRON_DIR=/home/tiger/Megatron-LM EPLB_DIR=/home/tiger/EP_balance \
 NNODES=4 NODE_RANK=<0..3> MASTER_ADDR=<node0-ip> MASTER_PORT=29500 \
 EPLB_MODE=apply EPLB_ADAPTER=deepep \
 EPLB_WEIGHT_COMM=gin EPLB_GIN_FENCE=signal \
-EPLB_CAP=8192 EPLB_N_SLOT=4 \
+EPLB_N_SLOT=4 \
 EPLB_CHUNKS=2 EPLB_DEEPEP_MAX_TOKENS_PER_RANK=4096 \
 EPLB_PROFILE=0 PROFILE_TRACE=0 \
 EP_SIZE=16 NUM_EXPERTS=32 TOPK=4 TRAIN_ITERS=3 \
@@ -704,7 +771,7 @@ EP_SIZE=16 NUM_EXPERTS=32 TOPK=4 TRAIN_ITERS=3 \
 ```
 
 Here `SEQ_LEN=2048`, `TOPK=4`, so each rank has 8192 routing units and each of two chunks has
-4096. `EPLB_CAP=8192` is the conservative no-drop bound. The log must print
+4096. Ragged grouped GEMM computes only the received rows. The log must print
 `transport=deep_ep.buffers.elastic.ElasticBuffer GIN=ready`; keep synchronous in-training
 profilers disabled for this zero-sync check.
 

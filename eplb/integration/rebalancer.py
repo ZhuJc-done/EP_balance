@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 
@@ -17,6 +17,9 @@ from . import profiling
 from .hooks import NullWeightMaterializer, RebalanceResult, WeightMaterializer
 
 
+PlanSolver = Callable[[Loads, Topology, ProblemSpec, EPLBConfig], Plan]
+
+
 class EPLBRebalancer:
     """Owns the topology/spec/config and runs the collect->solve->apply loop.
 
@@ -25,6 +28,8 @@ class EPLBRebalancer:
         spec: Static problem spec.
         cfg: Solver config (defaults to :class:`EPLBConfig`).
         materializer: Backend weight materializer (defaults to no-op placeholder).
+        plan_solver: Optional placement/plan plugin. The default is Scale-EPLB's
+            native solver; plugins receive the same ``(loads, topo, spec, cfg)``.
         cache_plans: If True, cache solved plans for backward; else recompute from
             cached ``Ω`` (less memory, relies on determinism; default for K=1).
         ring_size: Max in-flight (layer, mb) entries to retain (FIFO eviction). ``0`` retains
@@ -39,6 +44,7 @@ class EPLBRebalancer:
         spec: ProblemSpec,
         cfg: Optional[EPLBConfig] = None,
         materializer: Optional[WeightMaterializer] = None,
+        plan_solver: Optional[PlanSolver] = None,
         *,
         cache_plans: bool = False,
         ring_size: int = 64,
@@ -49,6 +55,7 @@ class EPLBRebalancer:
         self.spec = spec
         self.cfg = cfg or EPLBConfig()
         self.materializer = materializer or NullWeightMaterializer()
+        self.plan_solver = plan_solver
         self.cache_plans = cache_plans
         self.ring_size = int(ring_size)
 
@@ -61,7 +68,9 @@ class EPLBRebalancer:
     def plan_from_omega(self, loads: Loads) -> Plan:
         """Solve directly from an already-gathered ``Ω`` (no communication)."""
         with profiling.record("solve", time_it=True, device=loads.device):
-            return solve(loads, self.topo, self.spec, self.cfg, validate=False)
+            if self.plan_solver is None:
+                return solve(loads, self.topo, self.spec, self.cfg, validate=False)
+            return self.plan_solver(loads, self.topo, self.spec, self.cfg)
 
     def rebalance_from_omega(
         self, loads: Loads, layer_id: int, micro_batch_id: int

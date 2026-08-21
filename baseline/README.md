@@ -12,6 +12,55 @@ This directory provides a common benchmark harness for:
   Algorithms 1-2), a vExpert-based Expand/Shrink greedy.
 - `lplb`: an adapter around the official compiled LPLB `Planner`.
 
+## Use a baseline inside training
+
+`EPLB_PLAN_SOLVER` selects the planner in `apply` mode. The expert
+materializer, GIN weight pull/gradient reduction, DeepEP token transport, and
+grouped-GEMM pipeline remain unchanged:
+
+```bash
+# scale (default) | fastermoe | deepseek | flexmoe | lplb
+EPLB_MODE=apply \
+EPLB_PLAN_SOLVER=fastermoe \
+EPLB_N_SLOT=10 \
+  bash scripts/run_real_moe.sh
+```
+
+The training adapter converts each policy to the common
+`Plan(x[E,R], q[R,E,R], theta)` contract:
+
+- FasterMoE keeps its original semantics: a shadowed expert's tokens execute
+  on their source EP rank.
+- DeepSeek EPLB keeps its hierarchical replica-count/placement preference, but
+  pins every optimizer-owned main expert and projects duplicate same-rank
+  physical slots to a binary placement.
+- FlexMoE keeps its vExpert-count decision, then applies the same main-fixed
+  binary projection.
+- LPLB keeps main experts fixed, selects hot local experts for its configured
+  redundancy graph, and converts the official LP split ratios into integer,
+  token-conserving quotas.
+
+`EPLB_N_SLOT` has the runtime meaning used by Scale-EPLB: **total** physical
+slots per rank, including mains. The adapters subtract
+`num_experts / EP` before calling baseline APIs, whose standalone CLI uses an
+additional-replica-slot count.
+
+Optional policy knobs are:
+
+```bash
+EPLB_FASTERMOE_BW_NET=6.25e9
+EPLB_FASTERMOE_BW_MM=11.5e12
+EPLB_DEEPSEEK_NUM_GROUPS=8
+EPLB_FLEXMOE_THRESHOLD=1.2
+EPLB_LPLB_ROOT=/home/tiger/LPLB
+EPLB_LPLB_TOPOLOGY=auto   # auto | cube | ring
+```
+
+The vendored FasterMoE, DeepSeek, and FlexMoE reference policies execute their
+decision logic on CPU, including the required CUDA-to-host load transfer. Their
+cost is intentionally included in the existing `solve` profile region. LPLB
+requires its separately compiled CUDA package.
+
 ## Run
 
 ```bash

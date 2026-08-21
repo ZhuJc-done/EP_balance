@@ -223,6 +223,118 @@ def test_sync_free_two_chunk_backward_issue_order():
     mp.spawn(_worker, args=(6027, False, True, 2, True, []), nprocs=W, join=True)
 
 
+def test_expert_grad_callback_runs_after_upstream_token_backward():
+    """Deferred expert accumulation must follow the complete token backward."""
+    from eplb.integration.manual_block import _queue_parameter_grads
+
+    order = []
+
+    class UpstreamTokenPath(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            return x.view_as(x)
+
+        @staticmethod
+        def backward(ctx, grad):
+            order.append("upstream")
+            return grad
+
+    class ExpertNode(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, trigger):
+            return x.view_as(x)
+
+        @staticmethod
+        def backward(ctx, grad):
+            order.append("expert")
+            _queue_parameter_grads((weight,), (torch.ones(()),), None, None)
+            return grad, None
+
+    token = torch.ones((), requires_grad=True)
+    weight = torch.ones((), requires_grad=True)
+    trigger = torch.empty((), requires_grad=True)
+    expanded = weight.expand_as(weight)
+    grad_acc = expanded.grad_fn.next_functions[0][0]
+    grad_acc.register_hook(lambda *unused: order.append("ddp_post"))
+    weight.register_hook(lambda grad: (order.append("expert_leaf"), grad)[1])
+
+    ExpertNode.apply(UpstreamTokenPath.apply(token), trigger).backward()
+
+    assert order == ["expert", "upstream", "expert_leaf", "ddp_post"]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not hasattr(torch.cuda, "_sleep"),
+    reason="needs CUDA event timing and torch.cuda._sleep",
+)
+def test_deferred_expert_grad_wait_overlaps_upstream_cuda_backward():
+    """The end callback protects the expert grad without blocking the token branch."""
+    from eplb.integration.manual_block import _queue_parameter_grads
+    from eplb.integration.overlap import _weight_stream
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    weight_stream = _weight_stream(device)
+    weight = torch.nn.Parameter(torch.ones((), device=device))
+    weight.main_grad = torch.zeros_like(weight)
+    expanded = weight.expand_as(weight)
+    grad_acc = expanded.grad_fn.next_functions[0][0]
+
+    def megatron_post_hook(*unused):
+        assert weight.grad is not None
+        weight.main_grad.add_(weight.grad)
+        weight.grad = None
+
+    grad_acc.register_hook(megatron_post_hook)
+    events = {}
+
+    class UpstreamTokenPath(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            return x.view_as(x)
+
+        @staticmethod
+        def backward(ctx, grad):
+            marker = torch.cuda.Event(enable_timing=True)
+            marker.record(torch.cuda.current_stream(device))
+            events["upstream"] = marker
+            return grad
+
+    class AsyncExpertNode(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, trigger):
+            return x.view_as(x)
+
+        @staticmethod
+        def backward(ctx, grad):
+            compute = torch.cuda.current_stream(device)
+            launch = torch.cuda.Event(enable_timing=True)
+            done = torch.cuda.Event(enable_timing=True)
+            launch.record(compute)
+            with torch.cuda.stream(weight_stream):
+                weight_stream.wait_event(launch)
+                torch.cuda._sleep(20_000_000)
+                grad_weight = torch.ones((), device=device)
+                done.record(weight_stream)
+            _queue_parameter_grads((weight,), (grad_weight,), done, compute)
+            events["launch"], events["done"] = launch, done
+            return grad, None
+
+    token = torch.ones((), device=device, requires_grad=True)
+    trigger = torch.empty((), device=device, requires_grad=True)
+    output = AsyncExpertNode.apply(UpstreamTokenPath.apply(token), trigger)
+    output.backward()
+    torch.cuda.synchronize(device)
+
+    reduce_ms = events["launch"].elapsed_time(events["done"])
+    upstream_ms = events["launch"].elapsed_time(events["upstream"])
+    assert upstream_ms + 0.5 < reduce_ms, (
+        f"upstream backward did not overlap the async expert grad: "
+        f"upstream={upstream_ms:.3f}ms reduce={reduce_ms:.3f}ms"
+    )
+    assert weight.grad is None
+    assert torch.equal(weight.main_grad, torch.ones_like(weight))
+
+
 def test_sync_free_two_chunk_overlap_autograd_matches_reference():
     """Same configuration with EPLB_MANUAL_BWD=0, i.e. autograd ordering the backward instead.
 
@@ -431,8 +543,9 @@ def test_elastic_adapter_configuration_is_strict(monkeypatch):
     import sys
     import types
 
-    from eplb.integration.grouped_mlp import ragged_available
-    from eplb.integration.megatron_moe import _make_adapter
+    import eplb.integration.megatron_moe as megatron_moe
+
+    _make_adapter = megatron_moe._make_adapter
 
     fake_deep_ep = types.ModuleType("deep_ep")
     fake_deep_ep.ElasticBuffer = object
@@ -440,21 +553,18 @@ def test_elastic_adapter_configuration_is_strict(monkeypatch):
     monkeypatch.setitem(sys.modules, "deep_ep", fake_deep_ep)
     monkeypatch.setenv("EPLB_ADAPTER", "deepep")
     for key in (
-        "EPLB_CAP", "EPLB_WEIGHT_COMM", "EPLB_GIN_FENCE", "EPLB_PROFILE",
+        "EPLB_WEIGHT_COMM", "EPLB_GIN_FENCE", "EPLB_PROFILE",
         "EPLB_DEBUG_TIMING", "PROFILE_TRACE", "EPLB_DEEPEP_ALLOW_MNNVL",
     ):
         monkeypatch.delenv(key, raising=False)
 
-    # A cap is only mandatory for the padded expert path; the ragged one sizes itself on device.
+    # Production Elastic execution is intentionally SM90 ragged-only.
     monkeypatch.setenv("EPLB_GROUPED_GEMM", "0")
-    with pytest.raises(ValueError, match="EPLB_CAP"):
+    with pytest.raises(ValueError, match="SM90"):
         _make_adapter()
     monkeypatch.delenv("EPLB_GROUPED_GEMM")
-    if ragged_available():
-        with pytest.raises(ValueError, match="WEIGHT_COMM"):
-            _make_adapter()   # no EPLB_CAP set, and none needed
+    monkeypatch.setattr(megatron_moe, "ragged_available", lambda: True)
 
-    monkeypatch.setenv("EPLB_CAP", "16")
     with pytest.raises(ValueError, match="WEIGHT_COMM"):
         _make_adapter()
     monkeypatch.setenv("EPLB_WEIGHT_COMM", "gin")
@@ -550,7 +660,7 @@ def test_elastic_dispatch_uses_synthetic_experts_padding_and_no_sync(monkeypatch
     cached = [c for c in calls if c[0] == "dispatch" and c[3] is not None]
     assert cached and cached[0][1]["do_cpu_sync"] is False
     assert cached[0][1]["do_expand"] is False
-    with pytest.raises(RuntimeError, match="EPLB_CAP"):
+    with pytest.raises(RuntimeError, match="padded expert capacity"):
         adapter.dispatch_chunk(
             payload.detach(), torch.tensor([3]), torch.tensor([3]), adapter._group, tag=8,
             route_idx=routes, n_slot=2, cap=1,

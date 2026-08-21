@@ -189,9 +189,11 @@ __global__ void update_routing_kernel(
       (static_cast<int64_t>(src) * num_experts + expert) * num_ranks + dst;
   q[q_offset] = assigned;
   if (assigned > 0) {
-    atomic_add_i64(
-        expert_rank_load + static_cast<int64_t>(expert) * num_ranks + dst,
-        assigned);
+    if (expert_rank_load != nullptr) {
+      atomic_add_i64(
+          expert_rank_load + static_cast<int64_t>(expert) * num_ranks + dst,
+          assigned);
+    }
     atomic_add_i64(rank_load + dst, assigned);
   }
 }
@@ -873,9 +875,82 @@ void fast_solve_cuda(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void fixed_routing_cuda(
+    torch::Tensor omega,
+    torch::Tensor x,
+    torch::Tensor dom,
+    torch::Tensor q,
+    torch::Tensor rank_load,
+    int64_t quota_floor) {
+  check_cuda_contiguous(omega, "omega");
+  check_cuda_contiguous(x, "x");
+  check_cuda_contiguous(dom, "dom");
+  check_cuda_contiguous(q, "q");
+  check_cuda_contiguous(rank_load, "rank_load");
+
+  TORCH_CHECK(omega.scalar_type() == torch::kInt64, "omega must be int64");
+  TORCH_CHECK(x.scalar_type() == torch::kInt8, "x must be int8");
+  TORCH_CHECK(dom.scalar_type() == torch::kInt64, "dom must be int64");
+  TORCH_CHECK(q.scalar_type() == torch::kInt64, "q must be int64");
+  TORCH_CHECK(
+      rank_load.scalar_type() == torch::kInt64,
+      "rank_load must be int64");
+  TORCH_CHECK(omega.dim() == 2, "omega must have shape [R, E]");
+
+  const int num_ranks = static_cast<int>(omega.size(0));
+  const int num_experts = static_cast<int>(omega.size(1));
+  TORCH_CHECK(
+      num_ranks > 0 && num_ranks <= 1024,
+      "fixed CUDA routing requires 1 <= R <= 1024");
+  TORCH_CHECK(num_experts > 0, "fixed CUDA routing requires E > 0");
+  TORCH_CHECK(
+      x.sizes() == torch::IntArrayRef({num_experts, num_ranks}),
+      "x shape mismatch");
+  TORCH_CHECK(
+      dom.sizes() == torch::IntArrayRef({num_ranks}),
+      "dom shape mismatch");
+  TORCH_CHECK(
+      q.sizes() == torch::IntArrayRef({num_ranks, num_experts, num_ranks}),
+      "q shape mismatch");
+  TORCH_CHECK(
+      rank_load.sizes() == torch::IntArrayRef({num_ranks}),
+      "rank_load shape mismatch");
+  TORCH_CHECK(quota_floor > 0, "quota_floor must be positive");
+  TORCH_CHECK(
+      x.get_device() == omega.get_device() &&
+          dom.get_device() == omega.get_device() &&
+          q.get_device() == omega.get_device() &&
+          rank_load.get_device() == omega.get_device(),
+      "all fixed-routing tensors must be on the same CUDA device");
+
+  const c10::cuda::CUDAGuard device_guard(omega.device());
+  const cudaStream_t stream =
+      at::cuda::getCurrentCUDAStream(omega.get_device());
+  int threads = 32;
+  while (threads < num_ranks) {
+    threads <<= 1;
+  }
+  update_routing_kernel<<<num_ranks * num_experts, threads, 0, stream>>>(
+      omega.data_ptr<int64_t>(),
+      x.data_ptr<int8_t>(),
+      nullptr,
+      dom.data_ptr<int64_t>(),
+      q.data_ptr<int64_t>(),
+      nullptr,
+      rank_load.data_ptr<int64_t>(),
+      num_ranks,
+      num_experts,
+      quota_floor);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def(
       "fast_solve",
       &fast_solve_cuda,
       "Parallel Scale-EPLB CUDA solver (CUDA)");
+  module.def(
+      "fixed_routing",
+      &fixed_routing_cuda,
+      "Build quotas for a fixed expert placement (CUDA)");
 }

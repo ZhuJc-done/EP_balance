@@ -101,11 +101,12 @@ def _weight_stream(device: torch.device):
     ``wait_stream`` pair around a weight pull order the expert GEMMs against token transfers they have
     no dependency on.
 
-    Only the pull runs here -- the grad put in ``reduce_grads`` stays on the compute stream, because
-    autograd consumes its return value there. That still leaves the two uses of the single symmetric
-    ``slot`` buffer ordered without a second buffer: each pull opens with
-    ``wait_stream(compute)``, which covers the previous layer's put, and the consuming
-    ``wait_stream(weight)`` in :meth:`_ReplicaLease.wait` covers the reverse.
+    In the reference autograd path only the pull runs here: its grad put stays on the compute stream
+    because autograd consumes the return value immediately. The default manual path also puts the
+    grad reduction here, then accumulates the expert leaves from an end-of-backward callback so the
+    weight stream can overlap router/attention backward. The single stream keeps shared symmetric
+    buffers ordered across layers without a second buffer; each pull also opens with
+    ``wait_stream(compute)``, and :meth:`_ReplicaLease.wait` orders the consuming Dgrad after it.
     """
     return _side_stream(_WEIGHT_STREAMS, device)
 
@@ -549,7 +550,10 @@ class OverlappedExperts:
             return scatter_rows(y_sorted, order, T)
 
         if cap is None:
-            raise ValueError("the padded expert path needs a host-static cap")
+            raise RuntimeError(
+                "SM90 ragged grouped GEMM is required for production expert compute; "
+                "the padded path is reference-only"
+            )
         safe_slot = slot_sorted.clamp(max=n_slot - 1)
         seg_start = torch.zeros(n_slot, dtype=torch.int64, device=device)
         if n_slot > 1:

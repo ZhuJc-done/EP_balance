@@ -30,18 +30,29 @@ _RANK = os.environ.get("RANK", "")
 _PREFIX = f"[EPLB-profile r{_RANK}]" if _RANK else "[EPLB-profile]"
 _DEBUG_PREFIX = f"[EPLB-debug r{_RANK}]" if _RANK else "[EPLB-debug]"
 _DEBUG_PHASES = (
+    ("moe_fwd_total", ("apply/moe_fwd_total", "native/moe_fwd_total")),
     ("solver", ("solve",)),
     ("omega_gather", ("all_gather_omega",)),
     ("router", ("apply/route", "native/route")),
     ("shared_expert", ("apply/shared_expert", "native/shared_expert")),
     ("expert_transfer", ("apply/weight_move",)),
+    ("expert_transfer_wire", ("apply/weight_get_wire",)),
     ("dispatch", ("apply/dispatch", "native/dispatch")),
     ("expert_gemm", ("apply/expert_gemm", "native/expert_gemm")),
     ("combine", ("apply/combine", "native/combine")),
 )
 _DEBUG_BACKWARD_PHASES = (
+    ("moe_bwd_total", ("apply/moe_bwd_total", "native/moe_bwd_total")),
     ("expert_repull", ("apply/weight_repull",)),
+    ("expert_repull_wire", ("apply/weight_get_wire",)),
+    ("combine_bwd", ("apply/combine_bwd", "native/combine_bwd")),
+    ("expert_bwd", ("native/expert_bwd",)),
+    ("expert_dgrad", ("apply/expert_dgrad",)),
+    ("activation_bwd", ("apply/activation_bwd",)),
+    ("dispatch_bwd", ("apply/dispatch_bwd", "native/dispatch_bwd")),
+    ("expert_wgrad", ("apply/expert_wgrad",)),
     ("expert_grad_reduce", ("apply/grad_move",)),
+    ("expert_grad_put_wire", ("apply/grad_put_wire",)),
 )
 
 
@@ -160,11 +171,12 @@ def _format_fields(phases, missing: Optional[Mapping[str, str]] = None):
     return fields
 
 
-def _emit_deferred_backward() -> None:
+def _emit_deferred_backward(context: str = "", *, mode: str = "apply") -> None:
     fields = _format_fields(_DEBUG_BACKWARD_PHASES)
     if fields and _debug_logger is not None:
+        where = f" {context}" if context else ""
         _debug_logger(
-            f"{_DEBUG_PREFIX} mode=apply direction=backward " + " ".join(fields)
+            f"{_DEBUG_PREFIX} mode={mode} direction=backward{where} " + " ".join(fields)
         )
 
 
@@ -178,6 +190,44 @@ def begin_debug_window() -> None:
         return
     _drain()
     _emit_deferred_backward()
+    _WINDOW_STATS.clear()
+
+
+def start_debug_interval(*, device=None, stream=None):
+    """Start a debug-only interval that may finish on a different CUDA stream."""
+    if not _DEBUG_ENABLED:
+        return None
+    use_cuda = torch.cuda.is_available() and (
+        device is None or torch.device(device).type == "cuda"
+    )
+    if not use_cuda:
+        return ("cpu", time.perf_counter())
+    start = torch.cuda.Event(enable_timing=True)
+    start.record(stream)
+    return ("cuda", start)
+
+
+def finish_debug_interval(name: str, start, *, stream=None) -> None:
+    """Finish an interval without imposing a stream dependency."""
+    if start is None:
+        return
+    kind, value = start
+    if kind == "cpu":
+        _add_sample(name, (time.perf_counter() - value) * 1e3)
+        return
+    end = torch.cuda.Event(enable_timing=True)
+    end.record(stream)
+    _PENDING.append((name, value, end, 0))
+    if len(_PENDING) >= _MAX_PENDING:
+        _drain()
+
+
+def emit_backward_debug(context: str = "", *, mode: str = "apply") -> None:
+    """Synchronize, print and clear one completed MoE-layer backward window."""
+    if not _DEBUG_ENABLED:
+        return
+    _drain()
+    _emit_deferred_backward(context, mode=mode)
     _WINDOW_STATS.clear()
 
 

@@ -391,7 +391,7 @@ class DeepEPAdapter:
         if cap is not None and hasattr(torch, "_assert_async"):
             torch._assert_async(
                 torch.all(group_sizes <= int(cap)),
-                "ElasticBuffer: EPLB_CAP is below a physical slot's received-token count",
+                "ElasticBuffer: padded expert capacity is below a slot's received-token count",
             )
         holder.update(
             recv_slot=recv_slot,
@@ -731,6 +731,7 @@ def _moe_forward_two_chunks(
     device,
     R: int,
     num_chunks: int,
+    backward_timer: Optional[dict] = None,
 ) -> torch.Tensor:
     """Token-chunked dispatch/compute/combine pipeline over compute + comm streams (weights pre-acquired).
 
@@ -791,13 +792,14 @@ def _moe_forward_two_chunks(
 
     if block is not None:
         # One node for dispatch/GEMM/combine, both directions hand-scheduled: the forward's weight pull
-        # hides behind dispatch(c1) and the backward's reduce-to-main overlaps the last dispatch^-1.
+        # hides behind dispatch(c1). Backward reduce-to-main starts behind the last dispatch^-1 and
+        # remains asynchronous through router/attention backward, joining only in the leaf callback.
         comb = block.run(
             [p["payload"] for p in prep], [p["sent"] for p in prep], [p["recv"] for p in prep],
             [p["route"] for p in prep],
             [p["dispatch_bytes"] for p in prep], [p["combine_bytes"] for p in prep],
             adapter=adapter, group=group, cap=cap, n_slot=n_slot, H=H, pad_cols=pad_cols,
-            my_rank=my_rank, max_recv_rows=max_recv_rows,
+            my_rank=my_rank, max_recv_rows=max_recv_rows, backward_timer=backward_timer,
         )
         return block.prefetch_on_backward_of(
             _scatter_to_tokens(comb, prep, tokens.shape[0], H, device, keepalive=None)
@@ -922,6 +924,7 @@ def sync_free_moe_forward(
     gated: bool = False,
     act: Callable = torch.relu,
     transpose_w: bool = False,
+    backward_timer: Optional[dict] = None,
 ) -> torch.Tensor:
     """Replication-aware MoE forward via physical-id routing + grouped compute (the Phase C dispatch path; only the adapter may sync).
 
@@ -935,8 +938,8 @@ def sync_free_moe_forward(
         weights_local: ``{e: weight_tuple}`` for experts whose ``main(e)`` is this rank.
         weight_shapes: Shape of each weight tensor in an expert's tuple.
         batched_mlp_fn: ``(x[S, cap, H], stacked_weights) -> y[S, cap, H]`` padded expert forward.
-        cap: Per-slot capacity for the padded path. ElasticBuffer requires a host-static value or
-            ``EPLB_CAP`` unless the ragged path applies.
+        cap: Internal per-slot capacity for the padded CPU/reference path. Production
+            ElasticBuffer execution is SM90 ragged grouped GEMM and leaves this unset.
         grouped_mlp_fn: ``(x[T, H], stacked_weights, offs[n_slot]) -> y[T, H]`` ragged expert
             forward, matching ``batched_mlp_fn``'s weight convention. Supplying it lets the plain
             (non-overlapped) path drop both the padding and the ``cap`` host read.
@@ -957,6 +960,7 @@ def sync_free_moe_forward(
         act: Activation function (used on the overlap/GIN path).
         transpose_w: True if weights are ``[out, in]`` (Megatron) and used as ``x @ W.t()``
             (overlap/GIN path only).
+        backward_timer: Debug-only state shared with the output backward boundary.
 
     Returns:
         float ``[Ntok, H]`` combined MoE output for this rank's tokens.
@@ -980,13 +984,11 @@ def sync_free_moe_forward(
     ragged = ragged_enabled(tokens) and (
         overlap or gin_enabled() or grouped_mlp_fn is not None
     )
-    if cap is None and os.environ.get("EPLB_CAP"):
-        cap = int(os.environ["EPLB_CAP"])
     elastic = adapter.uses_padded_layout()
     if cap is None and elastic and not ragged:
         raise ValueError(
-            "ElasticBuffer needs a host-static per-slot cap: pass cap=..., set EPLB_CAP, or "
-            "supply grouped_mlp_fn so the ragged path can size itself on device"
+            "ElasticBuffer requires the SM90 ragged grouped-GEMM path; "
+            "the padded production fallback has been removed"
         )
 
     # Control plane for the replica broadcasts. `dist.broadcast` needs a host-side `src`, so the set of
@@ -1061,7 +1063,7 @@ def sync_free_moe_forward(
             experts=experts, block=block, batched_mlp_fn=batched_mlp_fn, cap=cap,
             grouped_mlp_fn=grouped_mlp_fn, max_recv_rows=max_recv_rows, group=group,
             adapter=adapter, my_rank=my_rank, n_slot=n_slot, H=H, dtype=dtype, device=device,
-            R=int(plan.q.shape[0]), num_chunks=num_chunks,
+            R=int(plan.q.shape[0]), num_chunks=num_chunks, backward_timer=backward_timer,
         )
 
     perm = torch.argsort(dst_rank, stable=True)

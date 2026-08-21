@@ -7,6 +7,7 @@ import argparse
 import glob
 import json
 import math
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -21,10 +22,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_GLOB = str(REPO_ROOT / "logs/slot_sweep/*_seed0.json")
-DEFAULT_OUTPUT = (
-    REPO_ROOT / "logs/slot_sweep/slot_imbalance_with_no_balance.png"
-)
+DEFAULT_EXP_DIR = Path(os.environ.get("EPLB_EXP_DIR", REPO_ROOT / "logs"))
+DEFAULT_GLOB = str(DEFAULT_EXP_DIR / "slot_sweep/*_seed0.json")
+DEFAULT_OUTPUT = DEFAULT_EXP_DIR / "slot_sweep/slot_imbalance.png"
 
 STRATEGY_ORDER = (
     "lplb",
@@ -100,6 +100,11 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional figure title (empty by default)",
     )
+    parser.add_argument(
+        "--allow-missing-strategies",
+        action="store_true",
+        help="Plot available strategies instead of requiring every configured baseline",
+    )
     return parser.parse_args()
 
 
@@ -113,6 +118,8 @@ def _load_rows(path: Path) -> list[dict[str, Any]]:
 
 def load_series(
     pattern: str,
+    *,
+    require_all_strategies: bool,
 ) -> tuple[dict[str, list[tuple[int, float]]], float]:
     paths = [Path(raw) for raw in sorted(glob.glob(pattern))]
     if not paths:
@@ -144,8 +151,10 @@ def load_series(
             values[strategy][slot] = imbalance
 
     missing = [strategy for strategy in STRATEGY_ORDER if strategy not in values]
-    if missing:
+    if missing and require_all_strategies:
         raise ValueError(f"missing strategy data: {missing}")
+    if not values:
+        raise ValueError("no recognized strategy data found")
     if not no_balance_values:
         raise ValueError("missing no-balance reference; rerun the slot sweep")
     no_balance = no_balance_values[0]
@@ -176,11 +185,14 @@ def plot(
 
     figure, axis = plt.subplots(figsize=(9.4, 5.8), constrained_layout=True)
     all_slots = sorted({slot for points in series.values() for slot, _ in points})
+    active_strategies = [
+        strategy for strategy in STRATEGY_ORDER if strategy in series
+    ]
     slot_positions = {
         slot: index + 1 for index, slot in enumerate(all_slots)
     }
     bar_width = 0.15
-    num_strategies = len(STRATEGY_ORDER)
+    num_strategies = len(active_strategies)
     no_balance_position = 0.4
 
     no_balance_bar = axis.bar(
@@ -205,7 +217,7 @@ def plot(
         color=NO_BALANCE_STYLE["color"],
     )
 
-    for strategy_index, strategy in enumerate(STRATEGY_ORDER):
+    for strategy_index, strategy in enumerate(active_strategies):
         points = series[strategy]
         offset = (strategy_index - (num_strategies - 1) / 2) * bar_width
         positions = [slot_positions[slot] + offset for slot, _ in points]
@@ -267,7 +279,10 @@ def plot(
 
 def main() -> None:
     args = parse_args()
-    series, no_balance = load_series(args.input_glob)
+    series, no_balance = load_series(
+        args.input_glob,
+        require_all_strategies=not args.allow_missing_strategies,
+    )
     pdf_output = args.pdf_output or args.output.with_suffix(".pdf")
     plot(
         series,
@@ -280,6 +295,8 @@ def main() -> None:
     )
     print(f"No balancing: {no_balance:.4f}")
     for strategy in STRATEGY_ORDER:
+        if strategy not in series:
+            continue
         values = ", ".join(
             f"slot {slot}={imbalance:.4f}"
             for slot, imbalance in series[strategy]

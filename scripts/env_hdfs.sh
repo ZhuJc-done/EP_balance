@@ -7,6 +7,7 @@ export EPLB_INDEXED_DATA_DIR="${EPLB_INDEXED_DATA_DIR:-${EPLB_DATA_ROOT}/indexed
 export EPLB_TOKENIZER_DIR="${EPLB_TOKENIZER_DIR:-${EPLB_DATA_ROOT}/tokenizers}"
 export EPLB_CHECKPOINT_DIR="${EPLB_CHECKPOINT_DIR:-${EPLB_DATA_ROOT}/checkpoints}"
 export EPLB_LOG_DIR="${EPLB_LOG_DIR:-${EPLB_DATA_ROOT}/logs}"
+export EPLB_EXP_DIR="${EPLB_EXP_DIR:-${EPLB_DATA_ROOT}/exp}"
 
 # Persist Hugging Face downloads across disposable machines.
 export HF_HOME="${HF_HOME:-${EPLB_DATA_ROOT}/cache/huggingface}"
@@ -20,6 +21,7 @@ if ! mkdir -p \
   "${EPLB_TOKENIZER_DIR}" \
   "${EPLB_CHECKPOINT_DIR}" \
   "${EPLB_LOG_DIR}" \
+  "${EPLB_EXP_DIR}" \
   "${HF_HUB_CACHE}" \
   "${HF_DATASETS_CACHE}"; then
   echo "cannot create EPLB data directories under ${EPLB_DATA_ROOT}; check that the HDFS mount is available and writable" >&2

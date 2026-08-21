@@ -11,6 +11,7 @@ from .adapters import (
     run_flexmoe,
     run_scale_eplb,
 )
+from .training import PLAN_SOLVERS, make_training_plan_solver
 
 __all__ = [
     "BaselineResult",
@@ -18,6 +19,8 @@ __all__ = [
     "LPLBBaseline",
     "LPLBUnavailableError",
     "ShadowCostModel",
+    "PLAN_SOLVERS",
+    "make_training_plan_solver",
     "run_deepseek_eplb",
     "run_fastermoe",
     "run_flexmoe",

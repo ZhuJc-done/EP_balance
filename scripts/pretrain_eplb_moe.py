@@ -26,6 +26,7 @@ from megatron.core import parallel_state as mpu
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
 
+from baseline.training import make_training_plan_solver
 from eplb import EPLBConfig, Topology
 from eplb.integration import (
     EPLBRebalancer,
@@ -78,6 +79,27 @@ def _eplb_params(args):
         s_tok=args.hidden_size * dtype_bytes,
         n_slot=_n_slot(args, ep),
         gpus_per_node=int(os.environ.get("GPUS_PER_NODE", "8")),
+    )
+
+
+def _plan_solver_from_env():
+    """Build one layer-local plan solver from launcher environment variables."""
+    return make_training_plan_solver(
+        os.environ.get("EPLB_PLAN_SOLVER", "scale"),
+        fastermoe_bw_net=float(
+            os.environ.get("EPLB_FASTERMOE_BW_NET", 50e9 / 8)
+        ),
+        fastermoe_bw_mm=float(
+            os.environ.get("EPLB_FASTERMOE_BW_MM", 11.5e12)
+        ),
+        flexmoe_threshold=float(
+            os.environ.get("EPLB_FLEXMOE_THRESHOLD", "1.2")
+        ),
+        deepseek_num_groups=int(
+            os.environ.get("EPLB_DEEPSEEK_NUM_GROUPS", "8")
+        ),
+        lplb_root=os.environ.get("EPLB_LPLB_ROOT") or None,
+        lplb_topology=os.environ.get("EPLB_LPLB_TOPOLOGY", "auto"),
     )
 
 
@@ -162,13 +184,22 @@ def model_provider(
         )
         gpn = p["gpus_per_node"] if ep_size % p["gpus_per_node"] == 0 else ep_size
         topo = Topology.from_nvlink_rdma(ep_size // gpn, gpn, 1, 8, device=device)
+        solver_name = os.environ.get("EPLB_PLAN_SOLVER", "scale")
+        if rank0:
+            print(f"[run_real_moe] EPLB plan solver: {solver_name}")
         for layer_id, moe in enumerate(find_moe_layers(model)):
             spec = build_spec_for_megatron(
                 p["num_experts"], ep_size, p["weight_bytes_each"], p["s_tok"], p["n_slot"], device
             )
             # ring_size=0: this path's backward is pure autograd, so a retained Ω ring
             # would be device memory (R*E int64 per layer per micro-batch) nothing ever reads.
-            reb = EPLBRebalancer(topo, spec, EPLBConfig(), ring_size=0)
+            reb = EPLBRebalancer(
+                topo,
+                spec,
+                EPLBConfig(),
+                plan_solver=_plan_solver_from_env(),
+                ring_size=0,
+            )
             bind_eplb_to_moe_layer(moe, reb, ep_group, layer_id)
             _KEEPALIVE.append(reb)
     else:

@@ -117,3 +117,28 @@ def solve_cuda(loads, topo, spec, cfg) -> Plan:
         bool(cfg.allow_cross_domain),
     )
     return Plan(x=x, q=q, theta=rank_load.max())
+
+
+def plan_fixed_cuda(loads, topo, placement, cfg) -> Plan:
+    """Build strict-domain quotas for an externally selected CUDA placement."""
+    backend = _get_backend()
+    device = loads.device
+    ranks = topo.num_ranks
+    experts = loads.num_experts
+    omega = loads.omega.to(torch.int64).contiguous()
+    x = placement.to(device=device, dtype=torch.int8).contiguous()
+    dom = topo.domain_of_rank.to(
+        device=device, dtype=torch.int64
+    ).contiguous()
+    q = torch.zeros((ranks, experts, ranks), dtype=torch.int64, device=device)
+    rank_load = torch.zeros(ranks, dtype=torch.int64, device=device)
+
+    backend.fixed_routing(
+        omega,
+        x,
+        dom,
+        q,
+        rank_load,
+        int(cfg.u_min),
+    )
+    return Plan(x=x, q=q, theta=rank_load.max())

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT_DIR = REPO_ROOT / "logs/solver_scaling"
+DEFAULT_EXP_DIR = Path(os.environ.get("EPLB_EXP_DIR", REPO_ROOT / "logs"))
+DEFAULT_INPUT_DIR = DEFAULT_EXP_DIR / "solver_scaling"
 COLOR = "#D62728"
 
 
@@ -147,15 +149,7 @@ def _draw_panel(
     axis.set_xticks(x, [str(value) for value in x])
     axis.margins(y=0.18)
     axis.set_xlabel(x_label, fontsize=16)
-    axis.text(
-        0.5,
-        -0.24,
-        title,
-        transform=axis.transAxes,
-        ha="center",
-        va="top",
-        fontsize=16,
-    )
+    axis.set_title(title, loc="left", fontsize=16, pad=10)
     axis.grid(True, which="major", linestyle="--", linewidth=0.7, alpha=0.35)
     axis.tick_params(axis="both", labelsize=10)
     axis.tick_params(axis="x", labelrotation=30)
@@ -183,9 +177,9 @@ def plot(
         raise ValueError("expert sweep must hold the rank count constant")
 
     figure, axes = plt.subplots(
-        1,
         2,
-        figsize=(11.0, 4.45),
+        1,
+        figsize=(10.8, 7.0),
         constrained_layout=True,
         sharey=True,
     )
@@ -205,7 +199,8 @@ def plot(
         title=f"(b) Expert scaling (R={next(iter(expert_ranks))})",
         y_scale=y_scale,
     )
-    axes[0].set_ylabel("kernel solve latency (µs)", fontsize=16)
+    for axis in axes:
+        axis.set_ylabel("kernel solve latency (µs)", fontsize=16)
 
     output = output.expanduser().resolve()
     pdf_output = pdf_output.expanduser().resolve()

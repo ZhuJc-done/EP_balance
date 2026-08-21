@@ -1,6 +1,6 @@
 """Integration glue for plugging Scale-EPLB into a real EP training framework (Megatron-LM + DeepEP)."""
 
-from .rebalancer import EPLBRebalancer
+from .rebalancer import EPLBRebalancer, PlanSolver
 from .hooks import (
     WeightMaterializer,
     NullWeightMaterializer,
@@ -26,6 +26,7 @@ from .megatron_timing import NativeMoETimingBinding, bind_native_moe_timing
 
 __all__ = [
     "EPLBRebalancer",
+    "PlanSolver",
     "WeightMaterializer",
     "NullWeightMaterializer",
     "Dispatcher",

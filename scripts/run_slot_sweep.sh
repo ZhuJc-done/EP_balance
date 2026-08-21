@@ -3,8 +3,14 @@
 set -euo pipefail
 
 EPLB_DIR="${EPLB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+source "${EPLB_DIR}/scripts/env_hdfs.sh"
 PYTHON_BIN="${PYTHON_BIN:-python}"
-OUT_DIR="${OUT_DIR:-${EPLB_DIR}/logs/slot_sweep}"
+OUT_DIR="${OUT_DIR:-${EPLB_EXP_DIR}/slot_sweep}"
+CSV_FILE="${CSV_FILE:-${OUT_DIR}/slot_sweep.csv}"
+SUMMARY_CSV_FILE="${SUMMARY_CSV_FILE:-${OUT_DIR}/slot_sweep_summary.csv}"
+PLOT="${PLOT:-1}"
+PLOT_FILE="${PLOT_FILE:-${OUT_DIR}/slot_imbalance.png}"
+PLOT_PDF_FILE="${PLOT_PDF_FILE:-${OUT_DIR}/slot_imbalance.pdf}"
 
 # Space-separated lists; override with e.g. SLOTS="1 2" SEEDS="0 1 2".
 SLOTS="${SLOTS:-1 2 3 4}"
@@ -34,6 +40,12 @@ LPLB_ROOT="${LPLB_ROOT:-/home/tiger/LPLB}"
 
 read -r -a SLOT_VALUES <<< "${SLOTS}"
 read -r -a SEED_VALUES <<< "${SEEDS}"
+PLOT_SEED="${PLOT_SEED:-${SEED_VALUES[0]}}"
+
+[[ "${PLOT}" == "0" || "${PLOT}" == "1" ]] || {
+  echo "invalid PLOT=${PLOT} (expected 0 or 1)" >&2
+  exit 1
+}
 
 mkdir -p "${OUT_DIR}"
 cd "${EPLB_DIR}"
@@ -82,4 +94,20 @@ for seed in "${SEED_VALUES[@]}"; do
   done
 done
 
+ "${PYTHON_BIN}" "${EPLB_DIR}/scripts/export_sweep_csv.py" \
+  --kind slot-sweep \
+  --input-dir "${OUT_DIR}" \
+  --output "${CSV_FILE}" \
+  --summary-output "${SUMMARY_CSV_FILE}"
+
+if [[ "${PLOT}" == "1" ]]; then
+  "${PYTHON_BIN}" "${EPLB_DIR}/eval/plot_slot_sweep_imbalance.py" \
+    --input-glob "${OUT_DIR}/baseline_*_seed${PLOT_SEED}.json" \
+    --output "${PLOT_FILE}" \
+    --pdf-output "${PLOT_PDF_FILE}"
+fi
+
 echo "[slot-sweep] completed $(( ${#SEED_VALUES[@]} * ${#SLOT_VALUES[@]} )) runs in ${OUT_DIR}"
+echo "[slot-sweep] CSV results: ${CSV_FILE}"
+echo "[slot-sweep] CSV summary: ${SUMMARY_CSV_FILE}"
+[[ "${PLOT}" == "1" ]] && echo "[slot-sweep] plot: ${PLOT_FILE}"
