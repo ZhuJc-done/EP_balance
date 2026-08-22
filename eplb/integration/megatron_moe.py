@@ -21,15 +21,61 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").lower() not in ("0", "", "false", "no")
 
 
+_RECV_ROWS_AUTO = "auto"
+
+
 def _env_max_recv_rows() -> Optional[int]:
     """``EPLB_MAX_RECV_ROWS`` as a positive int, or None to keep the transport's worst-case rows.
 
     Bounds this rank's *total* received rows, so a sane value is a margin over the balanced
     expectation ``tokens_per_rank * topk / EPLB_CHUNKS``, not the worst case the buffer is sized
     for. Too low is caught on device rather than silently dropping tokens.
+
+    ``auto`` returns None here and is resolved per micro-batch instead; see
+    :func:`_env_recv_rows_auto`.
     """
-    rows = int(os.environ.get("EPLB_MAX_RECV_ROWS", "0") or "0")
-    return rows if rows > 0 else None
+    raw = os.environ.get("EPLB_MAX_RECV_ROWS", "0").strip().lower()
+    if raw == _RECV_ROWS_AUTO:
+        return None
+    try:
+        rows = int(raw or "0")
+    except ValueError:
+        raise ValueError(
+            f"EPLB_MAX_RECV_ROWS must be a non-negative int or {_RECV_ROWS_AUTO!r}, got {raw!r}"
+        ) from None
+    if rows < 0:
+        raise ValueError("EPLB_MAX_RECV_ROWS must be non-negative")
+    return rows or None
+
+
+def _env_recv_rows_auto() -> bool:
+    """``EPLB_MAX_RECV_ROWS=auto``: size the budget from the solved plan rather than asserting one.
+
+    A static budget is an assertion about the plan's ``θ``, which the solver derives online from
+    the live routing. Scale-EPLB's solver minimises ``θ`` and can split one expert's tokens across
+    replicas, so a margin over the balanced receipt holds by construction. A baseline policy
+    without that freedom has no comparable bound -- FasterMoE's shadow decision is
+    all-ranks-or-main-rank, leaving ``θ`` as large as a single expert's entire load -- so no
+    affordable static value is sound for it, at any skew.
+
+    ``auto`` therefore reads this rank's receipt off the plan each micro-batch, costing one D2H
+    sync per layer and forfeiting the zero-sync contract. Only the baselines may use it: they are
+    not required to be sync-free, and in exchange their memory tracks the imbalance they left
+    behind instead of the transport's worst case.
+    """
+    return os.environ.get("EPLB_MAX_RECV_ROWS", "").strip().lower() == _RECV_ROWS_AUTO
+
+
+def _recv_rows_from_plan(plan, ep_rank: int) -> int:
+    """This rank's received rows over the whole micro-batch, read off the plan's quota.
+
+    ``q[src, e, dst]`` is the solver's routing quota, so ``q[:, :, r].sum()`` is exactly what rank
+    ``r`` receives. Chunking only partitions those units, so the micro-batch total bounds every
+    chunk as well -- the same argument the padded path's ``cap`` relies on.
+
+    Syncs once on the ``int()``.
+    """
+    return int(plan.q[:, :, ep_rank].sum())
 
 
 def _make_adapter():
@@ -199,6 +245,11 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
     plan = reb.rebalance(local_row, cfg["layer_id"], mb, group=group).plan
 
     ep_rank = dist.get_rank(group) if dist.is_initialized() else 0
+    max_recv_rows = (
+        _recv_rows_from_plan(plan, ep_rank)
+        if cfg["recv_rows_auto"]
+        else cfg["max_recv_rows"]
+    )
     weight_tuples, weight_shapes = extract_local_expert_weights(self.experts)
     num_local = len(weight_tuples)
     weights_local: Dict[int, Tuple[torch.Tensor, ...]] = {
@@ -213,7 +264,7 @@ def eplb_moe_forward(self, hidden_states, *args, **kwargs):
         plan=plan, spec=spec, weights_local=weights_local,
         weight_shapes=weight_shapes, batched_mlp_fn=cfg["batched_mlp_fn"],
         grouped_mlp_fn=cfg.get("grouped_mlp_fn"),
-        max_recv_rows=_env_max_recv_rows(),
+        max_recv_rows=max_recv_rows,
         group=group, adapter=cfg["adapter"],
         rematerialize=cfg["rematerialize"], overlap=cfg["overlap"],
         gated=cfg["gated"], act=cfg["act"], transpose_w=True,
@@ -262,6 +313,16 @@ def bind_eplb_to_moe_layer(moe_layer, rebalancer, ep_group, layer_id: int = 0) -
             raise ValueError("ElasticBuffer apply mode requires a fixed positive moe_router_topk")
     gated = bool(getattr(config, "gated_linear_unit", False))
     act = getattr(config, "activation_func", torch.nn.functional.gelu)
+    recv_rows_auto = _env_recv_rows_auto()
+    if recv_rows_auto:
+        warnings.warn(
+            "EPLB_MAX_RECV_ROWS=auto reads the plan's per-rank receipt every micro-batch, which "
+            "costs one D2H sync per layer and forfeits the zero-sync contract. Use it for the "
+            "baseline plan solvers, whose theta admits no affordable static bound; do not report "
+            "Scale-EPLB throughput measured under it",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     moe_layer._eplb = {
         "reb": rebalancer,
         "group": ep_group,
@@ -274,5 +335,7 @@ def bind_eplb_to_moe_layer(moe_layer, rebalancer, ep_group, layer_id: int = 0) -
         "adapter": adapter,
         "rematerialize": _env_flag("EPLB_REMATERIALIZE"),
         "overlap": _env_flag("EPLB_OVERLAP"),
+        "max_recv_rows": _env_max_recv_rows(),
+        "recv_rows_auto": recv_rows_auto,
     }
     moe_layer.forward = types.MethodType(eplb_moe_forward, moe_layer)

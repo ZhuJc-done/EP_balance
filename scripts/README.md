@@ -457,8 +457,16 @@ EPLB_REMATERIALIZE=1   # dist.broadcast path only: checkpoints the replication +
 EPLB_N_SLOT=16         # = num_experts/EP: no replica headroom, shrinks the weight stack. Also removes
                        # the balancing freedom, so use it to isolate memory, not to benchmark.
 EPLB_MAX_RECV_ROWS=... # bound packed rows after dispatch; exceeding it aborts asynchronously.
+                       # =auto sizes it from the solved plan's per-rank receipt instead of
+                       # asserting a constant, at one D2H sync per layer. Required for the
+                       # baseline plan solvers, whose theta admits no affordable static bound;
+                       # see baseline/README.md. Never use it to measure Scale-EPLB throughput.
 SEQ_LEN=2048           # reduces the real token rows and their grouped-GEMM activations.
 ```
+
+`EPLB_CHUNKS` is **memory-neutral** here: autograd retains every chunk's activations until
+backward, so `chunks x rows-per-chunk` is invariant. It trades transient working set and overlap,
+not peak.
 
 The GIN path keeps no replica weights across forward→backward: backward re-acquires them with a
 second `get_batched` off the schedule cached at plan time, so the routing is never re-derived and

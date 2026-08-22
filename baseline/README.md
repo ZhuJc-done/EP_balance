@@ -61,6 +61,35 @@ decision logic on CPU, including the required CUDA-to-host load transfer. Their
 cost is intentionally included in the existing `solve` profile region. LPLB
 requires its separately compiled CUDA package.
 
+### Size the receive budget from the plan, not from a constant
+
+Use `EPLB_MAX_RECV_ROWS=auto` for every baseline:
+
+```bash
+EPLB_MODE=apply EPLB_PLAN_SOLVER=fastermoe EPLB_MAX_RECV_ROWS=auto \
+  bash scripts/run_real_moe.sh
+```
+
+A numeric `EPLB_MAX_RECV_ROWS` is an *assertion* about the plan's `theta`, which
+is solved online from the live routing and checked on device. Scale-EPLB's solver
+minimises `theta` and can split one expert's tokens across replicas, so a margin
+over the balanced receipt `tokens_per_rank * topk / EPLB_CHUNKS` holds by
+construction. No baseline offers that guarantee, and FasterMoE cannot even
+approach it: its shadow decision is all-ranks-or-main-rank, so an unshadowed hot
+expert routes its entire load to one rank and `theta` has no bound below "every
+row in the system". Carrying a value calibrated for `scale` over to a baseline
+trips the assert on the first forward, and the traceback surfaces at the next
+sync point — usually `torch._grouped_mm` — rather than at the overflow.
+
+Leaving the budget unset avoids the assert but sizes every expert tensor at the
+transport worst case `EP * max_tokens_per_rank`, which is `EP` times the balanced
+receipt regardless of solver.
+
+`auto` instead reads this rank's receipt off `q[:, :, rank]` each micro-batch, so
+memory tracks the imbalance a policy actually left behind. It costs one D2H sync
+per layer and therefore forfeits the zero-sync contract — which is why it is a
+baseline-only setting. Do not report Scale-EPLB throughput measured under it.
+
 ## Run
 
 ```bash

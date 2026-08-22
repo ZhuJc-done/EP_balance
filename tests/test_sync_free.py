@@ -454,6 +454,8 @@ def test_eplb_megatron_forward_adds_shared_expert_output(monkeypatch):
             "adapter": object(),
             "rematerialize": False,
             "overlap": False,
+            "max_recv_rows": None,
+            "recv_rows_auto": False,
         },
     )
     monkeypatch.setattr(binding, "sync_free_moe_forward", fake_sync_free_moe_forward)
@@ -784,3 +786,102 @@ def test_elastic_padded_layout_matches_reference(monkeypatch, chunks, overlap, m
         assert torch.allclose(w0[expert].grad, rw0[expert].grad, atol=2e-2, rtol=2e-2)
         assert torch.allclose(w1[expert].grad, rw1[expert].grad, atol=2e-2, rtol=2e-2)
     manager._ELASTIC_BUFFERS.clear()
+
+
+def test_max_recv_rows_env_has_three_forms(monkeypatch):
+    """The budget is either a static assertion, the transport's worst case, or the plan itself."""
+    from eplb.integration.megatron_moe import _env_max_recv_rows, _env_recv_rows_auto
+
+    for unset in ("", "0"):
+        if unset:
+            monkeypatch.setenv("EPLB_MAX_RECV_ROWS", unset)
+        else:
+            monkeypatch.delenv("EPLB_MAX_RECV_ROWS", raising=False)
+        assert _env_max_recv_rows() is None, "unset/0 must keep the transport's worst-case rows"
+        assert not _env_recv_rows_auto()
+
+    monkeypatch.setenv("EPLB_MAX_RECV_ROWS", "65536")
+    assert _env_max_recv_rows() == 65536
+    assert not _env_recv_rows_auto()
+
+    monkeypatch.setenv("EPLB_MAX_RECV_ROWS", "AUTO")
+    assert _env_recv_rows_auto(), "auto is case-insensitive"
+    assert _env_max_recv_rows() is None, "auto is resolved per micro-batch, not from the env"
+
+    monkeypatch.setenv("EPLB_MAX_RECV_ROWS", "-1")
+    with pytest.raises(ValueError, match="non-negative"):
+        _env_max_recv_rows()
+
+    monkeypatch.setenv("EPLB_MAX_RECV_ROWS", "plenty")
+    with pytest.raises(ValueError, match="auto"):
+        _env_max_recv_rows()
+
+
+def test_recv_rows_from_plan_is_this_rank_receipt():
+    """``auto`` sizes from ``q``, so the receipts partition the units and peak at ``theta``."""
+    from eplb.integration.megatron_moe import _recv_rows_from_plan
+
+    # one expert far hotter than the rest, so the solver has to replicate and the receipts differ
+    omega = torch.full((W, E), 2, dtype=torch.int64)
+    omega[:, 0] = 40
+    spec = ProblemSpec(
+        E,
+        torch.arange(E, dtype=torch.int64) // (E // W),
+        torch.full((E,), 1024, dtype=torch.int64),
+        H * 2,
+        2,
+    )
+    plan = solve(Loads(omega), Topology.from_nvlink_rdma(1, W), spec, EPLBConfig())
+
+    receipts = [_recv_rows_from_plan(plan, rank) for rank in range(W)]
+    assert sum(receipts) == int(omega.sum()), "every routed unit is received exactly once"
+    assert max(receipts) == int(plan.theta), "theta is the busiest rank's receipt"
+    assert max(receipts) < int(omega.sum()), "a replicated hot expert must not land on one rank"
+
+
+def test_forward_sizes_the_budget_from_the_plan_under_auto(monkeypatch):
+    """``auto`` must reach the dispatcher as this rank's receipt, not as the env's static value."""
+    from types import SimpleNamespace
+
+    import eplb.integration.megatron_moe as binding
+    from eplb.plan import Plan
+
+    # rank 0 is sent 5 units for expert 0 and 7 for expert 1; rank 1 receives nothing here
+    q = torch.zeros((2, 2, 2), dtype=torch.int64)
+    q[0, 0, 0], q[1, 1, 0] = 5, 7
+    plan = Plan(x=torch.eye(2, dtype=torch.int8), q=q, theta=12)
+
+    seen = {}
+
+    def fake_sync_free_moe_forward(**kwargs):
+        seen["max_recv_rows"] = kwargs["max_recv_rows"]
+        return kwargs["tokens"]
+
+    def local_expert():
+        return SimpleNamespace(
+            linear_fc1=SimpleNamespace(weight=torch.empty(4, 3)),
+            linear_fc2=SimpleNamespace(weight=torch.empty(3, 2)),
+        )
+
+    layer = SimpleNamespace(
+        config=SimpleNamespace(moe_router_topk=1),
+        router=lambda x: (x.new_tensor([[1.0, 0.0], [0.0, 1.0]]),
+                          x.new_tensor([[1.0, 0.0], [0.0, 1.0]]).bool()),
+        experts=SimpleNamespace(local_experts=[local_expert(), local_expert()]),
+        use_shared_expert=False,
+        _eplb={
+            "reb": SimpleNamespace(
+                spec=SimpleNamespace(num_experts=2),
+                rebalance=lambda local_row, layer_id, mb, group: SimpleNamespace(plan=plan),
+            ),
+            "group": None, "layer_id": 0, "mb": 0, "gated": True,
+            "act": torch.nn.functional.silu, "batched_mlp_fn": None,
+            "adapter": object(), "rematerialize": False, "overlap": False,
+            "max_recv_rows": 65536, "recv_rows_auto": True,
+        },
+    )
+    monkeypatch.setattr(binding, "sync_free_moe_forward", fake_sync_free_moe_forward)
+    monkeypatch.setattr(binding.profiling, "enabled", lambda: False)
+
+    binding.eplb_moe_forward(layer, torch.randn(2, 1, 3))
+    assert seen["max_recv_rows"] == 12, "auto must override the static value with the plan's receipt"

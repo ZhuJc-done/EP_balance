@@ -166,10 +166,24 @@ for _knob in EPLB_N_SLOT EPLB_PLAN_SOLVER EPLB_FASTERMOE_BW_NET EPLB_FASTERMOE_B
              EPLB_PROFILE EPLB_PROFILE_ALL_RANKS EPLB_PROFILE_EVERY EPLB_PROFILE_RESET_AT \
              EPLB_DEBUG_TIMING \
              EPLB_ADAPTER EPLB_DEEPEP_HYBRID EPLB_DEEPEP_MAX_TOKENS_PER_RANK \
+             EPLB_MAX_RECV_ROWS \
              EPLB_WEIGHT_COMM EPLB_GIN_FENCE EPLB_GIN_LSA \
              EPLB_CHUNKS EPLB_MANUAL_BWD EPLB_OVERLAP EPLB_REMATERIALIZE; do
   if [[ -n "${!_knob:-}" ]]; then export "${_knob}"; fi
 done
+_recv_rows="${EPLB_MAX_RECV_ROWS:-0}"
+case "${_recv_rows,,}" in
+  auto|[0-9]*) ;;
+  *)
+    echo "unknown EPLB_MAX_RECV_ROWS=${EPLB_MAX_RECV_ROWS}; expected a non-negative int or 'auto'" >&2
+    exit 1
+    ;;
+esac
+if [[ "${_recv_rows,,}" == "auto" ]]; then
+  echo "[run_real_moe] EPLB_MAX_RECV_ROWS=auto -> receive budget read from the solved plan;" \
+       "costs one D2H sync per layer, so this is not a zero-sync throughput measurement"
+fi
+unset _recv_rows
 if [[ -n "${EPLB_N_SLOT:-}" ]]; then echo "[run_real_moe] EPLB_N_SLOT=${EPLB_N_SLOT} (slot budget override)"; fi
 if [[ "${EPLB_DEBUG_TIMING:-0}" != "0" ]]; then
   echo "[run_real_moe] EPLB_DEBUG_TIMING=1 -> per-MoE forward/backward breakdown; throughput is perturbed"
