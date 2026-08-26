@@ -56,11 +56,18 @@ MODEL=glm45_air NUM_LAYERS=6 bash scripts/run_real_moe.sh
 
 # Qwen has no dense prefix, so this is 5 MoE layers
 MODEL=qwen3_30b_a3b NUM_LAYERS=5 bash scripts/run_real_moe.sh
+
+# Synthetic MoE-only variants: remove the official dense prefix.
+MOE_ONLY=1 MODEL=deepseek_v2_160e NUM_LAYERS=3 bash scripts/run_real_moe.sh
+MOE_ONLY=1 MODEL=glm45_air NUM_LAYERS=3 bash scripts/run_real_moe.sh
 ```
 
 Reduced random-init models can run with `MOCK=1` or `FROM_SCRATCH=1`; loading
 weights requires a Megatron-Core checkpoint converted and truncated to the
-selected `NUM_LAYERS`.
+selected `NUM_LAYERS`. `MOE_ONLY=1` changes layer 0 from dense to MoE and
+therefore does not match an official DeepSeek-V2 or GLM-4.5-Air checkpoint;
+use random initialization or a checkpoint trained with the same MoE-only
+layout.
 
 Shared experts remain outside EPLB placement and are added to the routed-expert
 output in `apply` mode. Shared-expert communication overlap is deliberately

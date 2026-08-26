@@ -7,8 +7,18 @@
 
 _configure_depth() {
   local full_num_layers="${1:?full layer count is required}"
-  local dense_prefix_layers="${2:?dense prefix count is required}"
+  local official_dense_prefix_layers="${2:?dense prefix count is required}"
+  local dense_prefix_layers="${official_dense_prefix_layers}"
+  case "${MOE_ONLY:-0}" in
+    0|"") ;;
+    1) dense_prefix_layers=0 ;;
+    *)
+      echo "invalid MOE_ONLY=${MOE_ONLY} (expected 0 or 1)" >&2
+      return 1
+      ;;
+  esac
   MODEL_FULL_NUM_LAYERS="${full_num_layers}"
+  MODEL_OFFICIAL_DENSE_PREFIX_LAYERS="${official_dense_prefix_layers}"
   MODEL_DENSE_PREFIX_LAYERS="${dense_prefix_layers}"
   MODEL_NUM_LAYERS="${NUM_LAYERS:-${MODEL_FULL_NUM_LAYERS}}"
 

@@ -10,12 +10,18 @@ from pathlib import Path
 RECIPE_FILE = Path(__file__).resolve().parents[1] / "scripts" / "model_recipes.sh"
 
 
-def _recipe(model: str, *, num_layers: int | None = None):
+def _recipe(
+    model: str, *, num_layers: int | None = None, moe_only: bool = False
+):
     env = os.environ.copy()
     if num_layers is None:
         env.pop("NUM_LAYERS", None)
     else:
         env["NUM_LAYERS"] = str(num_layers)
+    if moe_only:
+        env["MOE_ONLY"] = "1"
+    else:
+        env.pop("MOE_ONLY", None)
     script = r'''
 set -euo pipefail
 source "$1"
@@ -86,6 +92,14 @@ def test_num_layers_override_keeps_one_dense_prefix():
 
     assert _value_after(model, "--num-layers") == "6"
     assert _value_after(moe, "--moe-layer-freq") == "([0]*1+[1]*5)"
+
+
+def test_moe_only_removes_mixed_models_dense_prefix():
+    for model_name in ("deepseek_v2_160e", "glm45_air"):
+        model, moe, _ = _recipe(model_name, num_layers=3, moe_only=True)
+
+        assert _value_after(model, "--num-layers") == "3"
+        assert _value_after(moe, "--moe-layer-freq") == "1"
 
 
 def test_existing_qwen_recipe_remains_selectable():

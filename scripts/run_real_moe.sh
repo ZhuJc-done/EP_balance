@@ -265,6 +265,9 @@ source "${SCRIPT_DIR}/model_recipes.sh"
 configure_model_recipe "${MODEL}"
 echo "[run_real_moe] depth=${MODEL_NUM_LAYERS}/${MODEL_FULL_NUM_LAYERS} layers" \
      "(dense=${MODEL_DENSE_PREFIX_LAYERS}, MoE=${MODEL_MOE_LAYERS}); override with NUM_LAYERS"
+if [[ "${MOE_ONLY:-0}" == "1" && "${MODEL_OFFICIAL_DENSE_PREFIX_LAYERS}" -gt 0 ]]; then
+  echo "[run_real_moe] MOE_ONLY=1 -> layer 0 is MoE; official pretrained checkpoints do not match"
+fi
 
 # Router load balancing. ROUTER_BALANCING=none turns the aux loss off so the routing skew survives to
 # the dispatcher: aux_loss actively flattens the very imbalance an expert load balancer exists to
