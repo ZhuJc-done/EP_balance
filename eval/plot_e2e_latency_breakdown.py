@@ -20,6 +20,7 @@ from eval.extract_eplb_debug import merge, parse
 matplotlib.use("Agg")
 matplotlib.rcParams["pdf.fonttype"] = 42
 matplotlib.rcParams["ps.fonttype"] = 42
+matplotlib.rcParams["hatch.linewidth"] = 0.7
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
@@ -80,10 +81,12 @@ DIRECTION_LABEL = {"forward": "Forward", "backward": "Backward"}
 
 # Replica movement uses nested wire-only timers so buffer materialization,
 # staging and fences in the parent operation are not charged to this category.
-CATEGORY_PHASES = {
+# Token transport likewise uses events placed directly around NCCL or the fused
+# DeepEP transport primitive, excluding permutation, allocation and count exchange.
+WIRE_CATEGORY_PHASES = {
     "forward": {
         "expert_compute": ("expert_gemm",),
-        "token_all_to_all": ("dispatch", "combine"),
+        "token_all_to_all": ("dispatch_wire", "combine_wire"),
         "replica_management": ("solver", "expert_transfer_wire"),
         "other": ("router", "shared_expert"),
     },
@@ -94,32 +97,47 @@ CATEGORY_PHASES = {
             "activation_bwd",
             "expert_wgrad",
         ),
-        "token_all_to_all": ("combine_bwd", "dispatch_bwd"),
+        "token_all_to_all": ("combine_bwd_wire", "dispatch_bwd_wire"),
         "replica_management": ("expert_repull_wire", "expert_grad_put_wire"),
         "other": (),
     },
+}
+DISPATCHER_CATEGORY_PHASES = {
+    direction: {
+        **categories,
+        "token_all_to_all": (
+            ("dispatch", "combine")
+            if direction == "forward"
+            else ("combine_bwd", "dispatch_bwd")
+        ),
+    }
+    for direction, categories in WIRE_CATEGORY_PHASES.items()
 }
 TOTAL_PHASE = {"forward": "moe_fwd_total", "backward": "moe_bwd_total"}
 CATEGORY_STYLE = {
     "expert_compute": {
         "label": "Expert Compute",
-        "color": "#3E7397",
-        "text_color": "white",
+        "color": "#8DA0CB",
+        "text_color": "#111111",
+        "hatch": "///",
     },
     "token_all_to_all": {
-        "label": "Token All-to-All",
-        "color": "#75A2BF",
-        "text_color": "white",
+        "label": "Token Transport Kernel",
+        "color": "#66C2A5",
+        "text_color": "#111111",
+        "hatch": "\\\\",
     },
     "replica_management": {
         "label": "Replica Management",
-        "color": "#D28A42",
-        "text_color": "white",
+        "color": "#FC8D62",
+        "text_color": "#111111",
+        "hatch": "xx",
     },
     "other": {
         "label": "Other",
-        "color": "#C4D5E1",
-        "text_color": "#303030",
+        "color": "#E5E5E5",
+        "text_color": "#111111",
+        "hatch": "..",
     },
 }
 
@@ -130,6 +148,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--dpi", type=int, default=600)
+    parser.add_argument(
+        "--rank-policy",
+        choices=("critical", "best-communication"),
+        default="critical",
+        help=(
+            "critical takes max rank for every phase; best-communication keeps "
+            "expert compute at max rank but takes min rank for token transport "
+            "and replica management, and hides Other/MoE Total"
+        ),
+    )
+    parser.add_argument(
+        "--token-scope",
+        choices=("wire", "dispatcher"),
+        default="wire",
+        help=(
+            "wire requires nested transport timers; dispatcher explicitly uses "
+            "legacy method-wide dispatch/combine intervals"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -156,6 +193,7 @@ def load_critical_phase_series(
     spec: RunSpec,
     *,
     warmup: int,
+    min_rank_phases: frozenset[str] = frozenset(),
 ) -> tuple[dict[tuple[str, str], list[tuple[int, float]]], dict[str, Any]]:
     rows = [
         row
@@ -214,11 +252,13 @@ def load_critical_phase_series(
             for (_iteration, stage, layer, _direction, _phase) in grouped
         }
     )
-    critical: dict[tuple[int, int, int, str, str], float] = {}
+    rank_reduced: dict[tuple[int, int, int, str, str], float] = {}
     for key, items in grouped.items():
         if key[0] in bad_iterations:
             continue
-        critical[key] = max(float(item["ms"]) for item in items)
+        phase = key[-1]
+        reduce_rank = min if phase in min_rank_phases else max
+        rank_reduced[key] = reduce_rank(float(item["ms"]) for item in items)
 
     by_phase_iteration: dict[tuple[str, str, int], float] = defaultdict(float)
     for (
@@ -227,7 +267,7 @@ def load_critical_phase_series(
         _layer,
         direction,
         phase,
-    ), value in critical.items():
+    ), value in rank_reduced.items():
         by_phase_iteration[(direction, phase, iteration)] += value / len(layer_keys)
 
     series: dict[tuple[str, str], list[tuple[int, float]]] = defaultdict(list)
@@ -244,6 +284,7 @@ def load_critical_phase_series(
         "ep_size": spec.ep_size,
         "pipeline_stages": len({stage for stage, _layer in layer_keys}),
         "sources": [str(path) for path in source_paths(logs_dir, spec)],
+        "min_rank_phases": sorted(min_rank_phases),
     }
     return dict(series), metadata
 
@@ -261,8 +302,17 @@ def aggregate_run(
     spec: RunSpec,
     *,
     warmup: int,
+    category_phases: dict[str, dict[str, tuple[str, ...]]],
+    min_rank_phases: frozenset[str] = frozenset(),
+    include_other: bool = True,
+    include_total: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    phase_series, metadata = load_critical_phase_series(logs_dir, spec, warmup=warmup)
+    phase_series, metadata = load_critical_phase_series(
+        logs_dir,
+        spec,
+        warmup=warmup,
+        min_rank_phases=min_rank_phases,
+    )
     summary_rows = []
     per_iteration_rows = []
 
@@ -275,7 +325,25 @@ def aggregate_run(
         iterations = sorted(total_by_iteration)
 
         category_by_iteration: dict[str, dict[int, float]] = {}
-        for category, phases in CATEGORY_PHASES[direction].items():
+        active_categories = [
+            category
+            for category in CATEGORY_STYLE
+            if include_other or category != "other"
+        ]
+        for category in active_categories:
+            phases = category_phases[direction][category]
+            if category == "token_all_to_all":
+                missing = [
+                    phase
+                    for phase in phases
+                    if not phase_values(phase_series, direction, phase)
+                ]
+                if missing:
+                    raise ValueError(
+                        f"{spec.key}: logs lack selected token phases {missing}; "
+                        "choose --token-scope dispatcher only for explicitly "
+                        "labelled legacy diagnostics, or rerun debug timing"
+                    )
             values = {iteration: 0.0 for iteration in iterations}
             for phase in phases:
                 for iteration, value in phase_values(
@@ -285,7 +353,7 @@ def aggregate_run(
                         values[iteration] += value
             category_by_iteration[category] = values
 
-        for category in CATEGORY_STYLE:
+        for category in active_categories:
             values = [
                 category_by_iteration[category][iteration]
                 for iteration in iterations
@@ -296,10 +364,19 @@ def aggregate_run(
                     direction=direction,
                     category=category,
                     kind="stream_occupancy",
-                    phases=CATEGORY_PHASES[direction][category],
+                    phases=category_phases[direction][category],
                     values=values,
                     metadata=metadata,
                     warmup=warmup,
+                    rank_reduction=(
+                        "min"
+                        if category_phases[direction][category]
+                        and all(
+                            phase in min_rank_phases
+                            for phase in category_phases[direction][category]
+                        )
+                        else "max"
+                    ),
                 )
             )
             per_iteration_rows.extend(
@@ -310,36 +387,56 @@ def aggregate_run(
                     "iteration": iteration,
                     "category": category,
                     "kind": "stream_occupancy",
+                    "rank_reduction": (
+                        "min"
+                        if category_phases[direction][category]
+                        and all(
+                            phase in min_rank_phases
+                            for phase in category_phases[direction][category]
+                        )
+                        else "max"
+                    ),
                     "ms_per_layer": round(category_by_iteration[category][iteration], 6),
                 }
                 for iteration in iterations
             )
 
-        total_values = [total_by_iteration[iteration] for iteration in iterations]
-        summary_rows.append(
-            _summary_row(
-                spec,
-                direction=direction,
-                category="moe_total",
-                kind="wall_time",
-                phases=(TOTAL_PHASE[direction],),
-                values=total_values,
-                metadata=metadata,
-                warmup=warmup,
+        if include_total:
+            total_values = [total_by_iteration[iteration] for iteration in iterations]
+            summary_rows.append(
+                _summary_row(
+                    spec,
+                    direction=direction,
+                    category="moe_total",
+                    kind="wall_time",
+                    phases=(TOTAL_PHASE[direction],),
+                    values=total_values,
+                    metadata=metadata,
+                    warmup=warmup,
+                    rank_reduction=(
+                        "min"
+                        if TOTAL_PHASE[direction] in min_rank_phases
+                        else "max"
+                    ),
+                )
             )
-        )
-        per_iteration_rows.extend(
-            {
-                "model": spec.model,
-                "method": spec.method,
-                "direction": direction,
-                "iteration": iteration,
-                "category": "moe_total",
-                "kind": "wall_time",
-                "ms_per_layer": round(total_by_iteration[iteration], 6),
-            }
-            for iteration in iterations
-        )
+            per_iteration_rows.extend(
+                {
+                    "model": spec.model,
+                    "method": spec.method,
+                    "direction": direction,
+                    "iteration": iteration,
+                    "category": "moe_total",
+                    "kind": "wall_time",
+                    "rank_reduction": (
+                        "min"
+                        if TOTAL_PHASE[direction] in min_rank_phases
+                        else "max"
+                    ),
+                    "ms_per_layer": round(total_by_iteration[iteration], 6),
+                }
+                for iteration in iterations
+            )
     return summary_rows, per_iteration_rows, metadata
 
 
@@ -353,6 +450,7 @@ def _summary_row(
     values: list[float],
     metadata: dict[str, Any],
     warmup: int,
+    rank_reduction: str,
 ) -> dict[str, Any]:
     return {
         "model": spec.model,
@@ -361,6 +459,7 @@ def _summary_row(
         "direction": direction,
         "category": category,
         "kind": kind,
+        "rank_reduction": rank_reduction,
         "phases": "+".join(phases),
         "median_ms_per_layer": round(st.median(values), 6),
         "p25_ms_per_layer": round(percentile(values, 0.25), 6),
@@ -385,27 +484,51 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def legend_handles() -> list[Any]:
+def visible_categories(rows: list[dict[str, Any]]) -> list[str]:
+    present = {str(row["category"]) for row in rows}
+    return [category for category in CATEGORY_STYLE if category in present]
+
+
+def has_moe_total(rows: list[dict[str, Any]]) -> bool:
+    return any(row["category"] == "moe_total" for row in rows)
+
+
+def rank_axis_label(rows: list[dict[str, Any]]) -> str:
+    reductions = {
+        str(row["rank_reduction"])
+        for row in rows
+        if row["category"] != "moe_total"
+    }
+    if reductions == {"min"}:
+        return "Best-rank time per MoE layer (ms)"
+    if reductions == {"max"}:
+        return "Critical-rank time per MoE layer (ms)"
+    return "Mixed-rank time per MoE layer (ms)"
+
+
+def legend_handles(rows: list[dict[str, Any]]) -> list[Any]:
     handles: list[Any] = [
         Patch(
-            facecolor=style["color"],
+            facecolor=CATEGORY_STYLE[category]["color"],
             edgecolor="white",
-            label=style["label"],
+            hatch=CATEGORY_STYLE[category]["hatch"],
+            label=CATEGORY_STYLE[category]["label"],
         )
-        for style in CATEGORY_STYLE.values()
+        for category in visible_categories(rows)
     ]
-    handles.append(
-        Line2D(
-            [0],
-            [0],
-            marker="D",
-            color="none",
-            markerfacecolor="#202020",
-            markeredgecolor="white",
-            label="Measured MoE Total",
-            markersize=5.5,
+    if has_moe_total(rows):
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="D",
+                color="none",
+                markerfacecolor="#202020",
+                markeredgecolor="white",
+                label="Measured MoE Total",
+                markersize=5.5,
+            )
         )
-    )
     return handles
 
 
@@ -421,7 +544,8 @@ def draw_panel(
     bottoms = [0.0] * len(METHOD_ORDER)
     total_values = []
 
-    for category, style in CATEGORY_STYLE.items():
+    for category in visible_categories(model_rows):
+        style = CATEGORY_STYLE[category]
         values = [
             _lookup(model_rows, method, direction, category)
             for method in METHOD_ORDER
@@ -434,6 +558,7 @@ def draw_panel(
             color=style["color"],
             edgecolor="white",
             linewidth=0.7,
+            hatch=style["hatch"],
         )
         for bar, value, bottom in zip(bars, values, bottoms):
             if value >= 0.7:
@@ -449,35 +574,36 @@ def draw_panel(
                 )
         bottoms = [bottom + value for bottom, value in zip(bottoms, values)]
 
-    for method_index, method in enumerate(METHOD_ORDER):
-        total = _lookup(model_rows, method, direction, "moe_total")
-        total_values.append(total)
-        total_x = method_index + 0.20
-        axis.plot(
-            total_x,
-            total,
-            marker="D",
-            markersize=5.0,
-            color="#202020",
-            markeredgecolor="white",
-            markeredgewidth=0.5,
-            linestyle="none",
-            zorder=5,
-        )
-        axis.annotate(
-            f"{total:.2f}",
-            (total_x, total),
-            xytext=(5, 5),
-            textcoords="offset points",
-            ha="left",
-            va="bottom",
-            fontsize=7.8,
-            color="#202020",
-        )
+    if has_moe_total(model_rows):
+        for method_index, method in enumerate(METHOD_ORDER):
+            total = _lookup(model_rows, method, direction, "moe_total")
+            total_values.append(total)
+            total_x = method_index + 0.20
+            axis.plot(
+                total_x,
+                total,
+                marker="D",
+                markersize=5.0,
+                color="#202020",
+                markeredgecolor="white",
+                markeredgewidth=0.5,
+                linestyle="none",
+                zorder=5,
+            )
+            axis.annotate(
+                f"{total:.2f}",
+                (total_x, total),
+                xytext=(5, 5),
+                textcoords="offset points",
+                ha="left",
+                va="bottom",
+                fontsize=7.8,
+                color="#202020",
+            )
 
     axis.set_xticks(x_positions, [METHOD_LABEL[item] for item in METHOD_ORDER])
     axis.set_ylabel(
-        "Critical-rank time per MoE layer (ms)" if show_ylabel else "",
+        rank_axis_label(model_rows) if show_ylabel else "",
         fontsize=9.5,
     )
     axis.grid(axis="y", linestyle="--", linewidth=0.6, alpha=0.3)
@@ -505,13 +631,12 @@ def plot_model(
     dpi: int,
 ) -> Path:
     model_rows = [row for row in rows if row["model"] == model]
-    model_title = str(model_rows[0]["model_title"])
     figure, axes = plt.subplots(1, 2, figsize=(7.25, 3.65))
     figure.subplots_adjust(
         left=0.085,
         right=0.985,
         bottom=0.22,
-        top=0.72,
+        top=0.80,
         wspace=0.20,
     )
 
@@ -525,12 +650,11 @@ def plot_model(
             ),
         )
 
-    figure.suptitle(model_title, fontsize=11.5, y=0.985)
     figure.legend(
-        handles=legend_handles(),
+        handles=legend_handles(model_rows),
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.91),
-        ncol=5,
+        bbox_to_anchor=(0.5, 0.98),
+        ncol=len(legend_handles(model_rows)),
         frameon=False,
         fontsize=7.1,
         columnspacing=0.9,
@@ -560,7 +684,7 @@ def plot_combined(
         left=0.085,
         right=0.985,
         bottom=0.105,
-        top=0.83,
+        top=0.88,
         wspace=0.20,
         hspace=0.66,
     )
@@ -581,16 +705,11 @@ def plot_combined(
             )
             panel_index += 1
 
-    figure.suptitle(
-        r"Latency Breakdown at $\mathtt{router\_skew}=-4$",
-        fontsize=11.5,
-        y=0.985,
-    )
     figure.legend(
-        handles=legend_handles(),
+        handles=legend_handles(rows),
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.94),
-        ncol=5,
+        bbox_to_anchor=(0.5, 0.985),
+        ncol=len(legend_handles(rows)),
         frameon=False,
         fontsize=7.1,
         columnspacing=0.9,
@@ -634,21 +753,35 @@ def write_readme(
     *,
     warmup: int,
     metadata: dict[str, dict[str, Any]],
+    rank_policy: str,
+    token_scope: str,
 ) -> None:
+    best_communication = rank_policy == "best-communication"
     lines = [
         "# End-to-end MoE latency breakdown",
         "",
-        "The plots use the median critical-rank phase time per MoE layer after "
+        "The plots use the median rank-reduced phase time per MoE layer after "
         f"excluding the first {warmup} iterations.",
         "",
         "For PP=2 GLM runs, local layer IDs are disambiguated by pipeline stage "
         "(`global_rank // EP_size`), yielding five distinct MoE layers. Each phase "
-        "first takes the maximum over the corresponding EP group, then averages "
-        "over MoE layers inside an iteration.",
+        + (
+            "takes the maximum rank for Expert Compute and the minimum rank for "
+            "Token Transport and Replica Management, then averages over MoE layers "
+            "inside an iteration. These independently selected ranks form a best-case "
+            "communication envelope, not one rank's additive execution path."
+            if best_communication
+            else "first takes the maximum over the corresponding EP group, then "
+            "averages over MoE layers inside an iteration."
+        ),
         "",
         "Colored stacks are CUDA-stream occupancy diagnostics. Their height is not "
-        "wall-clock latency because communication and compute overlap. Black diamonds "
-        "show the directly measured MoE forward/backward total.",
+        "wall-clock latency because communication and compute overlap."
+        + (
+            " Other and the measured MoE total are intentionally omitted."
+            if best_communication
+            else " Black diamonds show the directly measured MoE forward/backward total."
+        ),
         "",
         "Replica movement uses its nested wire-only timers; parent operation timers "
         "that also include buffer materialization, staging and fences are excluded.",
@@ -658,10 +791,19 @@ def write_readme(
         "Backward replica management includes only expert-weight get and replica-gradient "
         "put kernels.",
         "",
-        "Token All-to-All uses the existing CUDA-event intervals enclosing dispatch and "
-        "combine. This is an approximation to pure communication: the current logs do "
-        "not expose nested token-wire timers, and native dispatch includes both token "
-        "and routing-probability collectives.",
+        (
+            "Token Transport Kernel uses nested CUDA events placed directly around "
+            "the communication primitive. Native Megatron measures each "
+            "`all_to_all_single` call (two in dispatch: hidden states and "
+            "probabilities; one in combine), excluding allocation, permutation, "
+            "count exchange and barriers. DeepEP is one fused transport kernel, so "
+            "NIC-only time cannot be separated externally."
+            if token_scope == "wire"
+            else "Token Transport uses legacy dispatcher-wide dispatch/combine "
+            "intervals because the source logs predate nested wire timers. These "
+            "values include dispatcher overhead and are diagnostic only; they must "
+            "not be described as pure All-to-All communication."
+        ),
         "",
         "## Run coverage",
         "",
@@ -697,6 +839,27 @@ def main() -> None:
     logs_dir = args.logs_dir.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    category_phases = (
+        WIRE_CATEGORY_PHASES
+        if args.token_scope == "wire"
+        else DISPATCHER_CATEGORY_PHASES
+    )
+    CATEGORY_STYLE["token_all_to_all"]["label"] = (
+        "Token Transport Kernel"
+        if args.token_scope == "wire"
+        else "Token Dispatch/Combine"
+    )
+    best_communication = args.rank_policy == "best-communication"
+    min_rank_phases = (
+        frozenset(
+            phase
+            for direction in DIRECTION_ORDER
+            for category in ("token_all_to_all", "replica_management")
+            for phase in category_phases[direction][category]
+        )
+        if best_communication
+        else frozenset()
+    )
 
     summary_rows = []
     per_iteration_rows = []
@@ -706,7 +869,14 @@ def main() -> None:
             logs_dir,
             spec,
             warmup=args.warmup,
+            category_phases=category_phases,
+            min_rank_phases=min_rank_phases,
+            include_other=not best_communication,
+            include_total=not best_communication,
         )
+        for row in (*run_summary, *run_per_iteration):
+            row["rank_policy_mode"] = args.rank_policy
+            row["token_scope"] = args.token_scope
         summary_rows.extend(run_summary)
         per_iteration_rows.extend(run_per_iteration)
         metadata[spec.key] = run_metadata
@@ -732,6 +902,8 @@ def main() -> None:
         output_dir / "README.md",
         warmup=args.warmup,
         metadata=metadata,
+        rank_policy=args.rank_policy,
+        token_scope=args.token_scope,
     )
 
     for stem in stems:

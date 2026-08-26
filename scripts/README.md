@@ -24,9 +24,11 @@ Run MoE on real Megatron-LM with three behaviors selected by `EPLB_MODE`:
 | `model_recipes.sh` | Architecture presets for Qwen3, 160E DeepSeek-V2, and 128E GLM-4.5-Air, with launch-time depth override. |
 | `run_slot_sweep.sh` | Sweep `N_slot=1..4`; save raw JSON, flat CSV, seed summary CSV, and PNG/PDF under the shared experiment directory. |
 | `run_solver_scaling.sh` | Sweep the Scale-EPLB CUDA solver over logical rank and expert counts; save raw JSON, flat CSV, and PNG/PDF under the shared experiment directory. |
+| `run_token_alltoall_bench.sh` | Multi-node pure NCCL All-to-All-v baseline at controlled receive imbalance. |
 | `export_sweep_csv.py` | Flatten existing slot-sweep or solver-scaling JSON reports into CSV without rerunning a benchmark. |
 | `prepare_open_workload.py` | Download task/corpus workloads, extract model inputs, and optionally build Megatron `.bin/.idx`. |
 | `eval/plot_solver_scaling.py` | Read an existing solver-scaling JSON directory and independently generate PNG/PDF plots. |
+| `eval/benchmark_token_alltoall.py` | Pre-allocated CUDA-event benchmark used by the token-network launcher. |
 | `install_megatron.sh` | Clone+install pinned community Megatron-LM, self-check `import megatron`. |
 | `install_deepep.sh` | Optional: clone+build DeepEP (NCCL Gin backend) for the sync-free transport. |
 
@@ -60,6 +62,10 @@ MODEL=qwen3_30b_a3b NUM_LAYERS=5 bash scripts/run_real_moe.sh
 # Synthetic MoE-only variants: remove the official dense prefix.
 MOE_ONLY=1 MODEL=deepseek_v2_160e NUM_LAYERS=3 bash scripts/run_real_moe.sh
 MOE_ONLY=1 MODEL=glm45_air NUM_LAYERS=3 bash scripts/run_real_moe.sh
+
+# Synthetic variants without the shared-expert MLP.
+MOE_SHARED_EXPERT=0 MODEL=deepseek_v2_160e bash scripts/run_real_moe.sh
+MOE_SHARED_EXPERT=0 MODEL=glm45_air bash scripts/run_real_moe.sh
 ```
 
 Reduced random-init models can run with `MOCK=1` or `FROM_SCRATCH=1`; loading
@@ -69,9 +75,17 @@ therefore does not match an official DeepSeek-V2 or GLM-4.5-Air checkpoint;
 use random initialization or a checkpoint trained with the same MoE-only
 layout.
 
-Shared experts remain outside EPLB placement and are added to the routed-expert
-output in `apply` mode. Shared-expert communication overlap is deliberately
-disabled in all three modes so their step times use the same execution schedule.
+`MOE_SHARED_EXPERT` defaults to `1`. Setting it to `0` omits
+`--moe-shared-expert-intermediate-size` entirely; passing a zero size directly
+is invalid in Megatron. This removes DeepSeek-V2's combined 3072-wide shared MLP
+or GLM-4.5-Air's 1408-wide shared MLP without changing routed-expert count or
+Top-K. It is a synthetic architecture and does not match official checkpoints.
+Use the same setting for native and every EPLB solver in a comparison.
+
+When enabled, shared experts remain outside EPLB placement and are added to the
+routed-expert output in `apply` mode. Shared-expert communication overlap is
+deliberately disabled in all three modes so their step times use the same
+execution schedule.
 
 DeepSeek-V2 keeps Megatron's local implementation and does not require
 Transformer Engine. The custom entrypoint installs a narrow MLA compatibility
@@ -261,6 +275,62 @@ bash scripts/run_solver_scaling.sh
 Use an idle GPU for timing; unrelated kernels contaminate CUDA-event latency.
 Select the benchmark device with `CUDA_DEVICE=<id>`.
 
+### Pure token-network baseline
+
+Use the standalone NCCL benchmark to separate collective transport from token
+packing, permutation, split exchange, solver work, and expert compute. Run the
+same command on every node, changing only `NODE_RANK`:
+
+```bash
+source scripts/env_hdfs.sh
+
+# Qwen configuration used by the 32-GPU latency experiment.
+MODEL=qwen3_30b_a3b NNODES=4 GPUS_PER_NODE=8 NODE_RANK=0 \
+MASTER_ADDR=<node-0-address> EP_SIZE=32 TOKENS_PER_RANK=4096 \
+RATIOS=1,2,4,8 bash scripts/run_token_alltoall_bench.sh
+
+# GLM uses two concurrent EP=16 groups when PP=2 over the same 32 GPUs.
+MODEL=glm45_air NNODES=4 GPUS_PER_NODE=8 NODE_RANK=0 \
+MASTER_ADDR=<node-0-address> EP_SIZE=16 TOKENS_PER_RANK=4096 \
+RATIOS=1,2,4,8 bash scripts/run_token_alltoall_bench.sh
+```
+
+Rank zero writes JSON and CSV under `${EPLB_EXP_DIR}/network_a2a/`. The timed
+region contains exactly one pre-allocated `torch.distributed.all_to_all_single`
+call. A group barrier, CUDA synchronization, split exchange, allocation, and
+buffer initialization all happen outside the CUDA-event interval. For each
+repeat, the reported `critical_ms_*` series first takes the maximum across all
+ranks and then computes the requested percentile; this is the latency that
+paces a synchronous MoE layer.
+
+`RATIOS` controls destination receive `max/mean`: `1` is balanced and `4` makes
+one destination receive four times the mean. The output also records:
+
+- total remote, intra-node, and inter-node payload MiB;
+- maximum per-rank remote and inter-node payload MiB;
+- aggregate payload GB/s and bottleneck-rank inter-node GB/s;
+- critical-rank/mean-rank latency and nominal per-GPU link utilization.
+
+For an apples-to-apples Token All-to-All comparison, match `EP_SIZE`,
+`TOKENS_PER_RANK * TOPK`, `ROW_ELEMENTS`, and `DTYPE` to the measured training
+invocation. Use the routing trace's pre-balance `max/mean` to select or
+interpolate the skew curve. Then report two distinct quantities:
+
+```text
+network skew penalty = pure-A2A(skew) - pure-A2A(balanced)
+dispatcher software cost = measured wire phase - matched pure collective(s)
+```
+
+Do not subtract one hidden-state collective directly from the whole native
+Megatron dispatch phase: native dispatch also exchanges routing probabilities,
+while packing/count exchange and synchronization scope differ between
+dispatchers. Compare combine first (one hidden-state All-to-All), or benchmark
+and sum each payload separately. `ROW_ELEMENTS` defaults to the model hidden
+width; set `METADATA_ELEMENTS` or `ROW_ELEMENTS` explicitly when the actual
+transport row carries extra metadata. Effective payload GB/s is a workload
+goodput metric, not raw NIC line rate; `nominal_link_utilization` is meaningful
+only when `LINK_GBPS` matches the per-GPU network injection rate.
+
 For a compact forward/backward breakdown of each MoE invocation, enable debug timing in any mode:
 
 ```bash
@@ -270,9 +340,11 @@ EPLB_MODE=off EPLB_DEBUG_TIMING=1 \
 # [EPLB-debug r0] mode=off layer=0 mb=0 moe_fwd_total=...ms \
 #   solver=n/a omega_gather=n/a \
 #   router=0.391ms expert_transfer=n/a dispatch=2.107ms \
-#   expert_gemm=4.936ms combine=1.988ms
+#   dispatch_wire=...ms(x2)/...MiB/...GB/s expert_gemm=4.936ms \
+#   combine=1.988ms combine_wire=...ms/...MiB/...GB/s
 # [EPLB-debug r0] mode=off direction=backward layer=0 mb=0 \
-#   moe_bwd_total=...ms combine_bwd=...ms expert_bwd=...ms dispatch_bwd=...ms
+#   moe_bwd_total=...ms combine_bwd=...ms combine_bwd_wire=...ms \
+#   expert_bwd=...ms dispatch_bwd=...ms dispatch_bwd_wire=...ms(x2)
 
 # Native Megatron execution plus Ω collection and the EPLB solver; plan is not applied.
 EPLB_MODE=observe EPLB_DEBUG_TIMING=1 \
@@ -285,15 +357,17 @@ EPLB_MODE=apply EPLB_DEBUG_TIMING=1 \
 #   moe_fwd_total=...ms \
 #   expert_transfer=1.824ms/512.00MiB/294.36GB/s \
 #   expert_transfer_wire=...ms(x2)/512.00MiB/...GB/s \
-#   dispatch=2.107ms/64.00MiB/31.86GB/s ... \
-#   combine=1.988ms/64.00MiB/33.75GB/s
+#   dispatch=2.107ms/64.00MiB/31.86GB/s \
+#   dispatch_wire=...ms(x2)/64.00MiB/...GB/s ... \
+#   combine=1.988ms/64.00MiB/33.75GB/s combine_wire=...ms(x2)/64.00MiB/...GB/s
 # [EPLB-debug r0] mode=apply direction=backward layer=0 mb=0 \
 #   moe_bwd_total=...ms \
 #   expert_repull=1.791ms/512.00MiB/299.71GB/s \
 #   expert_repull_wire=...ms(x2)/512.00MiB/...GB/s \
-#   combine_bwd=...ms(x2)/64.00MiB/...GB/s \
+#   combine_bwd=...ms(x2)/64.00MiB/...GB/s combine_bwd_wire=...ms(x2)/64.00MiB/...GB/s \
 #   expert_dgrad=...ms(x4) activation_bwd=...ms(x2) \
-#   dispatch_bwd=...ms(x2)/64.00MiB/...GB/s expert_wgrad=...ms(x2) \
+#   dispatch_bwd=...ms(x2)/64.00MiB/...GB/s dispatch_bwd_wire=...ms(x2)/64.00MiB/...GB/s \
+#   expert_wgrad=...ms(x2) \
 #   expert_grad_reduce=2.031ms/512.00MiB/264.30GB/s \
 #   expert_grad_put_wire=...ms(x2)/512.00MiB/...GB/s
 ```
@@ -305,6 +379,26 @@ time. `off` and `observe` wrap the native Megatron leaf methods without replacin
 expert weights. `off` also reports `solver=n/a` and `omega_gather=n/a`. Launch through
 `run_real_moe.sh` (or `pretrain_eplb_moe.py`): invoking Megatron's unmodified `pretrain_gpt.py`
 directly does not install these wrappers.
+
+The dispatcher-wide `dispatch`, `combine`, `combine_bwd`, and `dispatch_bwd`
+fields remain useful for software-overhead diagnosis, but they are not pure
+communication and must not be used for the paper's token-transport stack. Use
+their nested `*_wire` fields instead. Native Megatron places CUDA events
+directly around every `torch.distributed.all_to_all_single`: dispatch therefore
+reports `(x2)` for hidden states plus routing probabilities, while combine
+reports one collective. Allocation, contiguous conversion, permutation, count
+exchange, Python launch overhead, and all barriers are outside these event
+intervals. The invocation-boundary synchronization that resolves the events is
+also outside them.
+
+Scale-EPLB's plain AllToAll adapter has the identical `all_to_all_single` scope.
+DeepEP does not expose a separate NCCL call: network transfer and local
+forwarding are one fused transport kernel. Its `*_wire` event therefore times
+only that fused `ElasticBuffer.dispatch`/`combine` primitive, excluding the
+surrounding routing, padding, compaction and bookkeeping, but it cannot be
+interpreted as NIC-only wire time. The latency plotting script rejects logs
+without these nested token timers instead of silently falling back to the
+dispatcher-wide values.
 
 Set `EPLB_PROFILE_ALL_RANKS=1` to print one line per rank. Under `EPLB_CHUNKS>=2`, an `(xN)`
 suffix means the displayed value is the sum of the `N` chunk events. Dispatch, expert GEMM,

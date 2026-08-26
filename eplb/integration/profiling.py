@@ -38,18 +38,22 @@ _DEBUG_PHASES = (
     ("expert_transfer", ("apply/weight_move",)),
     ("expert_transfer_wire", ("apply/weight_get_wire",)),
     ("dispatch", ("apply/dispatch", "native/dispatch")),
+    ("dispatch_wire", ("apply/dispatch_wire", "native/dispatch_wire")),
     ("expert_gemm", ("apply/expert_gemm", "native/expert_gemm")),
     ("combine", ("apply/combine", "native/combine")),
+    ("combine_wire", ("apply/combine_wire", "native/combine_wire")),
 )
 _DEBUG_BACKWARD_PHASES = (
     ("moe_bwd_total", ("apply/moe_bwd_total", "native/moe_bwd_total")),
     ("expert_repull", ("apply/weight_repull",)),
     ("expert_repull_wire", ("apply/weight_get_wire",)),
     ("combine_bwd", ("apply/combine_bwd", "native/combine_bwd")),
+    ("combine_bwd_wire", ("apply/combine_bwd_wire", "native/combine_bwd_wire")),
     ("expert_bwd", ("native/expert_bwd",)),
     ("expert_dgrad", ("apply/expert_dgrad",)),
     ("activation_bwd", ("apply/activation_bwd",)),
     ("dispatch_bwd", ("apply/dispatch_bwd", "native/dispatch_bwd")),
+    ("dispatch_bwd_wire", ("apply/dispatch_bwd_wire", "native/dispatch_bwd_wire")),
     ("expert_wgrad", ("apply/expert_wgrad",)),
     ("expert_grad_reduce", ("apply/grad_move",)),
     ("expert_grad_put_wire", ("apply/grad_put_wire",)),
@@ -207,17 +211,27 @@ def start_debug_interval(*, device=None, stream=None):
     return ("cuda", start)
 
 
-def finish_debug_interval(name: str, start, *, stream=None) -> None:
+def finish_debug_interval(
+    name: str,
+    start,
+    *,
+    stream=None,
+    payload_bytes=0,
+) -> None:
     """Finish an interval without imposing a stream dependency."""
     if start is None:
         return
     kind, value = start
     if kind == "cpu":
-        _add_sample(name, (time.perf_counter() - value) * 1e3)
+        _add_sample(
+            name,
+            (time.perf_counter() - value) * 1e3,
+            payload_bytes,
+        )
         return
     end = torch.cuda.Event(enable_timing=True)
     end.record(stream)
-    _PENDING.append((name, value, end, 0))
+    _PENDING.append((name, value, end, payload_bytes))
     if len(_PENDING) >= _MAX_PENDING:
         _drain()
 

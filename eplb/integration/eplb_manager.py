@@ -120,6 +120,22 @@ def _remote_payload_bytes(
     return remote_rows.to(torch.int64) * int(row_bytes)
 
 
+def _token_transport_timer(
+    phase: str,
+    tensor: torch.Tensor,
+    payload_bytes,
+):
+    """Time only a transport primitive; no packing, count exchange, or barrier."""
+    if not profiling.enabled():
+        return contextlib.nullcontext()
+    return profiling.record(
+        phase,
+        time_it=True,
+        device=tensor.device,
+        payload_bytes=payload_bytes,
+    )
+
+
 class CommAdapter(Protocol):
     """Differentiable all-to-all transport seam taking device-side split sizes."""
 
@@ -160,7 +176,14 @@ class AllToAllAdapter:
     ):
         splits = (recv_per_src.tolist(), sent_per_dst.tolist())
         self._state.setdefault(tag, {})["disp"] = splits
-        return all_to_all_single(payload, splits[0], splits[1], group)
+        return all_to_all_single(
+            payload,
+            splits[0],
+            splits[1],
+            group,
+            forward_phase="apply/dispatch_wire",
+            backward_phase="apply/dispatch_bwd_wire",
+        )
 
     def combine_chunk(
         self, y, sent_per_dst, recv_per_src, group, tag: int = 0,
@@ -169,7 +192,14 @@ class AllToAllAdapter:
         # reverse leg: send back what we received, receive back what we sent
         splits = (sent_per_dst.tolist(), recv_per_src.tolist())
         self._state.setdefault(tag, {})["comb"] = splits
-        return all_to_all_single(y, splits[0], splits[1], group)
+        return all_to_all_single(
+            y,
+            splits[0],
+            splits[1],
+            group,
+            forward_phase="apply/combine_wire",
+            backward_phase="apply/combine_bwd_wire",
+        )
 
     def uses_padded_layout(self) -> bool:
         """Whether dispatch returns a fixed worst-case tensor with invalid rows."""
@@ -182,66 +212,122 @@ class AllToAllAdapter:
 
     def dispatch_chunk_bwd(self, grad_recv, state, group):
         out_splits, in_splits = state["disp"]
-        return a2a_raw(grad_recv, in_splits, out_splits, group)
+        return a2a_raw(
+            grad_recv,
+            in_splits,
+            out_splits,
+            group,
+            phase="apply/dispatch_bwd_wire",
+        )
 
     def combine_chunk_bwd(self, grad_comb, state, group):
         out_splits, in_splits = state["comb"]
-        return a2a_raw(grad_comb, in_splits, out_splits, group)
+        return a2a_raw(
+            grad_comb,
+            in_splits,
+            out_splits,
+            group,
+            phase="apply/combine_bwd_wire",
+        )
 
 
 class _ElasticDispatch(torch.autograd.Function):
     """ElasticBuffer dispatch whose transpose is combine."""
 
     @staticmethod
-    def forward(ctx, inp, buffer, topk_idx, num_experts, max_tokens, num_sms, holder):
-        recv, recv_topk_idx, _, handle, _ = buffer.dispatch(
-            x=inp.contiguous(),
-            topk_idx=topk_idx,
-            num_experts=int(num_experts),
-            num_max_tokens_per_rank=int(max_tokens),
-            expert_alignment=1,
-            num_sms=int(num_sms),
-            do_handle_copy=True,
-            do_cpu_sync=False,
-            do_expand=False,
-        )
+    def forward(
+        ctx,
+        inp,
+        buffer,
+        topk_idx,
+        num_experts,
+        max_tokens,
+        num_sms,
+        holder,
+        payload_bytes,
+    ):
+        contiguous = inp.contiguous()
+        with _token_transport_timer(
+            "apply/dispatch_wire",
+            contiguous,
+            payload_bytes,
+        ):
+            recv, recv_topk_idx, _, handle, _ = buffer.dispatch(
+                x=contiguous,
+                topk_idx=topk_idx,
+                num_experts=int(num_experts),
+                num_max_tokens_per_rank=int(max_tokens),
+                expert_alignment=1,
+                num_sms=int(num_sms),
+                do_handle_copy=True,
+                do_cpu_sync=False,
+                do_expand=False,
+            )
         if recv_topk_idx is None:
             raise RuntimeError("ElasticBuffer non-expand dispatch did not return expert indices")
         ctx.buffer = buffer
         ctx.handle = handle
         ctx.num_sms = int(num_sms)
+        ctx.payload_bytes = payload_bytes
         holder["handle"] = handle
         holder["recv_topk_idx"] = recv_topk_idx
         return recv
 
     @staticmethod
     def backward(ctx, grad_recv):
-        grad_in, _, _ = ctx.buffer.combine(
-            x=grad_recv.contiguous(), handle=ctx.handle, num_sms=ctx.num_sms
-        )
-        return grad_in, None, None, None, None, None, None
+        contiguous = grad_recv.contiguous()
+        with _token_transport_timer(
+            "apply/dispatch_bwd_wire",
+            contiguous,
+            ctx.payload_bytes,
+        ):
+            grad_in, _, _ = ctx.buffer.combine(
+                x=contiguous,
+                handle=ctx.handle,
+                num_sms=ctx.num_sms,
+            )
+        return grad_in, None, None, None, None, None, None, None
 
 
 class _ElasticCombine(torch.autograd.Function):
     """ElasticBuffer combine whose transpose is cached non-expand dispatch."""
 
     @staticmethod
-    def forward(ctx, inp, buffer, handle, num_sms):
-        out, _, _ = buffer.combine(x=inp.contiguous(), handle=handle, num_sms=int(num_sms))
+    def forward(ctx, inp, buffer, handle, num_sms, payload_bytes):
+        contiguous = inp.contiguous()
+        with _token_transport_timer(
+            "apply/combine_wire",
+            contiguous,
+            payload_bytes,
+        ):
+            out, _, _ = buffer.combine(
+                x=contiguous,
+                handle=handle,
+                num_sms=int(num_sms),
+            )
         ctx.buffer = buffer
         ctx.handle = handle
         ctx.num_sms = int(num_sms)
+        ctx.payload_bytes = payload_bytes
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
-        grad_in, _, _, _, _ = ctx.buffer.dispatch(
-            x=grad_out.contiguous(), handle=ctx.handle,
-            num_experts=ctx.handle.num_experts,
-            num_sms=ctx.num_sms,
-            do_cpu_sync=False, do_expand=False,
-        )
-        return grad_in, None, None, None
+        contiguous = grad_out.contiguous()
+        with _token_transport_timer(
+            "apply/combine_bwd_wire",
+            contiguous,
+            ctx.payload_bytes,
+        ):
+            grad_in, _, _, _, _ = ctx.buffer.dispatch(
+                x=contiguous,
+                handle=ctx.handle,
+                num_experts=ctx.handle.num_experts,
+                num_sms=ctx.num_sms,
+                do_cpu_sync=False,
+                do_expand=False,
+            )
+        return grad_in, None, None, None, None
 
 
 class DeepEPAdapter:
@@ -347,6 +433,7 @@ class DeepEPAdapter:
         n_slot: int,
         cap: Optional[int],
         group,
+        payload_bytes=0,
     ) -> Tuple[torch.Tensor, Dict[str, object]]:
         if not self._deepep_eligible(payload):
             raise TypeError(
@@ -373,6 +460,7 @@ class DeepEPAdapter:
             self._max_tokens,
             self._num_sms,
             holder,
+            payload_bytes,
         )
 
         handle = holder["handle"]
@@ -397,6 +485,7 @@ class DeepEPAdapter:
             recv_slot=recv_slot,
             valid=valid,
             group_sizes=group_sizes,
+            dispatch_payload_bytes=payload_bytes,
         )
         return recv, holder
 
@@ -427,8 +516,19 @@ class DeepEPAdapter:
     ):
         if n_slot is None:
             raise ValueError("ElasticBuffer dispatch requires n_slot")
+        my_rank = dist.get_rank(group) if dist.is_initialized() else 0
+        payload_bytes = _remote_payload_bytes(
+            sent_per_dst,
+            my_rank,
+            self.transfer_row_bytes(payload, "dispatch"),
+        )
         recv, holder = self._dispatch(
-            payload, route_idx, int(n_slot), None if cap is None else int(cap), group
+            payload,
+            route_idx,
+            int(n_slot),
+            None if cap is None else int(cap),
+            group,
+            payload_bytes,
         )
         self._handles[tag] = holder
         self._state.setdefault(tag, {})["disp"] = holder
@@ -448,8 +548,21 @@ class DeepEPAdapter:
             padded = y.new_zeros((y.shape[0], self._hidden))
             padded[:, :y.shape[1]] = y
             y = padded
+        my_rank = dist.get_rank(group) if dist.is_initialized() else 0
+        payload_bytes = _remote_payload_bytes(
+            sent_per_dst,
+            my_rank,
+            self.transfer_row_bytes(y, "combine"),
+        )
+        holder["combine_payload_bytes"] = payload_bytes
         self._state.setdefault(tag, {})["comb"] = holder
-        combined = _ElasticCombine.apply(y, self._buffer, holder["handle"], self._num_sms)
+        combined = _ElasticCombine.apply(
+            y,
+            self._buffer,
+            holder["handle"],
+            self._num_sms,
+            payload_bytes,
+        )
         return combined[:, :holder["combine_hidden"]]
 
     def chunk_state(self, tag: int):
@@ -457,9 +570,18 @@ class DeepEPAdapter:
         return self._state.pop(tag, None)
 
     def dispatch_chunk_bwd(self, grad_recv, state, group):
-        return self._buffer.combine(
-            x=grad_recv.contiguous(), handle=state["disp"]["handle"], num_sms=self._num_sms
-        )[0]
+        contiguous = grad_recv.contiguous()
+        holder = state["disp"]
+        with _token_transport_timer(
+            "apply/dispatch_bwd_wire",
+            contiguous,
+            holder.get("dispatch_payload_bytes", 0),
+        ):
+            return self._buffer.combine(
+                x=contiguous,
+                handle=holder["handle"],
+                num_sms=self._num_sms,
+            )[0]
 
     def combine_chunk_bwd(self, grad_comb, state, group):
         hidden = int(state["comb"]["combine_hidden"])
@@ -467,12 +589,21 @@ class DeepEPAdapter:
             padded = grad_comb.new_zeros((grad_comb.shape[0], self._hidden))
             padded[:, :hidden] = grad_comb
             grad_comb = padded
-        grad_recv = self._buffer.dispatch(
-            x=grad_comb.contiguous(), handle=state["comb"]["handle"],
-            num_experts=state["comb"]["handle"].num_experts,
-            num_sms=self._num_sms,
-            do_cpu_sync=False, do_expand=False,
-        )[0]
+        contiguous = grad_comb.contiguous()
+        holder = state["comb"]
+        with _token_transport_timer(
+            "apply/combine_bwd_wire",
+            contiguous,
+            holder.get("combine_payload_bytes", 0),
+        ):
+            grad_recv = self._buffer.dispatch(
+                x=contiguous,
+                handle=holder["handle"],
+                num_experts=holder["handle"].num_experts,
+                num_sms=self._num_sms,
+                do_cpu_sync=False,
+                do_expand=False,
+            )[0]
         return grad_recv[:, :hidden]
 
 

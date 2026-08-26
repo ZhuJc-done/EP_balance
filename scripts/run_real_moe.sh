@@ -125,6 +125,9 @@ fi
 #                           apply: Scale-EPLB stages + expert transfer, remote payload MiB and effective
 #                           payload GB/s; backward token comm, Dgrad/activation/Wgrad and GIN
 #                           re-pull/grad-reduce are reported separately.
+#                           Nested dispatch/combine *_wire fields put CUDA events directly around
+#                           all_to_all_single (native/plain A2A) or the fused ElasticBuffer transport
+#                           primitive (DeepEP), excluding packing, count exchange and barriers.
 #                           Invocation-boundary sync makes this diagnostic only: never quote the
 #                           instrumented end-to-end step time. Use ALL_RANKS for cluster bandwidth.
 #
@@ -267,6 +270,13 @@ echo "[run_real_moe] depth=${MODEL_NUM_LAYERS}/${MODEL_FULL_NUM_LAYERS} layers" 
      "(dense=${MODEL_DENSE_PREFIX_LAYERS}, MoE=${MODEL_MOE_LAYERS}); override with NUM_LAYERS"
 if [[ "${MOE_ONLY:-0}" == "1" && "${MODEL_OFFICIAL_DENSE_PREFIX_LAYERS}" -gt 0 ]]; then
   echo "[run_real_moe] MOE_ONLY=1 -> layer 0 is MoE; official pretrained checkpoints do not match"
+fi
+if [[ "${MODEL_OFFICIAL_SHARED_EXPERT_INTERMEDIATE_SIZE}" -gt 0 ]]; then
+  if [[ "${MODEL_SHARED_EXPERT_INTERMEDIATE_SIZE}" -eq 0 ]]; then
+    echo "[run_real_moe] MOE_SHARED_EXPERT=0 -> shared experts disabled; official pretrained checkpoints do not match"
+  else
+    echo "[run_real_moe] shared expert intermediate size=${MODEL_SHARED_EXPERT_INTERMEDIATE_SIZE}; disable with MOE_SHARED_EXPERT=0"
+  fi
 fi
 
 # Router load balancing. ROUTER_BALANCING=none turns the aux loss off so the routing skew survives to

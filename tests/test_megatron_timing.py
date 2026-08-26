@@ -1,6 +1,7 @@
 import torch
 
 from eplb.integration import profiling
+from eplb.integration import megatron_timing
 from eplb.integration.megatron_timing import NativeMoETimingBinding
 
 
@@ -137,3 +138,102 @@ def test_native_totals_end_at_reverse_dispatch_before_delayed_wgrad_and_attentio
         assert "emit:off:layer=2 mb=0" in events
     finally:
         binding.remove()
+
+
+def _reset_wire_patch(monkeypatch):
+    monkeypatch.setattr(megatron_timing, "_active_wire_phase", None)
+    monkeypatch.setattr(megatron_timing, "_original_all_to_all_single", None)
+    monkeypatch.setattr(megatron_timing, "_wire_patch_users", 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda _group=None: 4)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda _group=None: 1)
+
+
+def test_native_wire_timer_wraps_only_sync_collective(monkeypatch):
+    _reset_wire_patch(monkeypatch)
+    calls = []
+    samples = []
+
+    def collective(*args, **kwargs):
+        calls.append((args, kwargs))
+        return None
+
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", collective)
+    monkeypatch.setattr(
+        profiling,
+        "start_debug_interval",
+        lambda **kwargs: ("start", kwargs["device"]),
+    )
+    monkeypatch.setattr(
+        profiling,
+        "finish_debug_interval",
+        lambda name, start, **kwargs: samples.append((name, start, kwargs)),
+    )
+
+    megatron_timing._install_wire_timing()
+    try:
+        inp = torch.zeros((4, 8), dtype=torch.float32)
+        out = torch.empty_like(inp)
+        with megatron_timing._wire_scope("native/dispatch_wire"):
+            torch.distributed.all_to_all_single(
+                out,
+                inp,
+                output_split_sizes=[1, 1, 1, 1],
+                input_split_sizes=[1, 1, 1, 1],
+                group=object(),
+            )
+    finally:
+        megatron_timing._uninstall_wire_timing()
+
+    assert len(calls) == 1
+    assert samples == [
+        (
+            "native/dispatch_wire",
+            ("start", inp.device),
+            {"payload_bytes": 3 * 8 * 4},
+        )
+    ]
+
+
+def test_native_async_wire_timer_ends_after_work_wait(monkeypatch):
+    _reset_wire_patch(monkeypatch)
+    events = []
+
+    class Work:
+        def wait(self):
+            events.append("wait")
+            return True
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_to_all_single",
+        lambda *args, **kwargs: Work(),
+    )
+    monkeypatch.setattr(
+        profiling,
+        "start_debug_interval",
+        lambda **_kwargs: events.append("start") or object(),
+    )
+    monkeypatch.setattr(
+        profiling,
+        "finish_debug_interval",
+        lambda name, _start, **_kwargs: events.append(f"finish:{name}"),
+    )
+
+    megatron_timing._install_wire_timing()
+    try:
+        inp = torch.zeros((4, 8))
+        with megatron_timing._wire_scope("native/combine_wire"):
+            work = torch.distributed.all_to_all_single(
+                torch.empty_like(inp),
+                inp,
+                output_split_sizes=[1, 1, 1, 1],
+                input_split_sizes=[1, 1, 1, 1],
+                group=object(),
+                async_op=True,
+            )
+            assert events == ["start"]
+            work.wait()
+    finally:
+        megatron_timing._uninstall_wire_timing()
+
+    assert events == ["start", "wait", "finish:native/combine_wire"]

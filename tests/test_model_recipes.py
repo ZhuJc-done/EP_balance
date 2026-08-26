@@ -6,12 +6,18 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 RECIPE_FILE = Path(__file__).resolve().parents[1] / "scripts" / "model_recipes.sh"
 
 
 def _recipe(
-    model: str, *, num_layers: int | None = None, moe_only: bool = False
+    model: str,
+    *,
+    num_layers: int | None = None,
+    moe_only: bool = False,
+    shared_expert: bool | str | None = None,
 ):
     env = os.environ.copy()
     if num_layers is None:
@@ -22,6 +28,12 @@ def _recipe(
         env["MOE_ONLY"] = "1"
     else:
         env.pop("MOE_ONLY", None)
+    if shared_expert is None:
+        env.pop("MOE_SHARED_EXPERT", None)
+    elif isinstance(shared_expert, bool):
+        env["MOE_SHARED_EXPERT"] = "1" if shared_expert else "0"
+    else:
+        env["MOE_SHARED_EXPERT"] = shared_expert
     script = r'''
 set -euo pipefail
 source "$1"
@@ -100,6 +112,22 @@ def test_moe_only_removes_mixed_models_dense_prefix():
 
         assert _value_after(model, "--num-layers") == "3"
         assert _value_after(moe, "--moe-layer-freq") == "1"
+
+
+def test_shared_expert_switch_removes_shared_mlp_from_mixed_models():
+    for model_name in ("deepseek_v2_160e", "glm45_air"):
+        _, moe, _ = _recipe(model_name, shared_expert=False)
+
+        assert "--moe-shared-expert-intermediate-size" not in moe
+        assert "--num-experts" in moe
+        assert "--moe-router-topk" in moe
+
+
+def test_invalid_shared_expert_switch_is_rejected():
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        _recipe("deepseek_v2_160e", shared_expert="disabled")
+
+    assert "invalid MOE_SHARED_EXPERT=disabled (expected 0 or 1)" in exc_info.value.stderr
 
 
 def test_existing_qwen_recipe_remains_selectable():

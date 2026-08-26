@@ -152,6 +152,21 @@ def test_transfer_timing_reports_payload_bandwidth(monkeypatch):
     assert "GB/s" in line
 
 
+def test_finished_debug_interval_preserves_wire_payload(monkeypatch):
+    _enable_fresh_debug_window(monkeypatch)
+
+    start = profiling.start_debug_interval(device="cpu")
+    profiling.finish_debug_interval(
+        "native/dispatch_wire",
+        start,
+        payload_bytes=4 * 1024 * 1024,
+    )
+    line = profiling.debug_str("mode=off layer=0 mb=0")
+
+    assert "dispatch_wire=" in line
+    assert "/4.00MiB/" in line
+
+
 def test_wire_timing_reports_get_and_put_without_outer_phase(monkeypatch):
     _enable_fresh_debug_window(monkeypatch)
 

@@ -109,3 +109,30 @@ def test_extracts_per_layer_backward_and_true_critical_rank(tmp_path):
         extract.summarize(
             rows, warmup=100, step_ms=None, expected_ranks=3
         )
+
+
+def test_extracts_nested_token_wire_phases(tmp_path):
+    log = tmp_path / "wire.log"
+    log.write_text(
+        _line(
+            0,
+            "mode=off layer=0 mb=101 dispatch=3.0ms "
+            "dispatch_wire=1.5ms(x2)/8.00MiB/5.59GB/s "
+            "combine_wire=0.8ms/7.50MiB/9.83GB/s",
+        )
+        + _line(
+            0,
+            "mode=off direction=backward layer=0 mb=101 "
+            "combine_bwd_wire=0.9ms/7.50MiB/8.74GB/s "
+            "dispatch_bwd_wire=1.7ms(x2)/8.00MiB/4.93GB/s",
+        )
+    )
+
+    rows = extract.merge(*extract.parse([log]))
+    by_phase = {row["phase"]: row for row in rows}
+
+    assert by_phase["dispatch_wire"]["events"] == 2
+    assert by_phase["dispatch_wire"]["mib"] == 8.0
+    assert by_phase["combine_wire"]["ms"] == 0.8
+    assert by_phase["combine_bwd_wire"]["ms"] == 0.9
+    assert by_phase["dispatch_bwd_wire"]["events"] == 2

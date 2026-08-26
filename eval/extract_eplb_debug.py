@@ -64,18 +64,22 @@ FORWARD_PHASES = (
     "expert_transfer",
     "expert_transfer_wire",
     "dispatch",
+    "dispatch_wire",
     "expert_gemm",
     "combine",
+    "combine_wire",
 )
 BACKWARD_PHASES = (
     "moe_bwd_total",
     "expert_repull",
     "expert_repull_wire",
     "combine_bwd",
+    "combine_bwd_wire",
     "expert_bwd",
     "expert_dgrad",
     "activation_bwd",
     "dispatch_bwd",
+    "dispatch_bwd_wire",
     "expert_wgrad",
     "expert_grad_reduce",
     "expert_grad_put_wire",
@@ -103,6 +107,10 @@ WIRE_PHASES = (
     "expert_transfer_wire",
     "expert_repull_wire",
     "expert_grad_put_wire",
+    "dispatch_wire",
+    "combine_wire",
+    "combine_bwd_wire",
+    "dispatch_bwd_wire",
 )
 TRANSFER_PHASES = (
     "expert_transfer",

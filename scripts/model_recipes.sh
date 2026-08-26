@@ -43,6 +43,29 @@ _configure_depth() {
   fi
 }
 
+_configure_shared_expert() {
+  local official_intermediate_size="${1:?official shared-expert size is required}"
+  local enabled="${MOE_SHARED_EXPERT:-1}"
+
+  case "${enabled}" in
+    0|1) ;;
+    *)
+      echo "invalid MOE_SHARED_EXPERT=${enabled} (expected 0 or 1)" >&2
+      return 1
+      ;;
+  esac
+
+  MODEL_OFFICIAL_SHARED_EXPERT_INTERMEDIATE_SIZE="${official_intermediate_size}"
+  if [[ "${enabled}" == "1" && "${official_intermediate_size}" -gt 0 ]]; then
+    MODEL_SHARED_EXPERT_INTERMEDIATE_SIZE="${official_intermediate_size}"
+    MOE_ARGS+=(
+      --moe-shared-expert-intermediate-size "${MODEL_SHARED_EXPERT_INTERMEDIATE_SIZE}"
+    )
+  else
+    MODEL_SHARED_EXPERT_INTERMEDIATE_SIZE=0
+  fi
+}
+
 configure_model_recipe() {
   local model="${1:?model name is required}"
   MODEL_ARGS=()
@@ -73,12 +96,13 @@ configure_model_recipe() {
         --moe-router-load-balancing-type aux_loss --moe-aux-loss-coeff 1e-3
         --moe-token-dispatcher-type alltoall --moe-layer-freq "${MODEL_MOE_PATTERN}"
       )
+      _configure_shared_expert 0 || return
       ;;
 
     deepseek_v2_160e)
-      # DeepSeek-V2: retain the production widths, MLA, routing, and two
-      # shared experts. NUM_LAYERS can truncate the depth while preserving the
-      # official one-layer dense prefix.
+      # DeepSeek-V2: retain the production widths, MLA, routing, and (by
+      # default) two shared experts. NUM_LAYERS can truncate the depth while
+      # preserving the official one-layer dense prefix.
       _configure_depth 60 1 || return
       MODEL_DEFAULT_ROUTER_BALANCING="seq_aux_loss"
       MODEL_ARGS=(
@@ -97,7 +121,6 @@ configure_model_recipe() {
       )
       MOE_ARGS=(
         --num-experts 160 --moe-router-topk 6 --moe-ffn-hidden-size 1536
-        --moe-shared-expert-intermediate-size 3072
         --moe-layer-freq "${MODEL_MOE_PATTERN}"
         --moe-router-num-groups 8 --moe-router-group-topk 3
         --moe-router-pre-softmax --moe-router-score-function softmax
@@ -105,13 +128,14 @@ configure_model_recipe() {
         --moe-router-load-balancing-type seq_aux_loss --moe-aux-loss-coeff 1e-3
         --moe-token-dispatcher-type alltoall
       )
+      _configure_shared_expert 3072 || return
       ;;
 
     glm45_air)
-      # GLM-4.5-Air: retain GQA, 128 routed experts, and one serial shared
-      # expert. NUM_LAYERS can truncate the depth while preserving the official
-      # one-layer dense prefix. Shared-expert overlap stays disabled so
-      # off/observe/apply use the same execution schedule.
+      # GLM-4.5-Air: retain GQA, 128 routed experts, and (by default) one serial
+      # shared expert. NUM_LAYERS can truncate the depth while preserving the
+      # official one-layer dense prefix. Shared-expert overlap stays disabled
+      # so off/observe/apply use the same execution schedule.
       _configure_depth 46 1 || return
       MODEL_DEFAULT_ROUTER_BALANCING="seq_aux_loss"
       MODEL_ARGS=(
@@ -129,7 +153,6 @@ configure_model_recipe() {
       )
       MOE_ARGS=(
         --num-experts 128 --moe-router-topk 8 --moe-ffn-hidden-size 1408
-        --moe-shared-expert-intermediate-size 1408
         --moe-layer-freq "${MODEL_MOE_PATTERN}"
         --moe-router-score-function sigmoid --moe-router-enable-expert-bias
         --moe-router-bias-update-rate 0.0 --moe-router-topk-scaling-factor 1.0
@@ -137,6 +160,7 @@ configure_model_recipe() {
         --moe-router-load-balancing-type seq_aux_loss --moe-aux-loss-coeff 1e-3
         --moe-token-dispatcher-type alltoall
       )
+      _configure_shared_expert 1408 || return
       ;;
 
     *)

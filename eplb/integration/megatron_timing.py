@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import types
 from typing import Callable, List, Optional
@@ -9,6 +10,160 @@ from typing import Callable, List, Optional
 import torch
 
 from . import profiling
+
+
+_FORWARD_WIRE_PHASE = {
+    "native/dispatch": "native/dispatch_wire",
+    "native/combine": "native/combine_wire",
+}
+_BACKWARD_WIRE_PHASE = {
+    "native/combine_bwd": "native/combine_bwd_wire",
+    "native/dispatch_bwd": "native/dispatch_bwd_wire",
+}
+_active_wire_phase: Optional[str] = None
+_original_all_to_all_single = None
+_wire_patch_users = 0
+
+
+def _collective_arg(args, kwargs, index: int, name: str, default=None):
+    if len(args) > index:
+        return args[index]
+    return kwargs.get(name, default)
+
+
+def _remote_payload_bytes(args, kwargs) -> int:
+    """Logical bytes sent to peers by one rank, computed outside the timed interval."""
+    input_ = _collective_arg(args, kwargs, 1, "input")
+    if not isinstance(input_, torch.Tensor) or input_.dim() == 0:
+        return 0
+    group = _collective_arg(args, kwargs, 4, "group")
+    try:
+        world_size = torch.distributed.get_world_size(group)
+        rank = torch.distributed.get_rank(group)
+    except (RuntimeError, TypeError, ValueError):
+        return 0
+    if world_size <= 1:
+        return 0
+
+    input_splits = _collective_arg(
+        args,
+        kwargs,
+        3,
+        "input_split_sizes",
+    )
+    if input_splits is None:
+        local_rows = int(input_.shape[0]) // world_size
+    else:
+        local_rows = int(input_splits[rank])
+    row_elements = input_[0].numel() if input_.shape[0] else 0
+    remote_rows = max(int(input_.shape[0]) - local_rows, 0)
+    return remote_rows * row_elements * input_.element_size()
+
+
+class _TimedWork:
+    """Record the end event after an asynchronous NCCL work handle is waited."""
+
+    def __init__(self, work, phase: str, start, payload_bytes: int) -> None:
+        self._work = work
+        self._phase = phase
+        self._start = start
+        self._payload_bytes = payload_bytes
+        self._finished = False
+
+    def _finish(self) -> None:
+        if self._finished:
+            return
+        profiling.finish_debug_interval(
+            self._phase,
+            self._start,
+            payload_bytes=self._payload_bytes,
+        )
+        self._finished = True
+
+    def wait(self, *args, **kwargs):
+        result = self._work.wait(*args, **kwargs)
+        self._finish()
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._work, name)
+
+
+def _timed_all_to_all_single(*args, **kwargs):
+    """Time only the actual collective call while a native MoE wire scope is active."""
+    original = _original_all_to_all_single
+    if original is None:
+        raise RuntimeError("native wire-timing patch has no underlying all_to_all_single")
+    if _active_wire_phase is None:
+        return original(*args, **kwargs)
+
+    phase = _active_wire_phase
+    input_ = _collective_arg(args, kwargs, 1, "input")
+    device = input_.device if isinstance(input_, torch.Tensor) else None
+    payload_bytes = _remote_payload_bytes(args, kwargs)
+    start = profiling.start_debug_interval(device=device)
+    work = original(*args, **kwargs)
+    async_op = bool(_collective_arg(args, kwargs, 5, "async_op", False))
+    if async_op:
+        return _TimedWork(work, phase, start, payload_bytes)
+    profiling.finish_debug_interval(
+        phase,
+        start,
+        payload_bytes=payload_bytes,
+    )
+    return work
+
+
+def _install_wire_timing() -> None:
+    """Patch the PyTorch primitive once while native timing bindings are alive."""
+    global _original_all_to_all_single, _wire_patch_users
+    if _wire_patch_users == 0:
+        _original_all_to_all_single = torch.distributed.all_to_all_single
+        torch.distributed.all_to_all_single = _timed_all_to_all_single
+    _wire_patch_users += 1
+
+
+def _uninstall_wire_timing() -> None:
+    global _active_wire_phase, _original_all_to_all_single, _wire_patch_users
+    if _wire_patch_users == 0:
+        return
+    _wire_patch_users -= 1
+    if _wire_patch_users == 0:
+        if torch.distributed.all_to_all_single is _timed_all_to_all_single:
+            torch.distributed.all_to_all_single = _original_all_to_all_single
+        _active_wire_phase = None
+        _original_all_to_all_single = None
+
+
+@contextlib.contextmanager
+def _wire_scope(phase: Optional[str]):
+    global _active_wire_phase
+    if phase is None:
+        yield
+        return
+    previous = _active_wire_phase
+    _active_wire_phase = phase
+    try:
+        yield
+    finally:
+        _active_wire_phase = previous
+
+
+def _start_backward_wire_scope(state: dict, phase: str) -> None:
+    global _active_wire_phase
+    wire_phase = _BACKWARD_WIRE_PHASE.get(phase)
+    if wire_phase is None:
+        return
+    previous = state.setdefault("wire_previous", {})
+    previous[phase] = _active_wire_phase
+    _active_wire_phase = wire_phase
+
+
+def _finish_backward_wire_scope(state: dict, phase: str) -> None:
+    global _active_wire_phase
+    previous = state.get("wire_previous", {})
+    if phase in previous:
+        _active_wire_phase = previous.pop(phase)
 
 
 def _device_hint(args, kwargs):
@@ -40,12 +195,16 @@ def _start_native_phase(state: dict, phase: str, device) -> None:
     starts = state["phase_starts"]
     if phase not in starts:
         starts[phase] = profiling.start_debug_interval(device=device)
+        _start_backward_wire_scope(state, phase)
 
 
 def _finish_native_phase(state: dict, phase: str) -> None:
     start = state["phase_starts"].pop(phase, None)
     if start is not None:
-        profiling.finish_debug_interval(phase, start)
+        try:
+            profiling.finish_debug_interval(phase, start)
+        finally:
+            _finish_backward_wire_scope(state, phase)
 
 
 class _NativePhaseBackwardStart(torch.autograd.Function):
@@ -197,8 +356,12 @@ class NativeMoETimingBinding:
         self.micro_batch_id = 0
         self._restore = []
         self._active_backward_state = None
+        self._wire_timing_installed = False
 
         try:
+            if profiling.debug_enabled():
+                _install_wire_timing()
+                self._wire_timing_installed = True
             # Wrap the leaf operations rather than reimplementing MoELayer.forward. In observe mode,
             # the router's forward hook runs after this router region closes, so solver work is not
             # accidentally charged to the router.
@@ -254,7 +417,8 @@ class NativeMoETimingBinding:
                 time_it=True,
                 device=_device_hint(args, kwargs),
             ):
-                return original(*args, **kwargs)
+                with _wire_scope(_FORWARD_WIRE_PHASE.get(region)):
+                    return original(*args, **kwargs)
 
         self._replace(owner, method_name, types.MethodType(timed, owner))
 
@@ -288,7 +452,8 @@ class NativeMoETimingBinding:
                 time_it=True,
                 device=_device_hint(tuple(positional), kwargs),
             ):
-                output = original(*tuple(positional), **kwargs)
+                with _wire_scope(_FORWARD_WIRE_PHASE.get(forward_region)):
+                    output = original(*tuple(positional), **kwargs)
             if state is not None:
                 output = _mark_phase_output(output, state, backward_region)
             return output
@@ -404,6 +569,9 @@ class NativeMoETimingBinding:
             elif method_name in vars(owner):
                 delattr(owner, method_name)
         self._restore.clear()
+        if self._wire_timing_installed:
+            _uninstall_wire_timing()
+            self._wire_timing_installed = False
         if getattr(self.moe_layer, "_eplb_native_timing", None) is self:
             delattr(self.moe_layer, "_eplb_native_timing")
 
