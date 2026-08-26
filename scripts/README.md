@@ -197,7 +197,7 @@ uniform. It says nothing on its own about how skewed the routing was — for tha
 against the input skew (see [`ROUTER_SKEW`](#dialing-the-skew-router_skew)) or replay the
 captured trace through the baselines below.
 
-### Capture a routing trace for the baseline comparison
+### Capture and analyze router decisions
 
 Set `EPLB_TRACE_OUT` in observe mode to dump the real gathered `Ω[R, E]`
 per (layer, micro-batch); rank 0 writes a self-describing file (topology, `main(e)`
@@ -215,9 +215,48 @@ python -m baseline.benchmark --trace logs/trace.pt \
   --strategies scale,eplb,fastermoe,flexmoe,lplb
 ```
 
+In apply mode the same switch writes a v4 trace containing `Ω`, the actual
+placement `x`, and the physical routing quota `q[src, expert, dst]`. This makes
+it possible to verify the plan used by training rather than infer it from
+aggregate DeepEP bytes:
+
+```bash
+# Add these variables to the normal EPLB_MODE=apply command. Keep the capture
+# short: q is R*E*R int64 and every sample deliberately performs a D2H sync.
+EPLB_TRACE_OUT=logs/qwen_scale_routing.pt \
+EPLB_TRACE_MAX=200 \
+EPLB_TRACE_EVERY=20 \
+  bash scripts/run_real_moe.sh ...
+
+python eval/analyze_eplb_routing.py \
+  --trace logs/qwen_scale_routing.pt \
+  --warmup-mb 10 \
+  --out-dir logs/qwen_scale_routing_analysis
+```
+
+The report compares original home-expert routing with the applied plan and
+emits local, intra-NVLink-domain, and inter-domain assignment/byte counts;
+before/after rank max/mean; the fraction sent to replicas; cross-domain traffic
+avoided, retained, or introduced; rank/domain flow matrices; full aggregate
+`(layer, source, expert, destination)` quotas; and replica placement frequency.
+The `home` rows are the Megatron-native counterfactual evaluated on the exact
+same `Ω`, so router drift between two training runs cannot confound this
+comparison. EPLB does not change Top-K logical expert choices; it changes only
+the physical replica destination represented by `q`.
+Logical bytes use one hidden-state row and exclude DeepEP metadata, padding, and
+protocol headers. The forward+backward estimate is four times one-way dispatch
+(forward dispatch/combine plus their two backward transposes).
+
+If PP/TP/EDP creates multiple EP groups, each EP-group leader writes a
+`<stem>.rank<global-rank><suffix>` file to avoid collisions. Pass all files to
+one `--trace` argument. A `{rank}` placeholder in `EPLB_TRACE_OUT` can instead
+control the filenames explicitly.
+
 Optional: `EPLB_TRACE_MAX` caps the number of captured samples (0 = all),
 `EPLB_TRACE_EVERY` sets the disk-flush cadence. See `baseline/README.md` for how
-each strategy's reported quality is defined.
+each strategy's reported quality is defined. Never use a trace-enabled run for
+end-to-end throughput or latency claims because plan capture synchronizes the
+GPU every layer.
 
 ## Measuring: latency breakdown, straggler, and the N_slot sweep
 

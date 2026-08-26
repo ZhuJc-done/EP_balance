@@ -39,6 +39,27 @@ def load_routing_trace(path: str | Path) -> dict:
             )
         if torch.any(omega < 0):
             raise ValueError(f"{path}: sample {index} contains negative token counts")
+        if "q" in sample or "x" in sample:
+            if "q" not in sample or "x" not in sample:
+                raise ValueError(f"{path}: sample {index} must contain both q and x")
+            q = torch.as_tensor(sample["q"])
+            x = torch.as_tensor(sample["x"])
+            if q.shape != (num_ranks, num_experts, num_ranks):
+                raise ValueError(
+                    f"{path}: sample {index} q shape {tuple(q.shape)} != "
+                    f"({num_ranks}, {num_experts}, {num_ranks})"
+                )
+            if x.shape != (num_experts, num_ranks):
+                raise ValueError(
+                    f"{path}: sample {index} x shape {tuple(x.shape)} != "
+                    f"({num_experts}, {num_ranks})"
+                )
+            if torch.any(q < 0) or not torch.equal(
+                q.to(torch.int64).sum(dim=2), omega.to(torch.int64)
+            ):
+                raise ValueError(
+                    f"{path}: sample {index} q does not conserve omega"
+                )
     return trace
 
 

@@ -95,14 +95,18 @@ case "${EPLB_PLAN_SOLVER}" in
 esac
 export EPLB_MODE EPLB_PLAN_SOLVER GPUS_PER_NODE
 
-# --- optional routing-trace capture (observe mode) ---------------------------
-# EPLB_TRACE_OUT=<path> makes rank 0 dump the real gathered Ω[R,E] per
-# (layer, micro-batch); EPLB_TRACE_MAX caps sample count (0=all), EPLB_TRACE_EVERY
-# is the flush cadence. Replay it through every load balancer with:
+# --- optional routing-trace capture ------------------------------------------
+# Observe mode dumps Ω[R,E]. Apply mode additionally dumps the actual x and
+# q[src,e,dst], which enables local/intra-domain/inter-domain rerouting analysis.
+# This diagnostic performs D2H copies and must not be used for throughput.
+# EPLB_TRACE_MAX caps sample count (0=all); EPLB_TRACE_EVERY is the flush cadence.
+# Replay either trace through every load balancer with:
 #   python -m baseline.benchmark --trace <path> --strategies scale,eplb,fastermoe,flexmoe,lplb
+# Analyze an apply-mode trace with:
+#   python eval/analyze_eplb_routing.py --trace <path> --out-dir <dir>
 if [[ -n "${EPLB_TRACE_OUT:-}" ]]; then
   export EPLB_TRACE_OUT EPLB_TRACE_MAX EPLB_TRACE_EVERY
-  echo "[run_real_moe] EPLB_TRACE_OUT=${EPLB_TRACE_OUT} (routing trace -> baseline replay)"
+  echo "[run_real_moe] EPLB_TRACE_OUT=${EPLB_TRACE_OUT} (diagnostic routing trace; D2H sync)"
 fi
 
 # --- optional sweep / instrumentation knobs ----------------------------------

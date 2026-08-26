@@ -18,6 +18,7 @@ from .hooks import NullWeightMaterializer, RebalanceResult, WeightMaterializer
 
 
 PlanSolver = Callable[[Loads, Topology, ProblemSpec, EPLBConfig], Plan]
+PlanObserver = Callable[[Loads, Plan, int, int], None]
 
 
 class EPLBRebalancer:
@@ -30,6 +31,8 @@ class EPLBRebalancer:
         materializer: Backend weight materializer (defaults to no-op placeholder).
         plan_solver: Optional placement/plan plugin. The default is Scale-EPLB's
             native solver; plugins receive the same ``(loads, topo, spec, cfg)``.
+        plan_observer: Optional diagnostic callback receiving the exact gathered
+            loads and applied plan before materialization.
         cache_plans: If True, cache solved plans for backward; else recompute from
             cached ``Ω`` (less memory, relies on determinism; default for K=1).
         ring_size: Max in-flight (layer, mb) entries to retain (FIFO eviction). ``0`` retains
@@ -45,6 +48,7 @@ class EPLBRebalancer:
         cfg: Optional[EPLBConfig] = None,
         materializer: Optional[WeightMaterializer] = None,
         plan_solver: Optional[PlanSolver] = None,
+        plan_observer: Optional[PlanObserver] = None,
         *,
         cache_plans: bool = False,
         ring_size: int = 64,
@@ -56,6 +60,7 @@ class EPLBRebalancer:
         self.cfg = cfg or EPLBConfig()
         self.materializer = materializer or NullWeightMaterializer()
         self.plan_solver = plan_solver
+        self.plan_observer = plan_observer
         self.cache_plans = cache_plans
         self.ring_size = int(ring_size)
 
@@ -77,6 +82,8 @@ class EPLBRebalancer:
     ) -> RebalanceResult:
         """Rebalance an already-gathered ``Ω`` in one process."""
         plan = self.plan_from_omega(loads)
+        if self.plan_observer is not None:
+            self.plan_observer(loads, plan, int(layer_id), int(micro_batch_id))
         self._remember(layer_id, micro_batch_id, loads.omega, plan)
         handle = self.materializer.materialize(plan, layer_id, micro_batch_id)
         return RebalanceResult(plan=plan, weight_handle=handle)
@@ -103,6 +110,8 @@ class EPLBRebalancer:
         with profiling.record("all_gather_omega", time_it=True, device=local_row.device):
             loads = all_gather_omega(local_row, group=group)
         plan = self.plan_from_omega(loads)
+        if self.plan_observer is not None:
+            self.plan_observer(loads, plan, int(layer_id), int(micro_batch_id))
         self._remember(layer_id, micro_batch_id, loads.omega, plan)
         handle = self.materializer.materialize(plan, layer_id, micro_batch_id)
         return RebalanceResult(plan=plan, weight_handle=handle)

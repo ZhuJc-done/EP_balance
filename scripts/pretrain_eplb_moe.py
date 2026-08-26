@@ -36,8 +36,10 @@ from eplb.integration import (
 )
 from eplb.integration import profiling
 from eplb.integration.megatron import build_spec_for_megatron, setup_eplb_observer
+from eplb.integration.plan_trace import PlanTraceWriter, rank_local_trace_path
 
 _KEEPALIVE = []  # keep hooks / rebalancers alive for the process lifetime
+_PLAN_TRACE_WRITERS = {}
 
 
 def _expert_param_bytes(args) -> int:
@@ -193,11 +195,62 @@ def model_provider(
         gpn = p["gpus_per_node"] if ep_size % p["gpus_per_node"] == 0 else ep_size
         topo = Topology.from_nvlink_rdma(ep_size // gpn, gpn, 1, 8, device=device)
         solver_name = os.environ.get("EPLB_PLAN_SOLVER", "scale")
+        spec = build_spec_for_megatron(
+            p["num_experts"],
+            ep_size,
+            p["weight_bytes_each"],
+            p["s_tok"],
+            p["n_slot"],
+            device,
+        )
+        trace_writer = None
+        trace_out = os.environ.get("EPLB_TRACE_OUT")
+        ep_rank = (
+            torch.distributed.get_rank(ep_group)
+            if torch.distributed.is_initialized()
+            else 0
+        )
+        if trace_out and ep_rank == 0:
+            global_rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            world_size = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_initialized()
+                else ep_size
+            )
+            num_writers = max(1, world_size // ep_size)
+            trace_path = rank_local_trace_path(
+                trace_out, global_rank, num_writers
+            )
+            trace_writer = _PLAN_TRACE_WRITERS.get(trace_path)
+            if trace_writer is None:
+                trace_writer = PlanTraceWriter(
+                    trace_path,
+                    topo,
+                    spec,
+                    solver=solver_name,
+                    global_rank=global_rank,
+                    pipeline_rank=mpu.get_pipeline_model_parallel_rank(),
+                    max_samples=int(os.environ.get("EPLB_TRACE_MAX") or 0),
+                    flush_every=int(os.environ.get("EPLB_TRACE_EVERY") or 25),
+                )
+                _PLAN_TRACE_WRITERS[trace_path] = trace_writer
+                print(
+                    "[run_real_moe] dumping applied routing plans "
+                    f"(omega+x+q) to {trace_path}; diagnostic D2H sync is enabled"
+                )
+                _KEEPALIVE.append(trace_writer)
         if rank0:
             print(f"[run_real_moe] EPLB plan solver: {solver_name}")
-        for layer_id, moe in enumerate(find_moe_layers(model)):
-            spec = build_spec_for_megatron(
-                p["num_experts"], ep_size, p["weight_bytes_each"], p["s_tok"], p["n_slot"], device
+        for local_layer_id, moe in enumerate(find_moe_layers(model)):
+            layer_number = getattr(moe, "layer_number", None)
+            layer_id = (
+                int(layer_number) - 1
+                if layer_number is not None and int(layer_number) > 0
+                else local_layer_id
             )
             # ring_size=0: this path's backward is pure autograd, so a retained Ω ring
             # would be device memory (R*E int64 per layer per micro-batch) nothing ever reads.
@@ -206,6 +259,7 @@ def model_provider(
                 spec,
                 EPLBConfig(),
                 plan_solver=_plan_solver_from_env(),
+                plan_observer=trace_writer.append if trace_writer else None,
                 ring_size=0,
             )
             bind_eplb_to_moe_layer(moe, reb, ep_group, layer_id)
