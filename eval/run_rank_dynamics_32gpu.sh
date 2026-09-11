@@ -26,6 +26,14 @@ EVAL_ITERS="${EVAL_ITERS:-16}"
 WORKERS="${WORKERS:-16}"
 FORCE_DATA="${FORCE_DATA:-0}"
 OVERWRITE="${OVERWRITE:-0}"
+RANK_DYNAMICS_DATASET="${RANK_DYNAMICS_DATASET:-both}"
+case "${RANK_DYNAMICS_DATASET}" in
+  dapo_math|starcoder|both) ;;
+  *)
+    echo "unknown RANK_DYNAMICS_DATASET=${RANK_DYNAMICS_DATASET}; expected dapo_math, starcoder, or both" >&2
+    exit 1
+    ;;
+esac
 
 GPUS_PER_NODE="${GPUS_PER_NODE:-${ARNOLD_WORKER_GPU:-8}}"
 NNODES="${NNODES:-${SLURM_NNODES:-${ARNOLD_WORKER_NUM:-4}}}"
@@ -243,6 +251,7 @@ if (( NODE_RANK == 0 )); then
     echo "INIT_MODE=random"
     echo "SEED=${SEED}"
     echo "MODEL=${MODEL}"
+    echo "RANK_DYNAMICS_DATASET=${RANK_DYNAMICS_DATASET}"
     echo "NUM_LAYERS=${NUM_LAYERS}"
     echo "WORLD_SIZE=${WORLD_SIZE}"
     echo "CAPTURE_EP=${CAPTURE_EP}"
@@ -301,24 +310,40 @@ run_capture() {
 
 echo "[rank-dynamics] random initialization, no checkpoint, no optimizer updates"
 echo "[rank-dynamics] world=${WORLD_SIZE} (${NNODES}x${GPUS_PER_NODE}) capture_EP=${CAPTURE_EP} master=[${MASTER_ADDR}]:${MASTER_PORT}"
+echo "[rank-dynamics] selected dataset=${RANK_DYNAMICS_DATASET}"
 echo "[rank-dynamics] virtual ranks=${TARGET_RANKS}, occurrence group=${OCCURRENCE_GROUP}"
 echo "[rank-dynamics] equal corpus budget=${TOKEN_BUDGET}, raw/grouped occurrences=${EVAL_ITERS}/$((EVAL_ITERS / OCCURRENCE_GROUP))"
-run_capture dapo_math "${DAPO_DATA_PATH}" "${DAPO_TRACE}" "${MASTER_PORT}"
-run_capture starcoder "${STARCODER_DATA_PATH}" "${STARCODER_TRACE}" "$((MASTER_PORT + 1))"
+case "${RANK_DYNAMICS_DATASET}" in
+  dapo_math)
+    run_capture dapo_math "${DAPO_DATA_PATH}" "${DAPO_TRACE}" "${MASTER_PORT}"
+    ;;
+  starcoder)
+    run_capture starcoder "${STARCODER_DATA_PATH}" "${STARCODER_TRACE}" "$((MASTER_PORT + 1))"
+    ;;
+  both)
+    run_capture dapo_math "${DAPO_DATA_PATH}" "${DAPO_TRACE}" "${MASTER_PORT}"
+    run_capture starcoder "${STARCODER_DATA_PATH}" "${STARCODER_TRACE}" "$((MASTER_PORT + 1))"
+    ;;
+esac
 
 if (( NODE_RANK == 0 )); then
-  plot_args=(
-    --trace "DAPO-Math=${DAPO_TRACE}"
-    --trace "StarCoderData=${STARCODER_TRACE}"
-    --max-occurrences "${EVAL_ITERS}"
-    --target-ranks "${TARGET_RANKS}"
-    --occurrence-group "${OCCURRENCE_GROUP}"
-    --output "${FIGURE}"
-  )
-  if [[ -n "${REPRESENTATIVE_LAYER:-}" ]]; then
-    plot_args+=(--layer "${REPRESENTATIVE_LAYER}")
+  if [[ -s "${DAPO_TRACE}" && -s "${STARCODER_TRACE}" ]]; then
+    plot_args=(
+      --trace "DAPO-Math=${DAPO_TRACE}"
+      --trace "StarCoderData=${STARCODER_TRACE}"
+      --max-occurrences "${EVAL_ITERS}"
+      --target-ranks "${TARGET_RANKS}"
+      --occurrence-group "${OCCURRENCE_GROUP}"
+      --output "${FIGURE}"
+    )
+    if [[ -n "${REPRESENTATIVE_LAYER:-}" ]]; then
+      plot_args+=(--layer "${REPRESENTATIVE_LAYER}")
+    fi
+    PYTHONPATH="${EPLB_DIR}:${PYTHONPATH:-}" \
+      python "${SCRIPT_DIR}/plot_rank_dynamics.py" "${plot_args[@]}"
+    echo "[rank-dynamics] both traces complete: ${RUN_DIR}"
+  else
+    echo "[rank-dynamics] ${RANK_DYNAMICS_DATASET} capture complete: ${RUN_DIR}"
+    echo "[rank-dynamics] joint plot deferred until dapo_math.pt and starcoder.pt both exist"
   fi
-  PYTHONPATH="${EPLB_DIR}:${PYTHONPATH:-}" \
-    python "${SCRIPT_DIR}/plot_rank_dynamics.py" "${plot_args[@]}"
-  echo "[rank-dynamics] complete: ${RUN_DIR}"
 fi

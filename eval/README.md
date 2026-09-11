@@ -40,6 +40,21 @@ onto 32 virtual fixed-placement ranks as `rank = expert_id // 4`. The resulting
 16 grouped occurrences therefore support the Layer × Microbatch and
 Rank × Microbatch panels without allocating 32 physical GPUs.
 
+On one 8-GPU node, launch the two captures separately. Keep `RUN_TAG`
+identical so both traces are written to the same result directory:
+
+```bash
+cd /home/tiger/EP_balance
+export RUN_TAG=rank_dynamics_8gpu_seed1234
+bash eval/run_rank_dynamics_8gpu.sh dapo_math
+bash eval/run_rank_dynamics_8gpu.sh starcoder
+```
+
+Each command uses all eight GPUs but runs only the named dataset. The 8-GPU
+wrapper captures 64 raw occurrences and combines every four into 16 virtual
+EP32 points. Once the second trace finishes, it automatically creates the
+joint PDF and CSV.
+
 For a 4-node × 8-GPU Arnold job, the following command prepares equal-token
 DAPO-Math and StarCoderData corpora from the existing HDFS JSONL files, runs
 both captures with the same fixed random initialization, and plots rank

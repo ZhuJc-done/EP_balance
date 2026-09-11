@@ -4,6 +4,30 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+usage() {
+  cat <<'EOF'
+Usage: bash eval/run_rank_dynamics_8gpu.sh dapo_math|starcoder [Megatron args...]
+
+Run the two datasets as separate GPU jobs. Use the same RUN_TAG for both jobs
+so that the second run can find the first trace and create the joint figure.
+EOF
+}
+
+case "${1:-}" in
+  dapo_math|starcoder)
+    export RANK_DYNAMICS_DATASET="$1"
+    shift
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
 export MODEL="${MODEL:-qwen3_30b_a3b}"
 if [[ "${MODEL}" != "qwen3_30b_a3b" ]]; then
   echo "run_rank_dynamics_8gpu.sh requires MODEL=qwen3_30b_a3b for rank=expert//4" >&2
