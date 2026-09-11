@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# One-command 4-node x 8-GPU capture for DAPO-Math and StarCoder rank dynamics.
+# Configurable capture engine for DAPO-Math and StarCoder rank dynamics.
+# Defaults retain the original 4-node x 8-GPU setup; use run_rank_dynamics_4gpu.sh
+# for a single-node capture followed by virtual EP32 analysis.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,6 +11,14 @@ source "${EPLB_DIR}/scripts/env_hdfs.sh"
 MEGATRON_DIR="${MEGATRON_DIR:-${HOME}/Megatron-LM}"
 TOKENIZER_MODEL="${TOKENIZER_MODEL:-${EPLB_TOKENIZER_DIR}/qwen3_30b_a3b}"
 MODEL="${MODEL:-qwen3_30b_a3b}"
+case "${MODEL}" in
+  qwen3_30b_a3b|glm45_air) NUM_EXPERTS_FOR_MAPPING=128 ;;
+  deepseek_v2_160e) NUM_EXPERTS_FOR_MAPPING=160 ;;
+  *)
+    echo "unknown MODEL=${MODEL}" >&2
+    exit 1
+    ;;
+esac
 SEED="${SEED:-1234}"
 NUM_LAYERS="${NUM_LAYERS:-48}"
 SEQ_LEN="${SEQ_LEN:-4096}"
@@ -37,8 +47,25 @@ MASTER_ADDR="${MASTER_ADDR:-${ARNOLD_WORKER_0_HOST:-}}"
 MASTER_PORT="${MASTER_PORT:-13401}"
 
 WORLD_SIZE=$((NNODES * GPUS_PER_NODE))
-if (( WORLD_SIZE != 32 )); then
-  echo "this launcher requires exactly 32 GPUs, got NNODES=${NNODES} x GPUS_PER_NODE=${GPUS_PER_NODE}" >&2
+EXPECTED_WORLD_SIZE="${EXPECTED_WORLD_SIZE:-32}"
+CAPTURE_EP="${CAPTURE_EP:-${WORLD_SIZE}}"
+TARGET_RANKS="${TARGET_RANKS:-32}"
+OCCURRENCE_GROUP="${OCCURRENCE_GROUP:-1}"
+CAPTURE_GLOBAL_BATCH_SIZE="${CAPTURE_GLOBAL_BATCH_SIZE:-${WORLD_SIZE}}"
+if (( WORLD_SIZE != EXPECTED_WORLD_SIZE )); then
+  echo "expected ${EXPECTED_WORLD_SIZE} GPUs, got NNODES=${NNODES} x GPUS_PER_NODE=${GPUS_PER_NODE}" >&2
+  exit 1
+fi
+if (( CAPTURE_EP <= 0 || WORLD_SIZE % CAPTURE_EP != 0 )); then
+  echo "CAPTURE_EP=${CAPTURE_EP} must divide WORLD_SIZE=${WORLD_SIZE}" >&2
+  exit 1
+fi
+if (( TARGET_RANKS <= 0 || NUM_EXPERTS_FOR_MAPPING % TARGET_RANKS != 0 )); then
+  echo "TARGET_RANKS=${TARGET_RANKS} must divide the model's ${NUM_EXPERTS_FOR_MAPPING} experts" >&2
+  exit 1
+fi
+if (( OCCURRENCE_GROUP <= 0 || EVAL_ITERS % OCCURRENCE_GROUP != 0 )); then
+  echo "EVAL_ITERS=${EVAL_ITERS} must be divisible by positive OCCURRENCE_GROUP=${OCCURRENCE_GROUP}" >&2
   exit 1
 fi
 if (( NODE_RANK < 0 || NODE_RANK >= NNODES )); then
@@ -218,7 +245,10 @@ if (( NODE_RANK == 0 )); then
     echo "MODEL=${MODEL}"
     echo "NUM_LAYERS=${NUM_LAYERS}"
     echo "WORLD_SIZE=${WORLD_SIZE}"
-    echo "EP=32"
+    echo "CAPTURE_EP=${CAPTURE_EP}"
+    echo "TARGET_RANKS=${TARGET_RANKS}"
+    echo "OCCURRENCE_GROUP=${OCCURRENCE_GROUP}"
+    echo "GLOBAL_BATCH_SIZE=${CAPTURE_GLOBAL_BATCH_SIZE}"
     echo "SEQ_LEN=${SEQ_LEN}"
     echo "EVAL_ITERS=${EVAL_ITERS}"
     echo "TOKEN_BUDGET=${TOKEN_BUDGET}"
@@ -248,9 +278,9 @@ run_capture() {
   MASTER_PORT="${port}" \
   TP=1 \
   PP=1 \
-  EP=32 \
+  EP="${CAPTURE_EP}" \
   MICRO_BATCH_SIZE=1 \
-  GLOBAL_BATCH_SIZE=32 \
+  GLOBAL_BATCH_SIZE="${CAPTURE_GLOBAL_BATCH_SIZE}" \
   SEQ_LEN="${SEQ_LEN}" \
   EVAL_ITERS="${EVAL_ITERS}" \
   TRACE_OUT="${trace_out}" \
@@ -270,8 +300,9 @@ run_capture() {
 }
 
 echo "[rank-dynamics] random initialization, no checkpoint, no optimizer updates"
-echo "[rank-dynamics] world=${WORLD_SIZE} (${NNODES}x${GPUS_PER_NODE}) EP=32 master=[${MASTER_ADDR}]:${MASTER_PORT}"
-echo "[rank-dynamics] equal corpus budget=${TOKEN_BUDGET}, eval occurrences=${EVAL_ITERS}"
+echo "[rank-dynamics] world=${WORLD_SIZE} (${NNODES}x${GPUS_PER_NODE}) capture_EP=${CAPTURE_EP} master=[${MASTER_ADDR}]:${MASTER_PORT}"
+echo "[rank-dynamics] virtual ranks=${TARGET_RANKS}, occurrence group=${OCCURRENCE_GROUP}"
+echo "[rank-dynamics] equal corpus budget=${TOKEN_BUDGET}, raw/grouped occurrences=${EVAL_ITERS}/$((EVAL_ITERS / OCCURRENCE_GROUP))"
 run_capture dapo_math "${DAPO_DATA_PATH}" "${DAPO_TRACE}" "${MASTER_PORT}"
 run_capture starcoder "${STARCODER_DATA_PATH}" "${STARCODER_TRACE}" "$((MASTER_PORT + 1))"
 
@@ -280,6 +311,8 @@ if (( NODE_RANK == 0 )); then
     --trace "DAPO-Math=${DAPO_TRACE}"
     --trace "StarCoderData=${STARCODER_TRACE}"
     --max-occurrences "${EVAL_ITERS}"
+    --target-ranks "${TARGET_RANKS}"
+    --occurrence-group "${OCCURRENCE_GROUP}"
     --output "${FIGURE}"
   )
   if [[ -n "${REPRESENTATIVE_LAYER:-}" ]]; then

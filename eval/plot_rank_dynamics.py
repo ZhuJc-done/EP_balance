@@ -58,7 +58,19 @@ def parse_args() -> argparse.Namespace:
         "--max-occurrences",
         type=int,
         default=0,
-        help="Use at most this many complete occurrences; 0 means all",
+        help="Use at most this many raw complete occurrences before grouping; 0 means all",
+    )
+    parser.add_argument(
+        "--target-ranks",
+        type=int,
+        default=0,
+        help="Map experts contiguously onto this many virtual ranks; 0 uses trace placement",
+    )
+    parser.add_argument(
+        "--occurrence-group",
+        type=int,
+        default=1,
+        help="Sum this many consecutive raw occurrences before computing rank load",
     )
     parser.add_argument("--output", default="rank_dynamics.pdf")
     parser.add_argument("--csv", dest="csv_path")
@@ -67,18 +79,56 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _rank_panel(label: str, path: Path, max_occurrences: int) -> dict:
+def _rank_panel(
+    label: str,
+    path: Path,
+    max_occurrences: int,
+    target_ranks: int,
+    occurrence_group: int,
+) -> dict:
     trace = load_routing_trace(path)
     layers, expert_counts = expert_count_cube(
         trace,
         max_occurrences=max_occurrences,
     )
     num_layers, occurrences, num_experts = expert_counts.shape
+    grouped_occurrences = occurrences // occurrence_group
+    if grouped_occurrences <= 0:
+        raise ValueError(
+            f"{path}: {occurrences} occurrences cannot form a group of {occurrence_group}"
+        )
+    selected_occurrences = grouped_occurrences * occurrence_group
+    expert_counts = expert_counts[:, :selected_occurrences].reshape(
+        num_layers,
+        grouped_occurrences,
+        occurrence_group,
+        num_experts,
+    ).sum(dim=2)
+    occurrences = grouped_occurrences
+
+    if target_ranks:
+        if num_experts % target_ranks:
+            raise ValueError(
+                f"{path}: {num_experts} experts cannot be divided evenly over "
+                f"{target_ranks} target ranks"
+            )
+        experts_per_rank = num_experts // target_ranks
+        placement_meta = {
+            "num_ranks": target_ranks,
+            "num_experts": num_experts,
+            "main_rank": torch.arange(num_experts, dtype=torch.int64)
+            // experts_per_rank,
+        }
+    else:
+        target_ranks = int(trace["meta"]["num_ranks"])
+        experts_per_rank = num_experts // target_ranks
+        placement_meta = trace["meta"]
+
     flat_counts = expert_counts.reshape(num_layers * occurrences, num_experts)
-    rank_loads = rank_loads_from_expert_counts(flat_counts, trace["meta"]).reshape(
+    rank_loads = rank_loads_from_expert_counts(flat_counts, placement_meta).reshape(
         num_layers,
         occurrences,
-        int(trace["meta"]["num_ranks"]),
+        target_ranks,
     )
     means = rank_loads.to(torch.float64).mean(dim=-1, keepdim=True)
     relative = torch.where(
@@ -93,6 +143,9 @@ def _rank_panel(label: str, path: Path, max_occurrences: int) -> dict:
         "rank_loads": rank_loads,
         "relative": relative,
         "max_mean": relative.max(dim=-1).values,
+        "target_ranks": target_ranks,
+        "experts_per_rank": experts_per_rank,
+        "occurrence_group": occurrence_group,
     }
 
 
@@ -134,12 +187,22 @@ def main() -> None:
         raise ValueError("--layer must be non-negative")
     if args.max_occurrences < 0:
         raise ValueError("--max-occurrences must be non-negative")
+    if args.target_ranks < 0:
+        raise ValueError("--target-ranks must be non-negative")
+    if args.occurrence_group <= 0:
+        raise ValueError("--occurrence-group must be positive")
     labels = [label for label, _ in args.trace]
     if len(set(labels)) != len(labels):
         raise ValueError("trace labels must be unique")
 
     panels = [
-        _rank_panel(label, path, args.max_occurrences)
+        _rank_panel(
+            label,
+            path,
+            args.max_occurrences,
+            args.target_ranks,
+            args.occurrence_group,
+        )
         for label, path in args.trace
     ]
     representative_layer = _representative_layer(panels, args.layer)
@@ -174,6 +237,11 @@ def main() -> None:
     bottom_images = []
     for column, panel in enumerate(panels):
         max_mean = panel["max_mean"].numpy()
+        occurrence_label = (
+            f"Micro-batch group (×{args.occurrence_group})"
+            if args.occurrence_group > 1
+            else "Micro-batch occurrence"
+        )
         top_axis = axes[0, column]
         top_images.append(
             top_axis.imshow(
@@ -186,7 +254,7 @@ def main() -> None:
             )
         )
         top_axis.set_title(f"({chr(ord('a') + column)}) {panel['label']}")
-        top_axis.set_xlabel("Micro-batch occurrence")
+        top_axis.set_xlabel(occurrence_label)
         top_axis.set_ylabel("MoE layer")
         _set_occurrence_ticks(top_axis, max_mean.shape[1])
         y_step = max(1, len(panel["layers"]) // 8)
@@ -210,7 +278,7 @@ def main() -> None:
         bottom_axis.set_title(
             f"({chr(ord('c') + column)}) {panel['label']}, layer {representative_layer + 1}"
         )
-        bottom_axis.set_xlabel("Micro-batch occurrence")
+        bottom_axis.set_xlabel(occurrence_label)
         bottom_axis.set_ylabel("Expert-parallel rank")
         _set_occurrence_ticks(bottom_axis, rank_matrix.shape[1])
         rank_step = max(1, rank_matrix.shape[0] // 8)
@@ -272,6 +340,12 @@ def main() -> None:
                         }
                     )
 
+    print(
+        "[plot_rank_dynamics] "
+        f"target ranks={panels[0]['target_ranks']}, "
+        f"experts/rank={panels[0]['experts_per_rank']}, "
+        f"raw occurrences/group={args.occurrence_group}"
+    )
     print(f"[plot_rank_dynamics] representative layer: {representative_layer + 1}")
     print(f"[plot_rank_dynamics] image: {output}")
     print(f"[plot_rank_dynamics] metrics: {csv_path}")

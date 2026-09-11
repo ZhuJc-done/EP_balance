@@ -25,7 +25,20 @@ The capture wrapper delegates model execution to the shared
 `scripts/run_real_moe.sh`; that launcher remains under `scripts/` because it is
 also used by non-evaluation EPLB workflows.
 
-## 0. One-command 32-GPU random-initialization pilot
+## 0. One-command random-initialization pilot
+
+The recommended offline rank-load run uses one 4-GPU node:
+
+```bash
+cd /home/tiger/EP_balance
+bash eval/run_rank_dynamics_4gpu.sh
+```
+
+It captures 128 raw EP4 occurrences, sums every eight consecutive occurrences
+to match the token volume of one EP32 occurrence, and maps Qwen's 128 experts
+onto 32 virtual fixed-placement ranks as `rank = expert_id // 4`. The resulting
+16 grouped occurrences therefore support the Layer × Microbatch and
+Rank × Microbatch panels without allocating 32 physical GPUs.
 
 For a 4-node × 8-GPU Arnold job, the following command prepares equal-token
 DAPO-Math and StarCoderData corpora from the existing HDFS JSONL files, runs
