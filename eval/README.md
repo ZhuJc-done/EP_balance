@@ -25,6 +25,30 @@ The capture wrapper delegates model execution to the shared
 `scripts/run_real_moe.sh`; that launcher remains under `scripts/` because it is
 also used by non-evaluation EPLB workflows.
 
+## 0. One-command 32-GPU random-initialization pilot
+
+For a 4-node × 8-GPU Arnold job, the following command prepares equal-token
+DAPO-Math and StarCoderData corpora from the existing HDFS JSONL files, runs
+both captures with the same fixed random initialization, and plots rank
+dynamics:
+
+```bash
+cd /home/tiger/EP_balance
+bash eval/run_rank_dynamics_32gpu.sh
+```
+
+Arnold supplies the node rank and node-0 address automatically. Outside Arnold,
+set `NODE_RANK`, `MASTER_ADDR`, `NNODES=4`, and `GPUS_PER_NODE=8` on each node.
+The default is 16 evaluation occurrences with Qwen3-30B-A3B at full 48-layer
+depth, `EP=32`, sequence length 4096, seed 1234, no optimizer updates, and no
+checkpoint load. Results are written below
+`${EPLB_EXP_DIR}/rank_dynamics/<run-tag>/`.
+
+This mode is useful for validating capture and input-conditioned temporal
+variation, but a randomly initialized router is not evidence of specialization
+learned during training. Use the frozen-checkpoint workflow below for the final
+paper claim.
+
 ## 1. Prepare one indexed corpus per domain
 
 Install the optional data dependency:

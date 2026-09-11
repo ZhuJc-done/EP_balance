@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot steady-state E2E throughput by router skew from per-run CSV data."""
+"""Plot steady-state E2E throughput by router skew from CSV data."""
 
 from __future__ import annotations
 
@@ -28,6 +28,10 @@ MODEL_STYLE = {
         "title": "GLM-4.5-Air",
         "stem": "glm_e2e_throughput_by_skew",
     },
+    "deepseek_v2": {
+        "title": "DeepSeek-V2",
+        "stem": "deepseek_v2_e2e_throughput_by_skew",
+    },
 }
 METHOD_STYLE = {
     "native": "Megatron-LM Baseline",
@@ -49,13 +53,19 @@ METRIC_STYLE = {
         "suffix": "tflops_per_gpu",
     },
 }
-SKEW_ORDER = ("natural", "-0.5", "-1.0", "-2.0", "-4.0")
+SKEW_ORDER = ("natural", "0.0", "-0.5", "-1.0", "-2.0", "-4.0")
 SKEW_STYLE = {
     "natural": {
         "label": "Natural",
         "color": "#4C4C4C",
         "marker": "o",
         "linestyle": "-",
+    },
+    "0.0": {
+        "label": r"$\mathtt{router\_skew}=0$",
+        "color": "#76B7B2",
+        "marker": "v",
+        "linestyle": (0, (3, 1)),
     },
     "-0.5": {
         "label": r"$\mathtt{router\_skew}=-0.5$",
@@ -86,17 +96,21 @@ SKEW_STYLE = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "--input-dir",
-        required=True,
         type=Path,
-        help="Directory containing aligned or measured per-run CSV files",
+        help="Directory containing per-run CSV files used to build key points",
+    )
+    source.add_argument(
+        "--keypoints-csv",
+        type=Path,
+        help="Existing keypoint CSV to plot directly, without reading per-run data",
     )
     parser.add_argument(
         "--output-dir",
-        required=True,
         type=Path,
-        help="Directory for PNG, PDF, and plotted-point CSV outputs",
+        help="Directory for PNG and PDF outputs (defaults to the keypoint CSV directory)",
     )
     parser.add_argument("--step-start", type=int, default=3000)
     parser.add_argument("--step-end", type=int, default=5000)
@@ -124,8 +138,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--metric",
         choices=tuple(METRIC_STYLE),
-        default="tokens",
-        help="Throughput metric to plot",
+        default=None,
+        help="Throughput metric; inferred from --keypoints-csv, otherwise tokens",
     )
     parser.add_argument(
         "--latest-stable-window",
@@ -230,6 +244,92 @@ def _load_series(
         rows.sort(key=lambda row: row["aligned_step"])
         series[key] = rows
     return series
+
+
+def _load_points(
+    path: Path,
+    *,
+    requested_metric: str | None,
+) -> tuple[
+    dict[tuple[str, str, str], list[dict[str, float | int]]],
+    str,
+    int,
+    int,
+]:
+    required_columns = {
+        "model",
+        "method",
+        "routing",
+        "router_skew",
+        "metric",
+        "unit",
+        "aligned_step",
+        "window_first_step",
+        "window_last_step",
+        "source_iteration_first",
+        "source_iteration_last",
+        "throughput_median",
+        "throughput_p25",
+        "throughput_p75",
+    }
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        missing = required_columns.difference(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"{path}: missing columns: {', '.join(sorted(missing))}")
+        raw_rows = list(reader)
+    if not raw_rows:
+        raise ValueError(f"{path}: empty CSV")
+
+    metrics = {row["metric"] for row in raw_rows}
+    if len(metrics) != 1:
+        raise ValueError(f"{path}: expected one metric, found {sorted(metrics)}")
+    metric = metrics.pop()
+    if metric not in METRIC_STYLE:
+        raise ValueError(f"{path}: unsupported metric {metric!r}")
+    if requested_metric is not None and requested_metric != metric:
+        raise ValueError(
+            f"{path}: contains metric {metric!r}, not requested metric "
+            f"{requested_metric!r}"
+        )
+
+    expected_unit = METRIC_STYLE[metric]["unit"]
+    units = {row["unit"] for row in raw_rows}
+    if units != {expected_unit}:
+        raise ValueError(
+            f"{path}: expected unit {expected_unit!r}, found {sorted(units)}"
+        )
+
+    points: dict[tuple[str, str, str], list[dict[str, float | int]]] = {}
+    for row in raw_rows:
+        key = (row["model"], row["method"], _skew_key(row))
+        points.setdefault(key, []).append(
+            {
+                "aligned_step": int(row["aligned_step"]),
+                "window_first_step": int(row["window_first_step"]),
+                "window_last_step": int(row["window_last_step"]),
+                "source_iteration_first": int(row["source_iteration_first"]),
+                "source_iteration_last": int(row["source_iteration_last"]),
+                "throughput_median": float(row["throughput_median"]),
+                "throughput_p25": float(row["throughput_p25"]),
+                "throughput_p75": float(row["throughput_p75"]),
+            }
+        )
+
+    expected_steps: list[int] | None = None
+    for key, key_points in points.items():
+        key_points.sort(key=lambda point: int(point["aligned_step"]))
+        steps = [int(point["aligned_step"]) for point in key_points]
+        if len(steps) != len(set(steps)):
+            raise ValueError(f"{path}: duplicate aligned steps for series {key}")
+        if expected_steps is None:
+            expected_steps = steps
+        elif steps != expected_steps:
+            raise ValueError(f"{path}: inconsistent aligned steps for series {key}")
+    if not expected_steps:
+        raise ValueError(f"{path}: no key points")
+
+    return points, metric, expected_steps[0], expected_steps[-1]
 
 
 def _select_measured_window(
@@ -470,55 +570,86 @@ def main() -> None:
     args = parse_args()
     if args.dpi <= 0:
         raise ValueError("--dpi must be positive")
-    input_dir = args.input_dir.expanduser().resolve()
-    output_dir = args.output_dir.expanduser().resolve()
+
+    if args.keypoints_csv is not None:
+        points_path = args.keypoints_csv.expanduser().resolve()
+        points, metric, step_start, step_end = _load_points(
+            points_path,
+            requested_metric=args.metric,
+        )
+        output_dir = (
+            args.output_dir.expanduser().resolve()
+            if args.output_dir is not None
+            else points_path.parent
+        )
+        summary = f"loaded {sum(map(len, points.values()))} key points from {points_path}"
+    else:
+        if args.output_dir is None:
+            raise ValueError("--output-dir is required with --input-dir")
+        input_dir = args.input_dir.expanduser().resolve()
+        output_dir = args.output_dir.expanduser().resolve()
+        metric = args.metric or "tokens"
+        step_start = args.step_start
+        step_end = args.step_end
+        raw_series = _load_series(
+            input_dir,
+            measured_tail=args.measured_tail,
+            aligned_end=step_end,
+            metric=metric,
+            latest_stable_window=args.latest_stable_window,
+            slow_factor=args.slow_factor,
+        )
+        centers = _key_steps(step_start, step_end, args.num_points)
+        points = {
+            key: _aggregate(
+                rows,
+                centers=centers,
+                step_start=step_start,
+                step_end=step_end,
+                window=args.window,
+            )
+            for key, rows in raw_series.items()
+        }
+        output_dir.mkdir(parents=True, exist_ok=True)
+        points_path = output_dir / (
+            f"e2e_throughput_keypoints_{METRIC_STYLE[metric]['suffix']}"
+            f"_steps{step_start}_{step_end}.csv"
+        )
+        _write_points(points, points_path, metric=metric)
+        source_kind = "measured" if args.measured_tail else "aligned"
+        summary = (
+            f"key steps: {centers}; median window: {args.window} "
+            f"{source_kind} samples"
+        )
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    raw_series = _load_series(
-        input_dir,
-        measured_tail=args.measured_tail,
-        aligned_end=args.step_end,
-        metric=args.metric,
-        latest_stable_window=args.latest_stable_window,
-        slow_factor=args.slow_factor,
-    )
-    centers = _key_steps(args.step_start, args.step_end, args.num_points)
-    points = {
-        key: _aggregate(
-            rows,
-            centers=centers,
-            step_start=args.step_start,
-            step_end=args.step_end,
-            window=args.window,
-        )
-        for key, rows in raw_series.items()
-    }
+    unknown_models = sorted({key[0] for key in points}.difference(MODEL_STYLE))
+    if unknown_models:
+        raise ValueError(f"missing plot styles for models: {', '.join(unknown_models)}")
+    plotted_models = [
+        model for model in MODEL_STYLE if any(key[0] == model for key in points)
+    ]
 
     output_stems = {
         model: _plot_model(
             model,
             points,
             output_dir=output_dir,
-            step_start=args.step_start,
-            step_end=args.step_end,
-            metric=args.metric,
+            step_start=step_start,
+            step_end=step_end,
+            metric=metric,
             dpi=args.dpi,
         )
-        for model in MODEL_STYLE
+        for model in plotted_models
     }
-    points_path = output_dir / (
-        f"e2e_throughput_keypoints_{METRIC_STYLE[args.metric]['suffix']}"
-        f"_steps{args.step_start}_{args.step_end}.csv"
-    )
-    _write_points(points, points_path, metric=args.metric)
 
-    source_kind = "measured" if args.measured_tail else "aligned"
-    print(f"key steps: {centers}; median window: {args.window} {source_kind} samples")
-    for model in MODEL_STYLE:
+    print(summary)
+    for model in plotted_models:
         stem = output_stems[model]
         print(f"saved {stem.with_suffix('.png')}")
         print(f"saved {stem.with_suffix('.pdf')}")
-    print(f"saved {points_path}")
+    print(f"plot data: {points_path}")
 
 
 if __name__ == "__main__":

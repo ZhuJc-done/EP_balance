@@ -144,14 +144,28 @@ CATEGORY_STYLE = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--logs-dir", required=True, type=Path)
-    parser.add_argument("--output-dir", required=True, type=Path)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--logs-dir",
+        type=Path,
+        help="Raw per-node debug logs used to refresh CSV data and figures",
+    )
+    source.add_argument(
+        "--input-csv",
+        type=Path,
+        help="Saved latency_breakdown.csv used for an offline figure-only replot",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Figure/output directory; defaults to the input CSV directory",
+    )
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--dpi", type=int, default=600)
     parser.add_argument(
         "--rank-policy",
         choices=("critical", "best-communication"),
-        default="critical",
+        default=None,
         help=(
             "critical takes max rank for every phase; best-communication keeps "
             "expert compute at max rank but takes min rank for token transport "
@@ -161,7 +175,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--token-scope",
         choices=("wire", "dispatcher"),
-        default="wire",
+        default=None,
         help=(
             "wire requires nested transport timers; dispatcher explicitly uses "
             "legacy method-wide dispatch/combine intervals"
@@ -484,6 +498,104 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def load_summary_csv(path: Path) -> list[dict[str, Any]]:
+    required = {
+        "model",
+        "model_title",
+        "method",
+        "direction",
+        "category",
+        "kind",
+        "phases",
+        "median_ms_per_layer",
+        "p25_ms_per_layer",
+        "p75_ms_per_layer",
+    }
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        missing = required.difference(reader.fieldnames or ())
+        if missing:
+            raise ValueError(
+                f"{path}: missing summary columns: {', '.join(sorted(missing))}"
+            )
+        rows: list[dict[str, Any]] = list(reader)
+    if not rows:
+        raise ValueError(f"{path}: empty latency summary")
+    if "rank_reduction" not in (reader.fieldnames or ()):
+        if not any(row["category"] == "moe_total" for row in rows):
+            raise ValueError(
+                f"{path}: missing rank_reduction and cannot infer its policy"
+            )
+        for row in rows:
+            row["rank_reduction"] = "max"
+
+    unknown_models = sorted({str(row["model"]) for row in rows}.difference(("qwen", "glm")))
+    unknown_methods = sorted(
+        {str(row["method"]) for row in rows}.difference(METHOD_ORDER)
+    )
+    unknown_directions = sorted(
+        {str(row["direction"]) for row in rows}.difference(DIRECTION_ORDER)
+    )
+    if unknown_models or unknown_methods or unknown_directions:
+        raise ValueError(
+            f"{path}: unsupported values: models={unknown_models}, "
+            f"methods={unknown_methods}, directions={unknown_directions}"
+        )
+    return rows
+
+
+def csv_modes(
+    rows: list[dict[str, Any]],
+    *,
+    requested_rank_policy: str | None,
+    requested_token_scope: str | None,
+) -> tuple[str, str]:
+    stored_rank_policies = {
+        str(row["rank_policy_mode"])
+        for row in rows
+        if row.get("rank_policy_mode")
+    }
+    if len(stored_rank_policies) > 1:
+        raise ValueError(
+            f"input CSV mixes rank policies: {sorted(stored_rank_policies)}"
+        )
+    inferred_rank_policy = (
+        stored_rank_policies.pop()
+        if stored_rank_policies
+        else ("critical" if has_moe_total(rows) else "best-communication")
+    )
+
+    stored_token_scopes = {
+        str(row["token_scope"]) for row in rows if row.get("token_scope")
+    }
+    if len(stored_token_scopes) > 1:
+        raise ValueError(
+            f"input CSV mixes token scopes: {sorted(stored_token_scopes)}"
+        )
+    token_phases = [
+        str(row["phases"])
+        for row in rows
+        if row["category"] == "token_all_to_all"
+    ]
+    inferred_token_scope = (
+        stored_token_scopes.pop()
+        if stored_token_scopes
+        else ("wire" if any("_wire" in phases for phases in token_phases) else "dispatcher")
+    )
+
+    if requested_rank_policy and requested_rank_policy != inferred_rank_policy:
+        raise ValueError(
+            f"--rank-policy={requested_rank_policy} conflicts with CSV mode "
+            f"{inferred_rank_policy}"
+        )
+    if requested_token_scope and requested_token_scope != inferred_token_scope:
+        raise ValueError(
+            f"--token-scope={requested_token_scope} conflicts with CSV mode "
+            f"{inferred_token_scope}"
+        )
+    return inferred_rank_policy, inferred_token_scope
+
+
 def visible_categories(rows: list[dict[str, Any]]) -> list[str]:
     present = {str(row["category"]) for row in rows}
     return [category for category in CATEGORY_STYLE if category in present]
@@ -526,7 +638,7 @@ def legend_handles(rows: list[dict[str, Any]]) -> list[Any]:
                 markerfacecolor="#202020",
                 markeredgecolor="white",
                 label="Measured MoE Total",
-                markersize=5.5,
+                markersize=6.5,
             )
         )
     return handles
@@ -568,7 +680,7 @@ def draw_panel(
                     f"{value:.2f}",
                     ha="center",
                     va="center",
-                    fontsize=8.2,
+                    fontsize=9.5,
                     color=style["text_color"],
                     fontweight="medium",
                 )
@@ -583,7 +695,7 @@ def draw_panel(
                 total_x,
                 total,
                 marker="D",
-                markersize=5.0,
+                markersize=6.0,
                 color="#202020",
                 markeredgecolor="white",
                 markeredgewidth=0.5,
@@ -597,18 +709,18 @@ def draw_panel(
                 textcoords="offset points",
                 ha="left",
                 va="bottom",
-                fontsize=7.8,
+                fontsize=9.0,
                 color="#202020",
             )
 
     axis.set_xticks(x_positions, [METHOD_LABEL[item] for item in METHOD_ORDER])
     axis.set_ylabel(
         rank_axis_label(model_rows) if show_ylabel else "",
-        fontsize=9.5,
+        fontsize=11.0,
     )
     axis.grid(axis="y", linestyle="--", linewidth=0.6, alpha=0.3)
     axis.set_axisbelow(True)
-    axis.tick_params(axis="both", labelsize=8.5)
+    axis.tick_params(axis="both", labelsize=9.8)
     axis.spines["top"].set_visible(False)
     axis.spines["right"].set_visible(False)
     axis.set_ylim(0, 1.16 * max([*bottoms, *total_values]))
@@ -619,7 +731,7 @@ def draw_panel(
         transform=axis.transAxes,
         ha="center",
         va="top",
-        fontsize=10.5,
+        fontsize=11.8,
     )
 
 
@@ -631,12 +743,12 @@ def plot_model(
     dpi: int,
 ) -> Path:
     model_rows = [row for row in rows if row["model"] == model]
-    figure, axes = plt.subplots(1, 2, figsize=(7.25, 3.65))
+    figure, axes = plt.subplots(1, 2, figsize=(7.25, 3.9))
     figure.subplots_adjust(
         left=0.085,
         right=0.985,
-        bottom=0.22,
-        top=0.80,
+        bottom=0.23,
+        top=0.77,
         wspace=0.20,
     )
 
@@ -656,8 +768,8 @@ def plot_model(
         bbox_to_anchor=(0.5, 0.98),
         ncol=len(legend_handles(model_rows)),
         frameon=False,
-        fontsize=7.1,
-        columnspacing=0.9,
+        fontsize=11.0,
+        columnspacing=0.7,
         handlelength=1.6,
     )
 
@@ -679,14 +791,14 @@ def plot_combined(
     output_dir: Path,
     dpi: int,
 ) -> Path:
-    figure, axes = plt.subplots(2, 2, figsize=(7.25, 6.15))
+    figure, axes = plt.subplots(2, 2, figsize=(7.25, 6.55))
     figure.subplots_adjust(
         left=0.085,
         right=0.985,
-        bottom=0.105,
-        top=0.88,
+        bottom=0.11,
+        top=0.86,
         wspace=0.20,
-        hspace=0.66,
+        hspace=0.74,
     )
     panel_index = 0
     for model_index, model in enumerate(("qwen", "glm")):
@@ -711,8 +823,8 @@ def plot_combined(
         bbox_to_anchor=(0.5, 0.985),
         ncol=len(legend_handles(rows)),
         frameon=False,
-        fontsize=7.1,
-        columnspacing=0.9,
+        fontsize=11.0,
+        columnspacing=0.7,
         handlelength=1.6,
     )
 
@@ -836,20 +948,59 @@ def main() -> None:
         raise ValueError("--warmup cannot be negative")
     if args.dpi <= 0:
         raise ValueError("--dpi must be positive")
-    logs_dir = args.logs_dir.expanduser().resolve()
-    output_dir = args.output_dir.expanduser().resolve()
+    input_csv = (
+        args.input_csv.expanduser().resolve() if args.input_csv is not None else None
+    )
+    if args.output_dir is not None:
+        output_dir = args.output_dir.expanduser().resolve()
+    elif input_csv is not None:
+        output_dir = input_csv.parent
+    else:
+        raise ValueError("--output-dir is required with --logs-dir")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if input_csv is not None:
+        summary_rows = load_summary_csv(input_csv)
+        rank_policy, token_scope = csv_modes(
+            summary_rows,
+            requested_rank_policy=args.rank_policy,
+            requested_token_scope=args.token_scope,
+        )
+        CATEGORY_STYLE["token_all_to_all"]["label"] = (
+            "Token Transport Kernel"
+            if token_scope == "wire"
+            else "Token Dispatch/Combine"
+        )
+        stems = [
+            plot_model(model, summary_rows, output_dir=output_dir, dpi=args.dpi)
+            for model in ("qwen", "glm")
+        ]
+        stems.append(
+            plot_combined(summary_rows, output_dir=output_dir, dpi=args.dpi)
+        )
+        print(
+            f"loaded {len(summary_rows)} aggregate rows from {input_csv} "
+            f"(rank_policy={rank_policy}, token_scope={token_scope})"
+        )
+        for stem in stems:
+            print(f"saved {stem.with_suffix('.png')}")
+            print(f"saved {stem.with_suffix('.pdf')}")
+        return
+
+    logs_dir = args.logs_dir.expanduser().resolve()
+    rank_policy = args.rank_policy or "critical"
+    token_scope = args.token_scope or "wire"
     category_phases = (
         WIRE_CATEGORY_PHASES
-        if args.token_scope == "wire"
+        if token_scope == "wire"
         else DISPATCHER_CATEGORY_PHASES
     )
     CATEGORY_STYLE["token_all_to_all"]["label"] = (
         "Token Transport Kernel"
-        if args.token_scope == "wire"
+        if token_scope == "wire"
         else "Token Dispatch/Combine"
     )
-    best_communication = args.rank_policy == "best-communication"
+    best_communication = rank_policy == "best-communication"
     min_rank_phases = (
         frozenset(
             phase
@@ -902,8 +1053,8 @@ def main() -> None:
         output_dir / "README.md",
         warmup=args.warmup,
         metadata=metadata,
-        rank_policy=args.rank_policy,
-        token_scope=args.token_scope,
+        rank_policy=rank_policy,
+        token_scope=token_scope,
     )
 
     for stem in stems:

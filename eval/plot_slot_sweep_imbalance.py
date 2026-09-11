@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
 import json
 import math
@@ -36,38 +37,38 @@ STRATEGY_ORDER = (
 STYLE = {
     "scale-eplb": {
         "label": "Scale-EPLB",
-        "color": "#D62728",
+        "color": "#E15759",
         "marker": "o",
         "linewidth": 2.8,
     },
     "deepseek-eplb": {
-        "label": "DeepSeek EPLB",
-        "color": "#1F77B4",
+        "label": "DeepSeek-EPLB",
+        "color": "#F2CF5B",
         "marker": "s",
         "linewidth": 2.2,
     },
     "fastermoe": {
         "label": "FasterMoE",
-        "color": "#2CA02C",
+        "color": "#4C78A8",
         "marker": "^",
         "linewidth": 2.2,
     },
     "flexmoe": {
         "label": "FlexMoE",
-        "color": "#9467BD",
+        "color": "#59A14F",
         "marker": "D",
         "linewidth": 2.2,
     },
     "lplb": {
         "label": "LPLB",
-        "color": "#FF7F0E",
+        "color": "#B279A2",
         "marker": "P",
         "linewidth": 2.2,
     },
 }
 NO_BALANCE_STYLE = {
-    "label": "No balancing",
-    "color": "#7F7F7F",
+    "label": "No Balance",
+    "color": "#8C8C8C",
 }
 
 
@@ -75,8 +76,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--input-glob",
-        default=DEFAULT_GLOB,
+        default=None,
         help="Glob selecting benchmark JSON files (default: logs/slot_sweep/*_seed0.json)",
+    )
+    parser.add_argument(
+        "--input-csv",
+        type=Path,
+        help="Saved plot-data CSV; mutually exclusive with --input-glob",
+    )
+    parser.add_argument(
+        "--data-output",
+        type=Path,
+        help="Optional CSV output for the loaded plotting values",
     )
     parser.add_argument(
         "--output",
@@ -168,6 +179,86 @@ def load_series(
         for strategy, slot_values in values.items()
     }
     return series, no_balance
+
+
+def load_series_csv(
+    path: Path,
+    *,
+    require_all_strategies: bool,
+) -> tuple[dict[str, list[tuple[int, float]]], float]:
+    required = {"strategy", "replica_slots_per_rank", "quality_imbalance"}
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        missing = required.difference(reader.fieldnames or ())
+        if missing:
+            raise ValueError(
+                f"{path}: missing plot-data columns: {', '.join(sorted(missing))}"
+            )
+        rows = list(reader)
+    if not rows:
+        raise ValueError(f"{path}: empty plot-data CSV")
+
+    values: dict[str, dict[int, float]] = defaultdict(dict)
+    no_balance_values = []
+    for row in rows:
+        strategy = row["strategy"]
+        imbalance = float(row["quality_imbalance"])
+        if strategy == "no-balance":
+            no_balance_values.append(imbalance)
+            continue
+        if strategy not in STYLE:
+            raise ValueError(f"{path}: unsupported strategy {strategy!r}")
+        slot = int(row["replica_slots_per_rank"])
+        if slot in values[strategy]:
+            raise ValueError(f"{path}: duplicate {strategy}, slot={slot}")
+        values[strategy][slot] = imbalance
+
+    missing = [strategy for strategy in STRATEGY_ORDER if strategy not in values]
+    if missing and require_all_strategies:
+        raise ValueError(f"missing strategy data: {missing}")
+    if not values or not no_balance_values:
+        raise ValueError(f"{path}: missing strategy or no-balance values")
+    no_balance = no_balance_values[0]
+    if any(
+        not math.isclose(value, no_balance, rel_tol=1e-9, abs_tol=1e-9)
+        for value in no_balance_values[1:]
+    ):
+        raise ValueError(f"{path}: inconsistent no-balance references")
+    return (
+        {
+            strategy: sorted(slot_values.items())
+            for strategy, slot_values in values.items()
+        },
+        no_balance,
+    )
+
+
+def write_plot_data(
+    path: Path,
+    series: dict[str, list[tuple[int, float]]],
+    no_balance: float,
+) -> None:
+    rows: list[dict[str, Any]] = [
+        {
+            "strategy": "no-balance",
+            "replica_slots_per_rank": "",
+            "quality_imbalance": no_balance,
+        }
+    ]
+    for strategy in STRATEGY_ORDER:
+        for slot, imbalance in series.get(strategy, ()):
+            rows.append(
+                {
+                    "strategy": strategy,
+                    "replica_slots_per_rank": slot,
+                    "quality_imbalance": imbalance,
+                }
+            )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def plot(
@@ -265,7 +356,7 @@ def plot(
         bbox_to_anchor=(0.5, -0.16),
         ncol=3,
         frameon=False,
-        fontsize=10.5,
+        fontsize=13.5,
     )
 
     output = output.expanduser().resolve()
@@ -279,10 +370,22 @@ def plot(
 
 def main() -> None:
     args = parse_args()
-    series, no_balance = load_series(
-        args.input_glob,
-        require_all_strategies=not args.allow_missing_strategies,
-    )
+    if args.input_csv is not None and args.input_glob is not None:
+        raise ValueError("--input-csv and --input-glob are mutually exclusive")
+    if args.input_csv is not None:
+        series, no_balance = load_series_csv(
+            args.input_csv.expanduser().resolve(),
+            require_all_strategies=not args.allow_missing_strategies,
+        )
+    else:
+        series, no_balance = load_series(
+            args.input_glob or DEFAULT_GLOB,
+            require_all_strategies=not args.allow_missing_strategies,
+        )
+    if args.data_output is not None:
+        data_output = args.data_output.expanduser().resolve()
+        write_plot_data(data_output, series, no_balance)
+        print(f"saved plot data to {data_output}")
     pdf_output = args.pdf_output or args.output.with_suffix(".pdf")
     plot(
         series,
